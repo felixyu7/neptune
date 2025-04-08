@@ -28,12 +28,20 @@ class PrometheusDataModule(pl.LightningDataModule):
         Sets up train and validation datasets.
         """
         if self.cfg['training']:
-            train_files = get_file_names(self.cfg['data_options']['train_data_files'], self.cfg['data_options']['train_data_file_ranges'])
+            train_files = get_file_names(
+                self.cfg['data_options']['train_data_files'], 
+                self.cfg['data_options']['train_data_file_ranges'],
+                self.cfg['data_options']['shuffle_files']
+            )
             self.train_dataset = PrometheusDataset(train_files,
                                                    self.cfg['data_options']['use_latent_representation'],
                                                    self.cfg['data_options']['geo_dict_path'])
             
-        valid_files = get_file_names(self.cfg['data_options']['valid_data_files'], self.cfg['data_options']['valid_data_file_ranges'])
+        valid_files = get_file_names(
+            self.cfg['data_options']['valid_data_files'], 
+            self.cfg['data_options']['valid_data_file_ranges'],
+            self.cfg['data_options']['shuffle_files']
+        )
         self.valid_dataset = PrometheusDataset(valid_files,
                                                self.cfg['data_options']['use_latent_representation'],
                                                self.cfg['data_options']['geo_dict_path'])

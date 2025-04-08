@@ -66,7 +66,7 @@ class PointCloudTokenizer(nn.Module):
             empty_centroids = torch.zeros((0, self.max_tokens, 4), device=coordinates.device, dtype=coordinates.dtype)
             empty_masks = torch.zeros((0, self.max_tokens), device=coordinates.device, dtype=torch.bool)
             return empty_tokens, empty_centroids, empty_masks
-            
+
         all_tokens = []
         all_centroids = []
         all_masks = []
@@ -249,8 +249,8 @@ class Neptune(pl.LightningModule):
             token_dim=self.hparams.token_dim,
             mlp_layers=self.hparams.mlp_layers,
             k_neighbors=self.hparams.k_neighbors,
-            pool_method=self.hparams.pool_method)
-        
+            pool_method=self.hparams.pool_method
+        )
         self.encoder = PointTransformerEncoder(
             token_dim=self.hparams.token_dim,
             num_layers=self.hparams.num_layers,
@@ -259,7 +259,7 @@ class Neptune(pl.LightningModule):
             dropout=self.hparams.dropout
         )
         
-        # Determine classifier output dimension
+        # Determine output dimension based on task
         self._set_output_dim()
         self._validate_loss_fn() 
             
@@ -435,13 +435,6 @@ class Neptune(pl.LightningModule):
         self.test_step_outputs = []
 
     def configure_optimizers(self) -> Dict[str, Any]:
-        optimizer = torch.optim.AdamW(
-            self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay
-        )
-        lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-            optimizer, T_0=self.hparams.lr_schedule[0], T_mult=self.hparams.lr_schedule[1]
-        )
-        return {
-            "optimizer": optimizer,
-            "lr_scheduler": {"scheduler": lr_scheduler, "interval": "epoch", "monitor": "val_loss_epoch"}
-        }
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.hparams.lr_schedule[1], eta_min=1e-7)
+        return [optimizer], [scheduler]

@@ -7,7 +7,7 @@ from torch import Tensor
 from torch.utils.data import Sampler, Dataset
 from typing import List, Tuple, Optional, Union, Any
 
-def get_file_names(data_dirs: List[str], ranges: List[List[int]]) -> List[str]:
+def get_file_names(data_dirs: List[str], ranges: List[List[int]], shuffle_files: bool = False) -> List[str]:
     """
     Get file names from directories within specified ranges.
     
@@ -21,6 +21,8 @@ def get_file_names(data_dirs: List[str], ranges: List[List[int]]) -> List[str]:
     filtered_files = []
     for i, directory in enumerate(data_dirs):
         all_files = sorted(glob.glob(os.path.join(directory, '*.parquet')))
+        if shuffle_files:
+            random.shuffle(all_files)
         file_range = ranges[i]
         filtered_files.extend(
             all_files[file_range[0]:file_range[1]]
