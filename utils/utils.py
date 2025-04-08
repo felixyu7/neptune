@@ -3,7 +3,7 @@ import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
 from torch import Tensor
-from typing import Optional, List, Union, Any
+from typing import Optional, List, Union, Any, Tuple
 import scipy.special
 
 def LogCoshLoss(pred: Tensor, truth: Tensor) -> Tensor:
@@ -13,6 +13,9 @@ def LogCoshLoss(pred: Tensor, truth: Tensor) -> Tensor:
 
 def AngularDistanceLoss(pred: Tensor, truth: Tensor, weights: Optional[Tensor]=None, eps: float=1e-7, reduction: str="mean") -> Tensor:
     """Angular distance loss function"""
+    # normalize pred and truth to unit vectors
+    pred = F.normalize(pred, p=2, dim=1)
+    truth = F.normalize(truth, p=2, dim=1)
     # clamp prevents invalid input to arccos
     cos_sim = F.cosine_similarity(pred, truth)
     angle = torch.acos(torch.clamp(cos_sim, min=-1.0 + eps, max=1.0 - eps))
