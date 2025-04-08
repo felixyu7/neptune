@@ -7,6 +7,7 @@ from torch import Tensor
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from typing import List, Tuple, Dict, Any, Optional
 import os
+import fpsample
 
 # Local imports
 from neptune.utils import (
@@ -101,8 +102,8 @@ class PointCloudTokenizer(nn.Module):
                 batch_tokens = all_point_features
                 num_valid_tokens = num_points
             else:
-                # Select centroids using Farthest Point Sampling
-                fps_indices = farthest_point_sampling(points_for_sampling, self.max_tokens)
+                # Select centroids using Farthest Point Sampling (bucket_fps_kdline_sampling)
+                fps_indices = fpsample.bucket_fps_kdline_sampling(points_for_sampling.detach().cpu().numpy(), self.max_tokens, h=3)
                 batch_centroids = points_for_sampling[fps_indices]  # [max_tokens, 4]
                 
                 # Find k-Nearest Neighbors for each centroid
