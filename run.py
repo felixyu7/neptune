@@ -95,7 +95,7 @@ def main():
         trainer = pl.Trainer(
             accelerator=cfg['accelerator'], 
             devices=cfg['num_devices'],
-            precision="bf16-mixed",
+            precision=cfg['training_options']['precision'],
             max_epochs=cfg['training_options']['epochs'], 
             log_every_n_steps=1, 
             gradient_clip_val=1.0,
@@ -117,7 +117,8 @@ def main():
         
         trainer = pl.Trainer(
             accelerator=cfg['accelerator'], 
-            precision="32-true",
+            precision=cfg['training_options']['test_precision'],
+            profiler='simple', 
             logger=logger,
             num_sanity_val_steps=0
         )

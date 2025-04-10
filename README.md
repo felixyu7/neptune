@@ -20,5 +20,8 @@ python run.py -c configs/train_neptune.cfg
 - PyTorch
 - PyTorch Lightning
 - NumPy
-- Awkward Arrays
-- PyArrow 
+- Awkward Array
+- PyArrow
+- PyYAML
+- SciPy
+- fpsample
