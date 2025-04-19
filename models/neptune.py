@@ -4,10 +4,11 @@ import torch.nn.functional as F
 import numpy as np
 import lightning.pytorch as pl
 from torch import Tensor
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
+# from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from typing import List, Tuple, Dict, Any, Optional
 import os
 import fpsample
+import time
 
 # Local imports
 from neptune.utils import (
@@ -16,6 +17,10 @@ from neptune.utils import (
     VonMisesFisherLoss, 
     LogCoshLoss, 
     GaussianNLLLoss
+)
+from neptune.models.transformer_layers import (
+    BiasTransformerEncoderLayer,
+    BiasTransformerEncoder
 )
 
 class PointCloudTokenizer(nn.Module):
@@ -157,17 +162,27 @@ class PointTransformerEncoder(nn.Module):
         # Position embedding component
         self.pos_embed = PositionEmbedding(out_dim=token_dim)
         
-        # Transformer layers
-        encoder_layer = TransformerEncoderLayer(
+        # # Transformer layers
+        # encoder_layer = TransformerEncoderLayer(
+        #     d_model=token_dim,
+        #     nhead=num_heads,
+        #     dim_feedforward=hidden_dim,
+        #     dropout=dropout,
+        #     activation='gelu',
+        #     batch_first=True,
+        #     norm_first=False
+        # )
+        # self.layers = TransformerEncoder(encoder_layer, num_layers)
+        encoder_layer = BiasTransformerEncoderLayer(
             d_model=token_dim,
             nhead=num_heads,
             dim_feedforward=hidden_dim,
             dropout=dropout,
             activation='gelu',
-            batch_first=True,
-            norm_first=False
+            learnable_delay=False,
+            learnable_geom=True
         )
-        self.layers = TransformerEncoder(encoder_layer, num_layers)
+        self.layers = BiasTransformerEncoder(encoder_layer, num_layers=num_layers)
         
         # Output normalization
         self.ln = nn.LayerNorm(token_dim)
@@ -181,9 +196,9 @@ class PointTransformerEncoder(nn.Module):
         # Apply transformer layers
         if masks is not None:
             attention_mask = ~masks
-            tokens = self.layers(tokens, src_key_padding_mask=attention_mask)
+            tokens = self.layers(tokens, centroids, src_key_padding_mask=attention_mask)
         else:
-            tokens = self.layers(tokens)
+            tokens = self.layers(tokens, centroids)
         
         # Global average pooling
         if masks is not None:
@@ -337,9 +352,22 @@ class Neptune(pl.LightningModule):
         return {"val_loss": loss.detach(), "preds": preds.detach(), "labels": labels.detach()}
     
     def test_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Dict[str, Tensor]:
-        loss, preds, labels = self.step(batch)
+        coords, features, labels = batch
+        start_time = time.time()
+        preds = self(coords, features)
+        end_time = time.time()
+        forward_time = end_time - start_time
+        
+        loss_func = self._get_loss_function()
+        loss = loss_func(preds, labels)
+        
         self.log('test_loss', loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=self.hparams.batch_size)
-        output = {"test_loss": loss.detach(), "preds": preds.detach(), "labels": labels.detach()}
+        output = {
+            "test_loss": loss.detach(), 
+            "preds": preds.detach(), 
+            "labels": labels.detach(),
+            "forward_time": torch.tensor(forward_time, device=loss.device)
+        }
         self.test_step_outputs.append(output)
         return output
 
@@ -377,11 +405,15 @@ class Neptune(pl.LightningModule):
             
         all_preds = torch.cat([x['preds'] for x in outputs], dim=0)
         all_labels = torch.cat([x['labels'] for x in outputs], dim=0)
-        
+        all_forward_times = torch.cat([x['forward_time'].unsqueeze(0) for x in outputs], dim=0)
+
         # Convert to numpy arrays for saving
         preds_np = all_preds.detach().cpu().numpy()
         labels_np = all_labels.detach().cpu().numpy()
-        
+        forward_times_np = all_forward_times.detach().cpu().numpy()
+
+        self.test_results = {}
+
         if self.hparams.downstream_task == 'angular_reco':
             # Collect angular reconstruction results
             truth = labels_np[:, 1:4]  # Direction components
@@ -426,6 +458,9 @@ class Neptune(pl.LightningModule):
                 self.test_results['preds'] = preds_np.squeeze()
             self.test_results['truth'] = labels_np[:, 0]
         
+        # Add forward times to the results
+        self.test_results['forward_time'] = forward_times_np
+
         # Save results to file
         if self.logger is not None:
             save_path = f"./results/{self.logger.name}_{self.logger.version}_results.npy"

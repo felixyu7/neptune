@@ -34,6 +34,7 @@ class ICParquetDataModule(pl.LightningDataModule):
                 self.cfg['data_options']['shuffle_files']
             )
             self.train_dataset = IceCube_Parquet_Dataset(train_files,
+                                                         self.cfg['data_options']['use_pulse_series'],
                                                          self.cfg['data_options']['use_latent_representation'],
                                                          self.cfg['data_options']['geo_inverse_dict_path'])
             
@@ -43,6 +44,7 @@ class ICParquetDataModule(pl.LightningDataModule):
             self.cfg['data_options']['shuffle_files']
         )
         self.valid_dataset = IceCube_Parquet_Dataset(valid_files,
+                                                     self.cfg['data_options']['use_pulse_series'],
                                                      self.cfg['data_options']['use_latent_representation'],
                                                      self.cfg['data_options']['geo_inverse_dict_path'])
             
@@ -89,8 +91,9 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
     
     Handles loading data from parquet files and preprocessing it for the model.
     """
-    def __init__(self, files, use_latent_representation, geo_inverse_dict_path):
+    def __init__(self, files, use_pulse_series, use_latent_representation, geo_inverse_dict_path):
         self.files = files
+        self.use_pulse_series = use_pulse_series
         self.use_latent_representation = use_latent_representation
         
         # Count number of events in each file
@@ -150,25 +153,46 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
         string_sensor_pos = [self.pos_to_str_sensor_dict[tuple(coord)] for coord in pos]
         string_sensor_pos = np.array(string_sensor_pos) - 1
         
-        # Extract features
-        if self.use_latent_representation:
-            feats = event.pulses.latents.to_numpy()
-        else:
-            feats = event.pulses.summary_stats.to_numpy()
-            feats = np.log(feats + 1)
+        if self.use_pulse_series:
+            # Extract pulse series
+            pulse_ts = event.pulses.pulse_times        # List of N lists of times
+            pulse_qs = event.pulses.pulse_charges      # List of N lists of charges
+            pulse_aux = event.pulses.aux
+            sensor_x = event.pulses.sensor_pos_x       # 1‑D list/array of length N
+            sensor_y = event.pulses.sensor_pos_y
+            sensor_z = event.pulses.sensor_pos_z
             
-        # Get first hit time on each sensor
-        first_hit_time = []
-        for times in event.pulses.pulse_times:
-            first_hit_time.append(min(times))
-        first_hit_time = np.array(first_hit_time)
+            counts = np.array([len(ts) for ts in pulse_ts])
+
+            flat_t = ak.flatten(pulse_ts).to_numpy()
+            flat_q = ak.flatten(pulse_qs).to_numpy()
+            flat_aux = ak.flatten(pulse_aux).to_numpy()
+
+            flat_x = np.repeat(sensor_x.to_numpy(), counts)
+            flat_y = np.repeat(sensor_y.to_numpy(), counts)
+            flat_z = np.repeat(sensor_z.to_numpy(), counts)
+
+            pos_t = np.asarray(np.column_stack((flat_x, flat_y, flat_z, flat_t))) / 100.0  # Scale down
+            feats = np.column_stack((np.log(flat_q + 1), flat_aux))
+        else:
+            # Extract features
+            if self.use_latent_representation:
+                feats = event.pulses.latents.to_numpy()
+            else:
+                feats = event.pulses.summary_stats.to_numpy()
+                feats = np.log(feats + 1)
+                
+            # Get first hit time on each sensor
+            first_hit_time = []
+            for times in event.pulses.pulse_times:
+                first_hit_time.append(min(times))
+            first_hit_time = np.array(first_hit_time)
         
-        # Combine position and time
-        pos_t = np.column_stack([pos, first_hit_time])
-        pos_t /= 100.  # Scale down
+            # Combine position and time
+            pos_t = np.asarray(np.column_stack([pos, first_hit_time])) / 100.0  # Scale down
              
         pos_t = torch.from_numpy(pos_t).float()
         feats = torch.from_numpy(feats).float()
         label = torch.from_numpy(np.array([label])).float()
         
-        return pos_t, feats, label 
+        return pos_t, feats, label
