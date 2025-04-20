@@ -16,11 +16,12 @@ from neptune.utils import (
     AngularDistanceLoss, 
     VonMisesFisherLoss, 
     LogCoshLoss, 
-    GaussianNLLLoss
+    GaussianNLLLoss,
+    CombinedAngularVMFDistanceLoss
 )
 from neptune.models.transformer_layers import (
-    BiasTransformerEncoderLayer,
-    BiasTransformerEncoder
+    RelativePosTransformerEncoderLayer,
+    RelativePosTransformerEncoder
 )
 
 class PointCloudTokenizer(nn.Module):
@@ -156,7 +157,7 @@ class PointCloudTokenizer(nn.Module):
 class PointTransformerEncoder(nn.Module):
     """Transformer encoder for point cloud tokens."""
     def __init__(self, token_dim=768, num_layers=12, num_heads=12,
-                 hidden_dim=3072, dropout=0.1):
+                 hidden_dim=3072, dropout=0.1, pre_norm=False):
         super().__init__()
         self.token_dim = token_dim
         # Position embedding component
@@ -173,16 +174,16 @@ class PointTransformerEncoder(nn.Module):
         #     norm_first=False
         # )
         # self.layers = TransformerEncoder(encoder_layer, num_layers)
-        encoder_layer = BiasTransformerEncoderLayer(
+        encoder_layer = RelativePosTransformerEncoderLayer(
             d_model=token_dim,
             nhead=num_heads,
             dim_feedforward=hidden_dim,
             dropout=dropout,
             activation='gelu',
-            learnable_delay=False,
-            learnable_geom=True
+            learnable_geom=True,
+            pre_norm=pre_norm
         )
-        self.layers = BiasTransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.layers = RelativePosTransformerEncoder(encoder_layer, num_layers=num_layers)
         
         # Output normalization
         self.ln = nn.LayerNorm(token_dim)
@@ -249,6 +250,7 @@ class Neptune(pl.LightningModule):
         loss_fn: str = 'angular_distance',
         k_neighbors: int = 16,
         pool_method: str = 'max',
+        pre_norm: bool = False,
         mlp_layers: List[int] = [256, 512, 768],
         batch_size: int = 128, 
         lr: float = 1e-3, 
@@ -272,7 +274,8 @@ class Neptune(pl.LightningModule):
             num_layers=self.hparams.num_layers,
             num_heads=self.hparams.num_heads,
             hidden_dim=self.hparams.hidden_dim,
-            dropout=self.hparams.dropout
+            dropout=self.hparams.dropout,
+            pre_norm=self.hparams.pre_norm
         )
         
         # Determine output dimension based on task
@@ -304,7 +307,7 @@ class Neptune(pl.LightningModule):
         task = self.hparams.downstream_task
         loss_choice = self.hparams.loss_fn
         valid = {
-            'angular_reco': ['angular_distance', 'vmf'],
+            'angular_reco': ['angular_distance', 'vmf', 'combined_angular_vmf'],
             'energy_reco': ['log_cosh', 'gaussian_nll']
         }
         if task not in valid or loss_choice not in valid[task]:
@@ -327,6 +330,8 @@ class Neptune(pl.LightningModule):
             get_labels = lambda labels: labels[:, 1:]
             if loss_choice == 'angular_distance': return lambda preds, labels: AngularDistanceLoss(preds, get_labels(labels))
             if loss_choice == 'vmf': return lambda preds, labels: VonMisesFisherLoss(preds, get_labels(labels))
+            if loss_choice == 'combined_angular_vmf': 
+                return lambda preds, labels: CombinedAngularVMFDistanceLoss(preds, get_labels(labels), angular_weight=0.5)
         elif task == 'energy_reco':
             get_labels = lambda labels: labels[:, 0]
             if loss_choice == 'log_cosh': return lambda preds, labels: LogCoshLoss(preds.squeeze(-1) if preds.dim() > 1 else preds, get_labels(labels))

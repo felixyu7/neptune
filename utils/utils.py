@@ -151,6 +151,35 @@ def VonMisesFisherLoss(pred: Tensor, truth: Tensor, kappa_switch: float = 100., 
     elements = -log_cmk_val - (kappa * dotprod) + (reg_factor * kappa)
     return elements.mean()
 
+def CombinedAngularVMFDistanceLoss(pred: Tensor, truth: Tensor, angular_weight: float = 0.5, vmf_kappa_switch: float = 100., vmf_reg_factor: float = 0.0, vmf_eps: float = 1e-6, angular_eps: float = 1e-7) -> Tensor:
+    """
+    Combined loss function weighting Angular Distance and Von Mises-Fisher loss.
+    Args:
+        pred: Predicted unnormalized direction vectors [B, D]. ||pred|| is kappa for VMF.
+        truth: True unit direction vectors [B, D].
+        angular_weight: Weight factor for the AngularDistanceLoss component (0 to 1).
+                        The VMF loss component will have weight (1 - angular_weight).
+        vmf_kappa_switch: kappa value to switch vMF calculation (passed to VonMisesFisherLoss).
+        vmf_reg_factor: kappa regularization factor (passed to VonMisesFisherLoss).
+        vmf_eps: Epsilon for VMF stability (passed to VonMisesFisherLoss).
+        angular_eps: Epsilon for AngularDistanceLoss stability.
+    Returns:
+        Mean combined loss value.
+    """
+    if not (0.0 <= angular_weight <= 1.0):
+        raise ValueError(f"angular_weight must be between 0 and 1, got {angular_weight}")
+
+    # Angular distance loss (normalizes pred internally)
+    loss_ang = AngularDistanceLoss(pred, truth, eps=angular_eps, reduction="mean")
+
+    # Von Mises-Fisher loss (uses unnormalized pred where ||pred|| = kappa)
+    loss_vmf = VonMisesFisherLoss(pred, truth, kappa_switch=vmf_kappa_switch, reg_factor=vmf_reg_factor, eps=vmf_eps)
+
+    # Combine losses
+    combined_loss = angular_weight * loss_ang + (1.0 - angular_weight) * loss_vmf
+    
+    return combined_loss
+
 def CombinedAngleEnergyLoss(pred: Tensor, truth: Tensor) -> Tensor:
     """Combined loss function for both angular and energy reco"""
     # Assumes truth/pred are shape [B, 4] (log_energy, dir_x, dir_y, dir_z)
