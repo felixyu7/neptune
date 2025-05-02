@@ -306,7 +306,7 @@ class Neptune(pl.LightningModule):
         elif task == 'energy_reco': 
             self.output_dim = 2 if loss_choice == 'gaussian_nll' else 1
         elif task == 'morphology_classification':
-            self.output_dim = 5
+            self.output_dim = 6
         elif task == 'bundleness_classification':
             self.output_dim = 3
         elif task == 'background_classification':
@@ -362,10 +362,10 @@ class Neptune(pl.LightningModule):
             # 2 = starting track
             # 3 = stopping track
             # 4 = passing track
-            num_classes = 5
-            
+            # 5 = bundle/multiple events
+            num_classes = 6
             get_labels = lambda labels: labels[:, 4]
-            return lambda preds, labels: CrossEntropyLoss(preds, get_labels(labels))
+            return lambda preds, labels: CrossEntropyLoss(preds, get_labels(labels).long())
 
         elif task == 'bundleness_classification':
             # 0 = cascade
