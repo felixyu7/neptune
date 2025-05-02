@@ -2,6 +2,17 @@
 
 Neptune (a**N** **E**fficient **P**oint **T**ransformer for **U**ltrarelativistic **N**eutrino **E**vents) is a transformer-based point cloud processing model specifically designed for neutrino event reconstruction in IceCube.
 
+## Installation
+
+```bash
+pip install .
+```
+
+If you plan on making any changes to the repository, it is recommended that you install it as an editable package:
+```bash
+pip install -e .
+```
+
 ## Features
 
 - Point cloud tokenization for irregular neutrino detector data
