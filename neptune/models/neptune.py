@@ -303,7 +303,7 @@ class Neptune(pl.LightningModule):
         loss_choice = self.hparams.loss_fn
         if task == 'angular_reco': 
             self.output_dim = 3
-        elif task == 'energy_reco': 
+        elif task == 'energy_reco' or task == 'deposited_energy_reco': 
             self.output_dim = 2 if loss_choice == 'gaussian_nll' else 1
         elif task == 'morphology_classification':
             self.output_dim = 6
@@ -320,6 +320,7 @@ class Neptune(pl.LightningModule):
         valid = {
             'angular_reco': ['angular_distance', 'vmf', 'combined_angular_vmf'],
             'energy_reco': ['log_cosh', 'gaussian_nll'],
+            'deposited_energy_reco': ['log_cosh', 'gaussian_nll'],
             'morphology_classification': ['cross_entropy'],
             'bundleness_classification': ['cross_entropy'],
             'background_classification': ['binary_cross_entropy'],
@@ -351,6 +352,13 @@ class Neptune(pl.LightningModule):
         
         elif task == 'energy_reco':
             get_labels = lambda labels: labels[:, 0]
+            if loss_choice == 'log_cosh': 
+                return lambda preds, labels: LogCoshLoss(preds.squeeze(-1) if preds.dim() > 1 else preds, get_labels(labels))
+            if loss_choice == 'gaussian_nll': 
+                return lambda preds, labels: GaussianNLLLoss(preds[:, 0], preds[:, 1], get_labels(labels))
+        
+        elif task == 'deposited_energy_reco':
+            get_labels = lambda labels: labels[:, 7]
             if loss_choice == 'log_cosh': 
                 return lambda preds, labels: LogCoshLoss(preds.squeeze(-1) if preds.dim() > 1 else preds, get_labels(labels))
             if loss_choice == 'gaussian_nll': 

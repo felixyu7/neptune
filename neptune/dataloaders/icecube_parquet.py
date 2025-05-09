@@ -167,6 +167,7 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
         morphology = event.morphology
         bundleness = event.bundleness
         background = event.background
+        deposited_energy = event.deposited_energy
         
         label = [np.log10(energy),
                  direction[0],
@@ -174,7 +175,8 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
                  direction[2],
                  morphology,
                  bundleness,
-                 background]
+                 background,
+                 np.log10(deposited_energy+1.0)]
         
         # Extract position information
         pos = np.array([event.pulses.sensor_pos_x.to_numpy(),
