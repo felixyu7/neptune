@@ -7,7 +7,9 @@ from torch import Tensor
 from torch.utils.data import Sampler, Dataset
 from typing import List, Tuple, Optional, Union, Any
 
-def get_file_names(data_dirs: List[str], ranges: List[List[int]], shuffle_files: bool = False) -> List[str]:
+def get_file_names(data_dirs: List[str], 
+                   ranges: List[List[int]], 
+                   shuffle_files: bool = False) -> List[str]:
     """
     Get file names from directories within specified ranges.
     
@@ -37,7 +39,10 @@ class ParquetFileSampler(Sampler):
     it shuffles the indices and yields batches from that file before moving
     to the next file.
     """
-    def __init__(self, data_source: Dataset, cumulative_lengths: np.ndarray, batch_size: int):
+    def __init__(self, 
+                 data_source: Dataset, 
+                 cumulative_lengths: np.ndarray, 
+                 batch_size: int):
        super().__init__(data_source) # Call Sampler's __init__
        self.data_source = data_source
        self.cumulative_lengths = cumulative_lengths  # expects array starting with 0, then cumulative sums

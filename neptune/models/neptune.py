@@ -17,7 +17,9 @@ from neptune.utils import (
     VonMisesFisherLoss, 
     LogCoshLoss, 
     GaussianNLLLoss,
-    CombinedAngularVMFDistanceLoss
+    CombinedAngularVMFDistanceLoss,
+    CrossEntropyLoss,
+    BinaryCrossEntropyLoss
 )
 from neptune.models.transformer_layers import (
     RelativePosTransformerEncoderLayer,
@@ -299,8 +301,17 @@ class Neptune(pl.LightningModule):
     def _set_output_dim(self):
         task = self.hparams.downstream_task
         loss_choice = self.hparams.loss_fn
-        if task == 'angular_reco': self.output_dim = 3
-        elif task == 'energy_reco': self.output_dim = 2 if loss_choice == 'gaussian_nll' else 1
+        if task == 'angular_reco': 
+            self.output_dim = 3
+        elif task == 'energy_reco' or task == 'deposited_energy_reco': 
+            self.output_dim = 2 if loss_choice == 'gaussian_nll' else 1
+        elif task == 'morphology_classification':
+            self.output_dim = 6
+        elif task == 'bundleness_classification':
+            self.output_dim = 3
+        elif task == 'background_classification':
+            self.output_dim = 1  # binary
+        
         else: raise ValueError(f"Unknown task: {task}")
 
     def _validate_loss_fn(self):
@@ -308,7 +319,11 @@ class Neptune(pl.LightningModule):
         loss_choice = self.hparams.loss_fn
         valid = {
             'angular_reco': ['angular_distance', 'vmf', 'combined_angular_vmf'],
-            'energy_reco': ['log_cosh', 'gaussian_nll']
+            'energy_reco': ['log_cosh', 'gaussian_nll'],
+            'deposited_energy_reco': ['log_cosh', 'gaussian_nll'],
+            'morphology_classification': ['cross_entropy'],
+            'bundleness_classification': ['cross_entropy'],
+            'background_classification': ['binary_cross_entropy'],
         }
         if task not in valid or loss_choice not in valid[task]:
             raise ValueError(f"Invalid task/loss combo: {task}/{loss_choice}")
@@ -327,15 +342,56 @@ class Neptune(pl.LightningModule):
         task = self.hparams.downstream_task
         loss_choice = self.hparams.loss_fn
         if task == 'angular_reco':
-            get_labels = lambda labels: labels[:, 1:]
-            if loss_choice == 'angular_distance': return lambda preds, labels: AngularDistanceLoss(preds, get_labels(labels))
-            if loss_choice == 'vmf': return lambda preds, labels: VonMisesFisherLoss(preds, get_labels(labels))
+            get_labels = lambda labels: labels[:, 1:4]
+            if loss_choice == 'angular_distance': 
+                return lambda preds, labels: AngularDistanceLoss(preds, get_labels(labels))
+            if loss_choice == 'vmf': 
+                return lambda preds, labels: VonMisesFisherLoss(preds, get_labels(labels))
             if loss_choice == 'combined_angular_vmf': 
                 return lambda preds, labels: CombinedAngularVMFDistanceLoss(preds, get_labels(labels), angular_weight=0.5)
+        
         elif task == 'energy_reco':
             get_labels = lambda labels: labels[:, 0]
-            if loss_choice == 'log_cosh': return lambda preds, labels: LogCoshLoss(preds.squeeze(-1) if preds.dim() > 1 else preds, get_labels(labels))
-            if loss_choice == 'gaussian_nll': return lambda preds, labels: GaussianNLLLoss(preds[:, 0], preds[:, 1], get_labels(labels))
+            if loss_choice == 'log_cosh': 
+                return lambda preds, labels: LogCoshLoss(preds.squeeze(-1) if preds.dim() > 1 else preds, get_labels(labels))
+            if loss_choice == 'gaussian_nll': 
+                return lambda preds, labels: GaussianNLLLoss(preds[:, 0], preds[:, 1], get_labels(labels))
+        
+        elif task == 'deposited_energy_reco':
+            get_labels = lambda labels: labels[:, 7]
+            if loss_choice == 'log_cosh': 
+                return lambda preds, labels: LogCoshLoss(preds.squeeze(-1) if preds.dim() > 1 else preds, get_labels(labels))
+            if loss_choice == 'gaussian_nll': 
+                return lambda preds, labels: GaussianNLLLoss(preds[:, 0], preds[:, 1], get_labels(labels))
+        
+        elif task == 'morphology_classification':
+            # 0 = cascade
+            # 1 = thru track
+            # 2 = starting track
+            # 3 = stopping track
+            # 4 = passing track
+            # 5 = bundle/multiple events
+            num_classes = 6
+            get_labels = lambda labels: labels[:, 4]
+            return lambda preds, labels: CrossEntropyLoss(preds, get_labels(labels).long())
+
+        elif task == 'bundleness_classification':
+            # 0 = cascade
+            # 1 = single track
+            # 2 = bundle/multiple events
+            num_classes = 3
+            
+            get_labels = lambda labels: labels[:, 5]
+            return lambda preds, labels: CrossEntropyLoss(preds, get_labels(labels))
+        
+        elif task == 'background_classification':
+            # 0 = neutrino, 1 = CORSIKA
+            num_classes = 2
+            
+            get_labels = lambda labels: labels[:, 6]
+            return lambda preds, labels: BinaryCrossEntropyLoss(preds.squeeze(-1), get_labels(labels))
+
+        
         raise ValueError(f"Unhandled task/loss: {task}/{loss_choice}") 
 
     def step(self, batch: Tuple[Tensor, Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
@@ -384,7 +440,7 @@ class Neptune(pl.LightningModule):
         overall_loss = loss_func(all_preds, all_labels)
         self.log(f'{stage}_loss_epoch', overall_loss, prog_bar=(stage=='val'))
         if self.hparams.downstream_task == 'angular_reco':
-            true_dirs = all_labels[:, 1:]
+            true_dirs = all_labels[:, 1:4]
             preds_norm = F.normalize(all_preds, p=2, dim=1)
             angular_errors_rad = AngularDistanceLoss(preds_norm, true_dirs, reduction='none') * np.pi
             median_angular_error_rad = torch.median(angular_errors_rad)
@@ -428,7 +484,7 @@ class Neptune(pl.LightningModule):
             preds_norm_np = preds_norm.detach().cpu().numpy()
             
             # Compute directions and metrics
-            angle_errors_rad = AngularDistanceLoss(preds_norm, all_labels[:, 1:], reduction='none') * np.pi
+            angle_errors_rad = AngularDistanceLoss(preds_norm, truth, reduction='none') * np.pi
             angle_errors_deg = torch.rad2deg(angle_errors_rad)
             angle_errors_deg_np = angle_errors_deg.detach().cpu().numpy()
             

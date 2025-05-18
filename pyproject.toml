@@ -1,0 +1,30 @@
+[build-system]
+requires = [
+    "setuptools>=69",
+    "wheel"
+]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "neptune"
+version = "0.0.1"
+description = ""
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = []
+classifiers = []
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/felixyu7/neptune"
+Issues   = "https://github.com/felixyu7/neptune/issues"
+
+# ---------------------------------------------
+#  Setuptools-specific configuration (optional)
+# ---------------------------------------------
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["neptune*"]
+exclude = ["configs*"]

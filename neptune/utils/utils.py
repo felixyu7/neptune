@@ -195,6 +195,12 @@ def CombinedAngleEnergyLoss(pred: Tensor, truth: Tensor) -> Tensor:
     loss = angle_loss + 0.5 * energy_loss
     return loss
 
+def CrossEntropyLoss(pred: Tensor, truth: Tensor) -> Tensor:
+    return F.cross_entropy(pred, truth)
+
+def BinaryCrossEntropyLoss(pred: Tensor, truth: Tensor) -> Tensor:
+    return F.binary_cross_entropy_with_logits(pred, truth)
+
 def unit_vector(vector: np.ndarray) -> np.ndarray:
     """Returns the unit vector of the vector."""
     norm = np.linalg.norm(vector)
@@ -260,6 +266,7 @@ def farthest_point_sampling(points: Tensor, n_samples: int) -> Tensor:
             min_distances = torch.minimum(min_distances, new_distances)
     
     return selected_indices
+
 
 # Removed downstream_task_loss function as logic is now in Neptune._get_loss_function
 # def downstream_task_loss(preds: Tensor, labels: Tensor, task: str='angular_reco', current_epoch: int=0) -> Tensor:

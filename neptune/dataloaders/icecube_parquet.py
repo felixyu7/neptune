@@ -12,10 +12,25 @@ class ICParquetDataModule(pl.LightningDataModule):
     """
     PyTorch Lightning data module for IceCube parquet datasets.
     """
-    def __init__(self, cfg, field='mc_truth'):
+    def __init__(self, 
+                 cfg, 
+                 field='mc_truth',
+                 columnar=False):
         super().__init__()
         self.cfg = cfg
         self.field = field
+        self.columnar = columnar
+        
+        self.data_options = self.cfg['data_options']
+        self.training_options = self.cfg['training_options']
+        
+        self.use_pulse_series = self.data_options['use_pulse_series']
+        self.use_latent_representation = self.data_options['use_latent_representation']
+        
+        if 'geo_inverse_dict_path' in self.data_options.keys():
+            self.geo_inverse_dict_path = self.data_options['geo_inverse_dict_path']
+        else:
+            self.geo_inverse_dict_path = None
         
     def prepare_data(self):
         """Called only once and on 1 GPU."""
@@ -27,63 +42,65 @@ class ICParquetDataModule(pl.LightningDataModule):
         
         Sets up train and validation datasets.
         """
+        
         if self.cfg['training']:
             train_files = get_file_names(
-                self.cfg['data_options']['train_data_files'], 
-                self.cfg['data_options']['train_data_file_ranges'],
-                self.cfg['data_options']['shuffle_files']
+                self.data_options['train_data_files'], 
+                self.data_options['train_data_file_ranges'],
+                self.data_options['shuffle_files']
             )
             self.train_dataset = IceCube_Parquet_Dataset(train_files,
-                                                         self.cfg['data_options']['use_pulse_series'],
-                                                         self.cfg['data_options']['use_latent_representation'],
-                                                         self.cfg['data_options']['geo_inverse_dict_path'])
+                                                         self.use_pulse_series,
+                                                         self.use_latent_representation,
+                                                         self.geo_inverse_dict_path)
             
         valid_files = get_file_names(
-            self.cfg['data_options']['valid_data_files'], 
-            self.cfg['data_options']['valid_data_file_ranges'],
-            self.cfg['data_options']['shuffle_files']
+            self.data_options['valid_data_files'], 
+            self.data_options['valid_data_file_ranges'],
+            self.data_options['shuffle_files']
         )
         self.valid_dataset = IceCube_Parquet_Dataset(valid_files,
-                                                     self.cfg['data_options']['use_pulse_series'],
-                                                     self.cfg['data_options']['use_latent_representation'],
-                                                     self.cfg['data_options']['geo_inverse_dict_path'])
+                                                     self.use_pulse_series,
+                                                     self.use_latent_representation,
+                                                     self.geo_inverse_dict_path)
             
     def train_dataloader(self):
         """Returns the training dataloader."""
-        sampler = ParquetFileSampler(self.train_dataset, self.train_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        sampler = ParquetFileSampler(self.train_dataset, self.train_dataset.cumulative_lengths, self.training_options['batch_size'])
         collate_fn = IrregularDataCollator()
         dataloader = torch.utils.data.DataLoader(self.train_dataset, 
-                                                 batch_size = self.cfg['training_options']['batch_size'], 
+                                                 batch_size = self.training_options['batch_size'], 
                                                  sampler=sampler,
                                                  collate_fn=collate_fn,
                                                  pin_memory=True,
                                                  persistent_workers=True,
-                                                 num_workers=self.cfg['training_options']['num_workers'])
+                                                #  shuffle=True,
+                                                 num_workers=self.training_options['num_workers'])
         return dataloader
     
     def val_dataloader(self):
         """Returns the validation dataloader."""
-        sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.training_options['batch_size'])
         collate_fn = IrregularDataCollator()
         return torch.utils.data.DataLoader(self.valid_dataset, 
-                                           batch_size = self.cfg['training_options']['batch_size'], 
+                                           batch_size = self.training_options['batch_size'], 
                                            sampler=sampler,
                                            collate_fn=collate_fn,
                                            pin_memory=True,
                                            persistent_workers=True,
-                                           num_workers=self.cfg['training_options']['num_workers'])
+                                           num_workers=self.training_options['num_workers'])
 
     def test_dataloader(self):
         """Returns the test dataloader (same as validation for now)."""
-        sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths,  self.training_options['batch_size'])
         collate_fn = IrregularDataCollator()
         return torch.utils.data.DataLoader(self.valid_dataset, 
-                                           batch_size = self.cfg['training_options']['batch_size'], 
+                                           batch_size = self.training_options['batch_size'], 
                                            sampler=sampler,
                                            collate_fn=collate_fn,
                                            pin_memory=True,
                                            persistent_workers=True,
-                                           num_workers=self.cfg['training_options']['num_workers'])
+                                           num_workers=self.training_options['num_workers'])
         
 class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
     """
@@ -91,7 +108,11 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
     
     Handles loading data from parquet files and preprocessing it for the model.
     """
-    def __init__(self, files, use_pulse_series, use_latent_representation, geo_inverse_dict_path):
+    def __init__(self, 
+                 files,
+                 use_pulse_series=False, 
+                 use_latent_representation=False, 
+                 geo_inverse_dict_path=None):
         self.files = files
         self.use_pulse_series = use_pulse_series
         self.use_latent_representation = use_latent_representation
@@ -106,10 +127,9 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
         self.dataset_size = self.cumulative_lengths[-1]
 
         # Default path for geometry dictionary - can be overridden
-        if geo_inverse_dict_path is None:
-            raise ValueError("geo_inverse_dict_path must be provided for IceCube_Parquet_Dataset")
-        
-        self.pos_to_str_sensor_dict = np.load(geo_inverse_dict_path, allow_pickle=True).item()
+        # if geo_inverse_dict_path is None:
+        #     raise ValueError("geo_inverse_dict_path must be provided for IceCube_Parquet_Dataset")
+        # self.pos_to_str_sensor_dict = np.load(geo_inverse_dict_path, allow_pickle=True).item()
         
         self.current_file = ''
         self.current_data = None
@@ -142,16 +162,28 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
         event = self.current_data[true_idx]
         
         # Extract MC truth information
-        direction = event.mc_truth.mu_direction.to_numpy()
-        energy = event.mc_truth.mu_energy
-        label = [np.log10(energy), direction[0], direction[1], direction[2]]
+        direction = event.primary_direction.to_numpy()
+        energy = event.primary_energy
+        morphology = event.morphology
+        bundleness = event.bundleness
+        background = event.background
+        deposited_energy = event.deposited_energy
+        
+        label = [np.log10(energy),
+                 direction[0],
+                 direction[1],
+                 direction[2],
+                 morphology,
+                 bundleness,
+                 background,
+                 np.log10(deposited_energy+1.0)]
         
         # Extract position information
         pos = np.array([event.pulses.sensor_pos_x.to_numpy(),
                         event.pulses.sensor_pos_y.to_numpy(),
                         event.pulses.sensor_pos_z.to_numpy()]).T
-        string_sensor_pos = [self.pos_to_str_sensor_dict[tuple(coord)] for coord in pos]
-        string_sensor_pos = np.array(string_sensor_pos) - 1
+        #string_sensor_pos = [self.pos_to_str_sensor_dict[tuple(coord)] for coord in pos]
+        #string_sensor_pos = np.array(string_sensor_pos) - 1
         
         if self.use_pulse_series:
             # Extract pulse series
@@ -196,3 +228,11 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
         label = torch.from_numpy(np.array([label])).float()
         
         return pos_t, feats, label
+    
+if __name__ == "__main__":
+    test_fn = "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/NuGen_22852/labels/000000-000999/NuGen_22852_labels_000999.parquet"
+    ds = IceCube_Parquet_Dataset([test_fn])
+    pos_t, feats, labels = ds[0]
+    print("pos_t: ", pos_t)
+    print("feats: ", feats)
+    print("labels: ", labels)

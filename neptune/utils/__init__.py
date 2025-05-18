@@ -6,7 +6,9 @@ from neptune.utils.utils import (
     CombinedAngularVMFDistanceLoss,
     unit_vector,
     angle_between,
-    farthest_point_sampling
+    farthest_point_sampling,
+    CrossEntropyLoss,
+    BinaryCrossEntropyLoss
 )
 
 __all__ = [
@@ -17,5 +19,7 @@ __all__ = [
     'CombinedAngularVMFDistanceLoss',
     'unit_vector',
     'angle_between',
-    'farthest_point_sampling'
+    'farthest_point_sampling',
+    'CrossEntropyLoss',
+    'BinaryCrossEntropyLoss'
 ] 
