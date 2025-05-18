@@ -164,18 +164,7 @@ class PointTransformerEncoder(nn.Module):
         self.token_dim = token_dim
         # Position embedding component
         self.pos_embed = PositionEmbedding(out_dim=token_dim)
-        
-        # # Transformer layers
-        # encoder_layer = TransformerEncoderLayer(
-        #     d_model=token_dim,
-        #     nhead=num_heads,
-        #     dim_feedforward=hidden_dim,
-        #     dropout=dropout,
-        #     activation='gelu',
-        #     batch_first=True,
-        #     norm_first=False
-        # )
-        # self.layers = TransformerEncoder(encoder_layer, num_layers)
+
         encoder_layer = RelativePosTransformerEncoderLayer(
             d_model=token_dim,
             nhead=num_heads,

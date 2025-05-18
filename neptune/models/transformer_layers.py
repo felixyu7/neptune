@@ -33,6 +33,8 @@ class GeomAwareSelfAttention(nn.Module):
         bias_hidden_dim: int = 64,
         dropout: float = 0.0,
         learnable_geom: bool = True,
+        num_fourier_features: int = 32,
+        c_ice: float = 0.2306,  # speed of light in ice, m/ns (c_vacuum=0.29979 / 1.3 refractive index)
     ) -> None:
         super().__init__()
         if d_model % n_heads:
@@ -51,10 +53,16 @@ class GeomAwareSelfAttention(nn.Module):
 
         # ------------------------- bias networks ------------------------- #
         self.use_geom = learnable_geom
+        self.num_fourier_features = num_fourier_features
+        self.c_squared = c_ice**2
 
         if self.use_geom:
+            if self.num_fourier_features <= 0 or self.num_fourier_features % 2 != 0:
+                raise ValueError(
+                    "If use_geom is True, num_fourier_features must be a positive even number."
+                )
             self.geom_mlp = nn.Sequential(
-                nn.Linear(2, bias_hidden_dim),
+                nn.Linear(self.num_fourier_features, bias_hidden_dim), # Input is now num_fourier_features
                 nn.ReLU(inplace=True),
                 nn.Linear(bias_hidden_dim, 1),
             )
@@ -80,22 +88,44 @@ class GeomAwareSelfAttention(nn.Module):
 
         if self.use_geom:
             # 2) ---------- build bias matrix (B, N, N) -------------------- #
-            bias = 0.0
+            bias = 0.0 # Initialize bias term
 
-            # pairwise spatial distance & time difference
-            # coords_spatial: (B, N, 3) ; coords_time: (B, N)
-            coords_spatial = coords[..., :3]
-            coords_time = coords[..., 3]
+            # Calculate pairwise spacetime interval ds^2 and its Fourier encoding
+            coords_spatial = coords[..., :3]  # (B, N, 3)
+            coords_time = coords[..., 3]    # (B, N)
 
-            # delta: (B, N, N, 3)
-            delta = coords_spatial[:, :, None, :] - coords_spatial[:, None, :, :]
-            dist = torch.norm(delta, dim=-1)  # (B, N, N)
+            # Pairwise differences for spatial coordinates
+            delta_spatial_x = coords_spatial[:, :, None, 0] - coords_spatial[:, None, :, 0] # (B, N, N)
+            delta_spatial_y = coords_spatial[:, :, None, 1] - coords_spatial[:, None, :, 1] # (B, N, N)
+            delta_spatial_z = coords_spatial[:, :, None, 2] - coords_spatial[:, None, :, 2] # (B, N, N)
 
-            dt = coords_time[:, :, None] - coords_time[:, None, :]  # (B, N, N)
+            # Squared spatial distance dr^2 = dx^2 + dy^2 + dz^2
+            dr_sq = delta_spatial_x**2 + delta_spatial_y**2 + delta_spatial_z**2  # (B, N, N)
 
-            if self.use_geom:
-                geom_feat = torch.stack((dist, dt), dim=-1)  # (B, N, N, 2)
-                bias = bias + self.geom_mlp(geom_feat).squeeze(-1)  # (B, N, N)
+            # Pairwise time difference dt
+            delta_t = coords_time[:, :, None] - coords_time[:, None, :]  # (B, N, N)
+
+            # Spacetime interval ds^2 = c^2 * dt^2 - dr^2
+            ds_sq = self.c_squared * (delta_t**2) - dr_sq  # (B, N, N)
+
+            # Fourier encoding for ds_sq
+            # div_term determines the frequencies for sine and cosine components
+            div_term = torch.exp(
+                torch.arange(0, self.num_fourier_features, 2, device=src.device, dtype=src.dtype) *
+                -(math.log(10000.0) / self.num_fourier_features)
+            )  # Shape: (num_fourier_features / 2)
+
+            # Expand ds_sq and div_term for broadcasting
+            # ds_sq_expanded shape: (B, N, N, 1)
+            # div_term_expanded shape: (1, 1, 1, num_fourier_features / 2)
+            fourier_args = ds_sq.unsqueeze(-1) * div_term.view(1, 1, 1, -1)
+            # fourier_args shape: (B, N, N, num_fourier_features / 2)
+
+            fourier_feat = torch.cat((torch.sin(fourier_args), torch.cos(fourier_args)), dim=-1)
+            # fourier_feat shape: (B, N, N, num_fourier_features)
+
+            geom_contribution = self.geom_mlp(fourier_feat).squeeze(-1)  # (B, N, N)
+            bias = bias + geom_contribution # Add new contribution to bias
 
             attn = attn + bias.unsqueeze(1)  # broadcast to heads
 
@@ -128,6 +158,8 @@ class RelativePosTransformerEncoderLayer(nn.Module):
         bias_hidden_dim: int = 64,
         learnable_geom: bool = True,
         pre_norm: bool = False,
+        num_fourier_features: int = 16, # New parameter with default
+        c_ice: float = 0.2306,          # New parameter with default
     ) -> None:
         super().__init__()
 
@@ -144,6 +176,8 @@ class RelativePosTransformerEncoderLayer(nn.Module):
             bias_hidden_dim=bias_hidden_dim,
             dropout=dropout,
             learnable_geom=learnable_geom,
+            num_fourier_features=num_fourier_features, # Pass to GeomAwareSelfAttention
+            c_ice=c_ice,                               # Pass to GeomAwareSelfAttention
         )
         self.ffn = nn.Sequential(
             nn.Linear(d_model, dim_feedforward),
