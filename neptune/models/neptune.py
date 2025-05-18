@@ -290,9 +290,10 @@ class Neptune(pl.LightningModule):
     def _set_output_dim(self):
         task = self.hparams.downstream_task
         loss_choice = self.hparams.loss_fn
-        if task == 'angular_reco': 
-            self.output_dim = 3
-        elif task == 'energy_reco' or task == 'deposited_energy_reco': 
+        if task == 'angular_reco':
+            # Output: 3 for direction vector, 1 for kappa
+            self.output_dim = 4
+        elif task == 'energy_reco' or task == 'deposited_energy_reco':
             self.output_dim = 2 if loss_choice == 'gaussian_nll' else 1
         elif task == 'morphology_classification':
             self.output_dim = 6
@@ -332,12 +333,25 @@ class Neptune(pl.LightningModule):
         loss_choice = self.hparams.loss_fn
         if task == 'angular_reco':
             get_labels = lambda labels: labels[:, 1:4]
-            if loss_choice == 'angular_distance': 
-                return lambda preds, labels: AngularDistanceLoss(preds, get_labels(labels))
-            if loss_choice == 'vmf': 
-                return lambda preds, labels: VonMisesFisherLoss(preds, get_labels(labels))
-            if loss_choice == 'combined_angular_vmf': 
-                return lambda preds, labels: CombinedAngularVMFDistanceLoss(preds, get_labels(labels), angular_weight=0.5)
+            if loss_choice == 'angular_distance':
+                # AngularDistanceLoss only uses the direction part
+                return lambda preds, labels: AngularDistanceLoss(preds[:, :3], get_labels(labels))
+            if loss_choice == 'vmf':
+                # VonMisesFisherLoss will now take direction and kappa separately
+                # preds[:, :3] is direction, F.softplus(preds[:, 3]) is kappa
+                return lambda preds, labels: VonMisesFisherLoss(
+                    preds[:, :3],
+                    get_labels(labels),
+                    kappa=F.softplus(preds[:, 3].squeeze()) # Ensure kappa is positive
+                )
+            if loss_choice == 'combined_angular_vmf':
+                # Combined loss will also take direction and kappa separately
+                return lambda preds, labels: CombinedAngularVMFDistanceLoss(
+                    preds[:, :3],
+                    get_labels(labels),
+                    kappa=F.softplus(preds[:, 3].squeeze()), # Ensure kappa is positive
+                    angular_weight=0.5
+                )
         
         elif task == 'energy_reco':
             get_labels = lambda labels: labels[:, 0]
@@ -430,7 +444,9 @@ class Neptune(pl.LightningModule):
         self.log(f'{stage}_loss_epoch', overall_loss, prog_bar=(stage=='val'))
         if self.hparams.downstream_task == 'angular_reco':
             true_dirs = all_labels[:, 1:4]
-            preds_norm = F.normalize(all_preds, p=2, dim=1)
+            # Normalize only the direction part of the predictions (first 3 components)
+            pred_directions = all_preds[:, :3]
+            preds_norm = F.normalize(pred_directions, p=2, dim=1)
             angular_errors_rad = AngularDistanceLoss(preds_norm, true_dirs, reduction='none') * np.pi
             median_angular_error_rad = torch.median(angular_errors_rad)
             self.log(f'{stage}_median_angular_error_deg', torch.rad2deg(median_angular_error_rad))
@@ -469,11 +485,13 @@ class Neptune(pl.LightningModule):
             truth = labels_np[:, 1:4]  # Direction components
             
             # Calculate angular differences
-            preds_norm = F.normalize(all_preds, p=2, dim=1)
+            # all_preds is (N, 4) for angular_reco. Normalize only the direction part.
+            pred_directions_tensor = all_preds[:, :3]
+            preds_norm = F.normalize(pred_directions_tensor, p=2, dim=1)
             preds_norm_np = preds_norm.detach().cpu().numpy()
             
             # Compute directions and metrics
-            angle_errors_rad = AngularDistanceLoss(preds_norm, truth, reduction='none') * np.pi
+            angle_errors_rad = AngularDistanceLoss(preds_norm, torch.from_numpy(truth).to(preds_norm.device), reduction='none') * np.pi
             angle_errors_deg = torch.rad2deg(angle_errors_rad)
             angle_errors_deg_np = angle_errors_deg.detach().cpu().numpy()
             
@@ -481,10 +499,12 @@ class Neptune(pl.LightningModule):
             self.test_results['angle_diff'] = angle_errors_deg_np
             self.test_results['true_e'] = labels_np[:, 0]  # Energy component
             
-            # Calculate kappa (magnitude of direction vectors)
-            self.test_results['kappa'] = np.linalg.norm(preds_np, axis=1)
+            # Kappa is now the 4th output (index 3), passed through softplus
+            # preds_np is (N, 4)
+            raw_kappa_np = preds_np[:, 3]
+            self.test_results['kappa'] = np.log(1 + np.exp(raw_kappa_np)) # softplus
             
-            # Calculate zenith and azimuth angles
+            # Calculate zenith and azimuth angles from normalized predicted directions
             pred_zenith = np.arccos(preds_norm_np[:, 2])
             pred_azimuth = np.arctan2(preds_norm_np[:, 1], preds_norm_np[:, 0])
             self.test_results['pred_zenith'] = pred_zenith
