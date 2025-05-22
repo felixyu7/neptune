@@ -48,7 +48,7 @@ def main():
     dm.setup()
 
     # Initialize model
-    if cfg['checkpoint'] != '':
+    if cfg['checkpoint'] != '' and not cfg['resume_training']:
         # Load from checkpoint
         print(f"Loading checkpoint: {cfg['checkpoint']}")
         model = Neptune.load_from_checkpoint(cfg['checkpoint'])
@@ -66,7 +66,6 @@ def main():
             loss_fn=cfg['model_options']['loss_fn'],
             k_neighbors=cfg['model_options']['k_neighbors'],
             pool_method=cfg['model_options']['pool_method'],
-            pre_norm=cfg['model_options']['pre_norm'],
             batch_size=cfg['training_options']['batch_size'],
             lr=cfg['training_options']['lr'],
             lr_schedule=cfg['training_options']['lr_schedule'],
@@ -105,7 +104,10 @@ def main():
         # Train the model
         if cfg.get('resume_training', False):
             print(f"Resuming training from checkpoint: {cfg['checkpoint']}")
-            trainer.fit(model=model, datamodule=dm, ckpt_path=cfg['checkpoint'])
+            # Load only model weights from checkpoint, reset optimizer and lr schedule
+            checkpoint = torch.load(cfg['checkpoint'], map_location='cpu')
+            model.load_state_dict(checkpoint['state_dict'])
+            trainer.fit(model=model, datamodule=dm)
         else:
             trainer.fit(model=model, datamodule=dm)
     else:

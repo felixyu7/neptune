@@ -158,7 +158,7 @@ class RelativePosTransformerEncoderLayer(nn.Module):
         bias_hidden_dim: int = 64,
         learnable_geom: bool = True,
         pre_norm: bool = False,
-        num_fourier_features: int = 16, # New parameter with default
+        num_fourier_features: int = 32, # New parameter with default
         c_ice: float = 0.2306,          # New parameter with default
     ) -> None:
         super().__init__()

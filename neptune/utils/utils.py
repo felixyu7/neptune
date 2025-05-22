@@ -115,27 +115,21 @@ def log_cmk_approx(m: int, kappa: Tensor) -> Tensor:
     log_term = torch.log(b + a).clamp(max=85) # Clamp to avoid overflow in exp later if needed
     return -a + b * log_term
     
-def VonMisesFisherLoss(pred_direction: Tensor, truth: Tensor, kappa: Tensor, kappa_switch: float = 100., reg_factor: float = 0.0, eps: float = 1e-6) -> Tensor:
+def VonMisesFisherLoss(pred: Tensor, truth: Tensor, kappa_switch: float = 100., reg_factor: float = 0.0, eps: float = 1e-6) -> Tensor:
     """
     Von Mises-Fisher loss function.
     Args:
-        pred_direction: Predicted unnormalized direction vectors [B, D].
-        truth: True unit direction vectors [B, D].
-        kappa: Predicted concentration parameter (should be positive) [B].
+        pred: Predicted output tensor [B, D].
+        truth: True output tensor [B, D].
         kappa_switch: Value of kappa at which to switch from exact to approximate log_cmk.
         reg_factor: Optional regularization factor for kappa.
-        eps: Small epsilon for numerical stability (used for normalizing pred_direction if needed).
+        eps: Small epsilon for numerical stability (used for normalizing pred if needed).
     Returns:
         Mean loss value.
     """
     m = truth.size(1) # Dimension (e.g., 3 for 3D direction)
-    # kappa is now passed directly. Ensure it's clamped if necessary, though softplus in model should handle positivity.
-    # kappa = kappa.clamp(min=eps) # Clamping might still be useful for extreme values or if softplus isn't enough.
-                                 # For now, assume kappa from model is well-behaved.
-
-    # Normalize predicted direction vector
-    pred_direction_normalized = F.normalize(pred_direction, p=2, dim=1, eps=eps)
-    dotprod = torch.sum(pred_direction_normalized * truth, dim=1) # Cosine similarity
+    kappa = torch.norm(pred, dim=1).clamp(min=eps)
+    dotprod = torch.sum(F.normalize(pred, dim=1) * truth, dim=1)
     
     kappa_switch_tensor = torch.tensor([kappa_switch], device=kappa.device, dtype=kappa.dtype)
     mask_exact = kappa < kappa_switch_tensor
@@ -157,13 +151,12 @@ def VonMisesFisherLoss(pred_direction: Tensor, truth: Tensor, kappa: Tensor, kap
     elements = -log_cmk_val - (kappa * dotprod) + (reg_factor * kappa)
     return elements.mean()
 
-def CombinedAngularVMFDistanceLoss(pred_direction: Tensor, truth: Tensor, kappa: Tensor, angular_weight: float = 0.5, vmf_kappa_switch: float = 100., vmf_reg_factor: float = 0.0, vmf_eps: float = 1e-6, angular_eps: float = 1e-7) -> Tensor:
+def CombinedAngularVMFDistanceLoss(pred: Tensor, truth: Tensor, angular_weight: float = 0.5, vmf_kappa_switch: float = 100., vmf_reg_factor: float = 0.0, vmf_eps: float = 1e-6, angular_eps: float = 1e-7) -> Tensor:
     """
     Combined loss function weighting Angular Distance and Von Mises-Fisher loss.
     Args:
-        pred_direction: Predicted unnormalized direction vectors [B, D].
-        truth: True unit direction vectors [B, D].
-        kappa: Predicted concentration parameter (should be positive) [B].
+        pred: Predicted output tensor [B, D].
+        truth: True output tensor [B, D].
         angular_weight: Weight factor for the AngularDistanceLoss component (0 to 1).
                         The VMF loss component will have weight (1 - angular_weight).
         vmf_kappa_switch: kappa value to switch vMF calculation (passed to VonMisesFisherLoss).
@@ -176,11 +169,11 @@ def CombinedAngularVMFDistanceLoss(pred_direction: Tensor, truth: Tensor, kappa:
     if not (0.0 <= angular_weight <= 1.0):
         raise ValueError(f"angular_weight must be between 0 and 1, got {angular_weight}")
 
-    # Angular distance loss (normalizes pred_direction internally)
-    loss_ang = AngularDistanceLoss(pred_direction, truth, eps=angular_eps, reduction="mean")
+    # Angular distance loss (normalizes pred internally)
+    loss_ang = AngularDistanceLoss(pred, truth, eps=angular_eps, reduction="mean")
 
     # Von Mises-Fisher loss
-    loss_vmf = VonMisesFisherLoss(pred_direction, truth, kappa, kappa_switch=vmf_kappa_switch, reg_factor=vmf_reg_factor, eps=vmf_eps)
+    loss_vmf = VonMisesFisherLoss(pred, truth, kappa_switch=vmf_kappa_switch, reg_factor=vmf_reg_factor, eps=vmf_eps)
 
     # Combine losses
     combined_loss = angular_weight * loss_ang + (1.0 - angular_weight) * loss_vmf
