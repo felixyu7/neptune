@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import numpy as np
 import lightning.pytorch as pl
 from torch import Tensor
-# from torch.nn import TransformerEncoder, TransformerEncoderLayer
+from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from typing import List, Tuple, Dict, Any, Optional
 import os
 import fpsample
@@ -18,10 +18,6 @@ from neptune.utils import (
     LogCoshLoss, 
     GaussianNLLLoss,
     CombinedAngularVMFDistanceLoss
-)
-from neptune.models.transformer_layers import (
-    RelativePosTransformerEncoderLayer,
-    RelativePosTransformerEncoder
 )
 
 class PointCloudTokenizer(nn.Module):
@@ -163,27 +159,17 @@ class PointTransformerEncoder(nn.Module):
         # Position embedding component
         self.pos_embed = PositionEmbedding(out_dim=token_dim)
         
-        # # Transformer layers
-        # encoder_layer = TransformerEncoderLayer(
-        #     d_model=token_dim,
-        #     nhead=num_heads,
-        #     dim_feedforward=hidden_dim,
-        #     dropout=dropout,
-        #     activation='gelu',
-        #     batch_first=True,
-        #     norm_first=False
-        # )
-        # self.layers = TransformerEncoder(encoder_layer, num_layers)
-        encoder_layer = RelativePosTransformerEncoderLayer(
+        # Transformer layers
+        encoder_layer = TransformerEncoderLayer(
             d_model=token_dim,
             nhead=num_heads,
             dim_feedforward=hidden_dim,
             dropout=dropout,
             activation='gelu',
-            learnable_geom=True,
-            pre_norm=pre_norm
+            batch_first=True,
+            norm_first=pre_norm
         )
-        self.layers = RelativePosTransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.layers = TransformerEncoder(encoder_layer, num_layers)
         
         # Output normalization
         self.ln = nn.LayerNorm(token_dim)
@@ -197,9 +183,9 @@ class PointTransformerEncoder(nn.Module):
         # Apply transformer layers
         if masks is not None:
             attention_mask = ~masks
-            tokens = self.layers(tokens, centroids, src_key_padding_mask=attention_mask)
+            tokens = self.layers(tokens, src_key_padding_mask=attention_mask)
         else:
-            tokens = self.layers(tokens, centroids)
+            tokens = self.layers(tokens)
         
         # Global average pooling
         if masks is not None:
