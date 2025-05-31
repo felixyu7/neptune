@@ -360,9 +360,9 @@ class Neptune(pl.LightningModule):
                 item_masked_indices = current_valid_indices[selected_indices_in_valid_set]
                 actual_masked_indices_list.append(item_masked_indices)
 
-                # Apply mask embeddings
-                input_features[b, item_masked_indices, :] = self.feature_mask_embedding.squeeze(0) # Squeeze if embedding is (1,1,D)
-                input_centroids[b, item_masked_indices, :] = self.centroid_mask_embedding.squeeze(0) # Squeeze if embedding is (1,1,4)
+                # Apply mask embeddings, ensuring dtype compatibility
+                input_features[b, item_masked_indices, :] = self.feature_mask_embedding.squeeze(0).to(input_features.dtype)
+                input_centroids[b, item_masked_indices, :] = self.centroid_mask_embedding.squeeze(0).to(input_centroids.dtype)
 
             # 3. Encode masked features and centroids
             encoded_per_token_output = self.encoder(
