@@ -114,9 +114,7 @@ class PrometheusDataset(torch.utils.data.Dataset):
             i: Index of the item
             
         Returns:
-            pos: Position and time data
-            feats: Feature data
-            label: Label data
+            pos, feats, label
         """
         if i < 0 or i >= self.dataset_size:
             raise IndexError("Index out of range")
@@ -140,7 +138,7 @@ class PrometheusDataset(torch.utils.data.Dataset):
         
         log_energy = np.log10(event.mc_truth.initial_state_energy)
         
-        label = [log_energy, 
+        label = [log_energy,
                  dir_x,
                  dir_y,
                  dir_z]
@@ -164,4 +162,4 @@ class PrometheusDataset(torch.utils.data.Dataset):
             # log normalize
             feats = np.log(feats + 1)
 
-        return torch.from_numpy(pos_t).float(), torch.from_numpy(feats).float(), torch.from_numpy(np.array([label])).float() 
+        return torch.from_numpy(pos_t).float(), torch.from_numpy(feats).float(), torch.from_numpy(np.array([label])).float()

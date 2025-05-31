@@ -40,21 +40,23 @@ def main():
     with open(args.cfg_file, 'r') as cfg_file:
         cfg = yaml.load(cfg_file, Loader=yaml.FullLoader)
 
-    # Initialize dataloader
+    # Determine training mode
+    training_mode = cfg.get('training_mode', 'supervised')
+    pretrain_opts = cfg.get('pretrain_options', {})
+    masking_ratio = pretrain_opts.get('masking_ratio', 0.15)
+    centroid_loss_weight = pretrain_opts.get('centroid_loss_weight', 1.0) # Get centroid_loss_weight
+    checkpoint_path = cfg.get('checkpoint', '')
+
+    # Dataloader selection
     if cfg['dataloader'] == 'prometheus':
-        dm = PrometheusDataModule(cfg)
+        dm = PrometheusDataModule(cfg) # Removed mode and masking_ratio arguments
     else:
         print(f"Unknown dataloader: {cfg['dataloader']}")
         exit(1)
     dm.setup()
 
-    # Initialize model
-    if cfg['checkpoint'] != '':
-        # Load from checkpoint
-        print(f"Loading checkpoint: {cfg['checkpoint']}")
-        model = Neptune.load_from_checkpoint(cfg['checkpoint'])
-    else:
-        # Initialize new model
+    # Model/loss selection and checkpoint logic
+    if training_mode == 'pretrain':
         model = Neptune(
             in_channels=cfg['model_options']['in_channels'],
             num_patches=cfg['model_options']['num_patches'],
@@ -63,16 +65,90 @@ def main():
             num_heads=cfg['model_options']['num_heads'],
             hidden_dim=cfg['model_options']['hidden_dim'],
             dropout=cfg['model_options']['dropout'],
-            downstream_task=cfg['model_options']['downstream_task'],
-            loss_fn=cfg['model_options']['loss_fn'],
+            downstream_task=None,
+            loss_fn=None,
             k_neighbors=cfg['model_options']['k_neighbors'],
             pool_method=cfg['model_options']['pool_method'],
             pre_norm=cfg['model_options']['pre_norm'],
             batch_size=cfg['training_options']['batch_size'],
             lr=cfg['training_options']['lr'],
             lr_schedule=cfg['training_options']['lr_schedule'],
-            weight_decay=cfg['training_options']['weight_decay']
+            weight_decay=cfg['training_options']['weight_decay'],
+            training_mode='pretrain',
+            pretrain_masking_ratio=masking_ratio, # hparam name is pretrain_masking_ratio
+            centroid_loss_weight=centroid_loss_weight # Pass centroid_loss_weight
         )
+    elif training_mode == 'finetune':
+        if checkpoint_path != '':
+            print(f"Loading pretrained backbone from checkpoint: {checkpoint_path}")
+            model = Neptune.load_from_checkpoint(
+                checkpoint_path,
+                strict=False,
+                in_channels=cfg['model_options']['in_channels'],
+                num_patches=cfg['model_options']['num_patches'],
+                token_dim=cfg['model_options']['token_dim'],
+                num_layers=cfg['model_options']['num_layers'],
+                num_heads=cfg['model_options']['num_heads'],
+                hidden_dim=cfg['model_options']['hidden_dim'],
+                dropout=cfg['model_options']['dropout'],
+                downstream_task=cfg['model_options']['downstream_task'],
+                loss_fn=cfg['model_options']['loss_fn'],
+                k_neighbors=cfg['model_options']['k_neighbors'],
+                pool_method=cfg['model_options']['pool_method'],
+                pre_norm=cfg['model_options']['pre_norm'],
+                batch_size=cfg['training_options']['batch_size'],
+                lr=cfg['training_options']['lr'],
+                lr_schedule=cfg['training_options']['lr_schedule'],
+                weight_decay=cfg['training_options']['weight_decay'],
+                training_mode='finetune'
+            )
+        else:
+            print("Error: checkpoint must be specified for finetune mode.")
+            exit(1)
+    else:  # supervised (default)
+        if checkpoint_path != '' and cfg.get('resume_training', False):
+            print(f"Loading checkpoint for resume_training: {checkpoint_path}")
+            model = Neptune.load_from_checkpoint(
+                checkpoint_path,
+                strict=True,
+                in_channels=cfg['model_options']['in_channels'],
+                num_patches=cfg['model_options']['num_patches'],
+                token_dim=cfg['model_options']['token_dim'],
+                num_layers=cfg['model_options']['num_layers'],
+                num_heads=cfg['model_options']['num_heads'],
+                hidden_dim=cfg['model_options']['hidden_dim'],
+                dropout=cfg['model_options']['dropout'],
+                downstream_task=cfg['model_options']['downstream_task'],
+                loss_fn=cfg['model_options']['loss_fn'],
+                k_neighbors=cfg['model_options']['k_neighbors'],
+                pool_method=cfg['model_options']['pool_method'],
+                pre_norm=cfg['model_options']['pre_norm'],
+                batch_size=cfg['training_options']['batch_size'],
+                lr=cfg['training_options']['lr'],
+                lr_schedule=cfg['training_options']['lr_schedule'],
+                weight_decay=cfg['training_options']['weight_decay'],
+                training_mode='supervised'
+            )
+        else:
+            model = Neptune(
+                in_channels=cfg['model_options']['in_channels'],
+                num_patches=cfg['model_options']['num_patches'],
+                token_dim=cfg['model_options']['token_dim'],
+                num_layers=cfg['model_options']['num_layers'],
+                num_heads=cfg['model_options']['num_heads'],
+                hidden_dim=cfg['model_options']['hidden_dim'],
+                dropout=cfg['model_options']['dropout'],
+                downstream_task=cfg['model_options']['downstream_task'],
+                loss_fn=cfg['model_options']['loss_fn'],
+                k_neighbors=cfg['model_options']['k_neighbors'],
+                pool_method=cfg['model_options']['pool_method'],
+                pre_norm=cfg['model_options']['pre_norm'],
+                batch_size=cfg['training_options']['batch_size'],
+                lr=cfg['training_options']['lr'],
+                lr_schedule=cfg['training_options']['lr_schedule'],
+                weight_decay=cfg['training_options']['weight_decay'],
+                training_mode='supervised'
+            )
 
     # Setup trainer
     if cfg['training']:

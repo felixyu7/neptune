@@ -174,7 +174,7 @@ class PointTransformerEncoder(nn.Module):
         # Output normalization
         self.ln = nn.LayerNorm(token_dim)
     
-    def forward(self, tokens, centroids, masks=None):
+    def forward(self, tokens, centroids, masks=None, return_per_token_features=False):
         """Process tokens through transformer architecture."""
         # Add positional embeddings
         pos_embed_out = self.pos_embed(centroids)
@@ -187,17 +187,20 @@ class PointTransformerEncoder(nn.Module):
         else:
             tokens = self.layers(tokens)
         
+        # Apply final normalization
+        normed_tokens = self.ln(tokens)
+
+        if return_per_token_features:
+            return normed_tokens
         # Global average pooling
         if masks is not None:
-            valid_tokens = tokens * masks.unsqueeze(-1)
+            valid_tokens = normed_tokens * masks.unsqueeze(-1)
             token_sum = valid_tokens.sum(dim=1)
             valid_count = masks.sum(dim=1, keepdim=True).clamp(min=1)
             global_features = token_sum / valid_count
         else:
-            global_features = tokens.mean(dim=1)
-        
-        # Apply final normalization
-        return self.ln(global_features)
+            global_features = normed_tokens.mean(dim=1)
+        return global_features
 
 class PositionEmbedding(nn.Module):
     """MLP for encoding position information into tokens."""
@@ -238,14 +241,17 @@ class Neptune(pl.LightningModule):
         pool_method: str = 'max',
         pre_norm: bool = False,
         mlp_layers: List[int] = [256, 512, 768],
-        batch_size: int = 128, 
-        lr: float = 1e-3, 
+        batch_size: int = 128,
+        lr: float = 1e-3,
         lr_schedule: List[int] = [10, 2],
-        weight_decay: float = 1e-5
+        weight_decay: float = 1e-5,
+        training_mode: str = 'supervised',
+        centroid_loss_weight: float = 1.0,
+        pretrain_masking_ratio: float = 0.15
     ):
         super().__init__()
         self.save_hyperparameters()
-
+    
         # Model Components
         self.tokenizer = PointCloudTokenizer(
             feature_dim=self.hparams.in_channels,
@@ -264,9 +270,17 @@ class Neptune(pl.LightningModule):
             pre_norm=self.hparams.pre_norm
         )
         
+        # Mask Embeddings for MPM Pretraining
+        self.feature_mask_embedding = nn.Parameter(torch.randn(1, 1, self.hparams.token_dim))
+        self.centroid_mask_embedding = nn.Parameter(torch.randn(1, 1, 4))
+        
+        # MPM Heads for Pretraining
+        self.mpm_feature_predictor = nn.Linear(self.hparams.token_dim, self.hparams.token_dim)
+        self.mpm_centroid_predictor = nn.Linear(self.hparams.token_dim, 4)
+        
         # Determine output dimension based on task
         self._set_output_dim()
-        self._validate_loss_fn() 
+        self._validate_loss_fn()
             
         # Classification head
         self.classifier = nn.Sequential(
@@ -299,15 +313,75 @@ class Neptune(pl.LightningModule):
         if task not in valid or loss_choice not in valid[task]:
             raise ValueError(f"Invalid task/loss combo: {task}/{loss_choice}")
 
-    def forward(self, coords: Tensor, features: Tensor) -> Tensor:
-        """Forward pass through the model."""
-        # 1. Tokenize
-        tokens, centroids, masks = self.tokenizer(coords, features)
-        # 2. Encode
-        global_features = self.encoder(tokens, centroids, masks)
-        # 3. Classify
-        output = self.classifier(global_features)
-        return output
+    def forward(self, coords: Tensor, features: Tensor):
+        """Forward pass through the model. Handles both supervised and pretrain modes."""
+        tokens, centroids, valid_token_masks = self.tokenizer(coords, features) # valid_token_masks was 'masks'
+
+        if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
+            # 1. Clone original features and centroids for loss calculation
+            original_features_for_loss = tokens.clone()
+            original_centroids_for_loss = centroids.clone()
+
+            # 2. Masking logic (applied per batch item)
+            batch_size, num_tokens, _ = tokens.shape
+            device = tokens.device
+            
+            input_features = tokens.clone()
+            input_centroids = centroids.clone()
+            
+            # Store selected masked indices for each batch item (for loss calculation)
+            # This needs to be a list of tensors, as the number of masked tokens can vary per item if num_valid varies.
+            # However, the design in training_step implies masked_indices is already handled as a list.
+            # Let's ensure it's created correctly here.
+            actual_masked_indices_list = []
+
+            for b in range(batch_size):
+                # Consider only valid tokens for masking
+                current_valid_indices = torch.where(valid_token_masks[b])[0]
+                num_valid_tokens_for_item = current_valid_indices.shape[0]
+
+                if num_valid_tokens_for_item == 0:
+                    actual_masked_indices_list.append(torch.empty(0, dtype=torch.long, device=device))
+                    continue
+
+                # Determine number of tokens to mask for this specific item
+                num_to_mask_for_item = max(1, int(self.hparams.pretrain_masking_ratio * num_valid_tokens_for_item))
+                
+                # Randomly select among the valid tokens
+                perm = torch.randperm(num_valid_tokens_for_item, device=device)
+                selected_indices_in_valid_set = perm[:num_to_mask_for_item]
+                
+                # Map these back to original token indices for this batch item
+                item_masked_indices = current_valid_indices[selected_indices_in_valid_set]
+                actual_masked_indices_list.append(item_masked_indices)
+
+                # Apply mask embeddings
+                input_features[b, item_masked_indices, :] = self.feature_mask_embedding.squeeze(0) # Squeeze if embedding is (1,1,D)
+                input_centroids[b, item_masked_indices, :] = self.centroid_mask_embedding.squeeze(0) # Squeeze if embedding is (1,1,4)
+
+            # 3. Encode masked features and centroids
+            encoded_per_token_output = self.encoder(
+                input_features, input_centroids, valid_token_masks, return_per_token_features=True
+            )
+
+            # 4. Predict original features and centroids from encoded output
+            predicted_features = self.mpm_feature_predictor(encoded_per_token_output)
+            predicted_centroids = self.mpm_centroid_predictor(encoded_per_token_output)
+
+            # 5. Return structure for loss computation
+            return {
+                "predicted_features": predicted_features,
+                "predicted_centroids": predicted_centroids,
+                "original_features_for_loss": original_features_for_loss,
+                "original_centroids_for_loss": original_centroids_for_loss,
+                "masked_indices": actual_masked_indices_list, # List of tensors with actual masked indices per batch item
+                "valid_token_masks": valid_token_masks,
+            }
+        else:
+            # Standard supervised forward
+            global_features = self.encoder(tokens, centroids, valid_token_masks) # was 'masks'
+            output = self.classifier(global_features)
+            return output
 
     def _get_loss_function(self) -> callable:
         task = self.hparams.downstream_task
@@ -332,9 +406,40 @@ class Neptune(pl.LightningModule):
         return loss, preds, labels
         
     def training_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Tensor:
-        loss, _, _ = self.step(batch)
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
-        return loss
+        if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
+            coords, features, _ = batch
+            out = self(coords, features)
+            pred_feat = out["predicted_features"]
+            pred_cent = out["predicted_centroids"]
+            orig_feat = out["original_features_for_loss"]
+            orig_cent = out["original_centroids_for_loss"]
+            masked_indices = out["masked_indices"]
+            valid_token_masks = out["valid_token_masks"]
+
+            # Compute loss only at masked indices and valid tokens
+            feature_losses = []
+            centroid_losses = []
+            batch_size = pred_feat.shape[0]
+            for b in range(batch_size):
+                idx = masked_indices[b]
+                if idx.numel() == 0:
+                    continue
+                feat_loss = F.mse_loss(pred_feat[b, idx], orig_feat[b, idx], reduction="mean")
+                cent_loss = F.mse_loss(pred_cent[b, idx], orig_cent[b, idx], reduction="mean")
+                feature_losses.append(feat_loss)
+                centroid_losses.append(cent_loss)
+            feature_reconstruction_loss = torch.stack(feature_losses).mean() if feature_losses else torch.tensor(0.0, device=pred_feat.device)
+            centroid_reconstruction_loss = torch.stack(centroid_losses).mean() if centroid_losses else torch.tensor(0.0, device=pred_feat.device)
+            total_loss = feature_reconstruction_loss + self.hparams.centroid_loss_weight * centroid_reconstruction_loss
+
+            self.log('pretrain_feature_loss', feature_reconstruction_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
+            self.log('pretrain_centroid_loss', centroid_reconstruction_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
+            self.log('pretrain_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
+            return total_loss
+        else:
+            loss, _, _ = self.step(batch)
+            self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
+            return loss
         
     def validation_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Dict[str, Tensor]:
         loss, preds, labels = self.step(batch)
