@@ -278,17 +278,22 @@ class Neptune(pl.LightningModule):
         self.mpm_feature_predictor = nn.Linear(self.hparams.token_dim, self.hparams.token_dim)
         self.mpm_centroid_predictor = nn.Linear(self.hparams.token_dim, 4)
         
-        # Determine output dimension based on task
-        self._set_output_dim()
-        self._validate_loss_fn()
-            
-        # Classification head
-        self.classifier = nn.Sequential(
-            nn.Linear(self.hparams.token_dim, self.hparams.token_dim),
-            nn.GELU(),
-            nn.Dropout(self.hparams.dropout),
-            nn.Linear(self.hparams.token_dim, self.output_dim)
-        )
+        # Downstream task specific setup
+        if self.hparams.training_mode != 'pretrain':
+            # Determine output dimension based on task
+            self._set_output_dim()
+            self._validate_loss_fn()
+                
+            # Classification head
+            self.classifier = nn.Sequential(
+                nn.Linear(self.hparams.token_dim, self.hparams.token_dim),
+                nn.GELU(),
+                nn.Dropout(self.hparams.dropout),
+                nn.Linear(self.hparams.token_dim, self.output_dim)
+            )
+        else:
+            self.classifier = None # Not used in pretrain mode
+            self.output_dim = None # Not applicable in pretrain mode
         
         # Results storage for test metrics
         self.test_results = {}
