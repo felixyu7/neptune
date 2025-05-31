@@ -137,25 +137,3 @@ def batched_coordinates(list_of_coords: List[Tensor],
         out.requires_grad_(True)
 
     return out
-
-    # else: # Remove NumPy logic as we expect tensors now
-    #     # NumPy logic:
-    #     # If no dtype provided, use the dtype of the first array
-    #     if dtype is None:
-    #         dtype = first.dtype
-
-    #     cat_list = []
-    #     for b, coords in enumerate(list_of_coords):
-    #         coords = coords.astype(dtype, copy=False)
-
-    #         # Create a column of batch indices
-    #         b_idx = np.full((coords.shape[0], 1), b, dtype=dtype)
-
-    #         # Concatenate [batch_index_column, coords]
-    #         out_coords = np.concatenate([b_idx, coords], axis=1)
-    #         cat_list.append(out_coords)
-
-    #     # Final concatenation
-    #     out = np.concatenate(cat_list, axis=0)
-
-    #     return out 

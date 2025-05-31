@@ -322,7 +322,7 @@ class Neptune(pl.LightningModule):
             get_labels = lambda labels: labels[:, 0]
             if loss_choice == 'log_cosh': return lambda preds, labels: LogCoshLoss(preds.squeeze(-1) if preds.dim() > 1 else preds, get_labels(labels))
             if loss_choice == 'gaussian_nll': return lambda preds, labels: GaussianNLLLoss(preds[:, 0], preds[:, 1], get_labels(labels))
-        raise ValueError(f"Unhandled task/loss: {task}/{loss_choice}") 
+        raise ValueError(f"Unhandled task/loss: {task}/{loss_choice}")
 
     def step(self, batch: Tuple[Tensor, Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
         coords, features, labels = batch

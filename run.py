@@ -16,7 +16,6 @@ from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 
 from neptune.models import Neptune
 from neptune.dataloaders.prometheus import PrometheusDataModule
-from neptune.dataloaders.icecube_parquet import ICParquetDataModule
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Neptune: An Efficient Point Transformer for Ultrarelativistic Neutrino Events")
@@ -44,8 +43,6 @@ def main():
     # Initialize dataloader
     if cfg['dataloader'] == 'prometheus':
         dm = PrometheusDataModule(cfg)
-    elif cfg['dataloader'] == 'icecube_parquet':
-        dm = ICParquetDataModule(cfg)
     else:
         print(f"Unknown dataloader: {cfg['dataloader']}")
         exit(1)
