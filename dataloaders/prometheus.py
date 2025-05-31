@@ -6,7 +6,7 @@ import lightning.pytorch as pl
 import awkward as ak
 import pyarrow.parquet as pq
 
-from neptune.dataloaders.data_utils import IrregularDataCollator, get_file_names, ParquetFileSampler
+from dataloaders.data_utils import IrregularDataCollator, get_file_names, ParquetFileSampler
 
 class PrometheusDataModule(pl.LightningDataModule):
     """
@@ -150,7 +150,7 @@ class PrometheusDataset(torch.utils.data.Dataset):
                             event.om2vec.sensor_pos_y.to_numpy(),
                             event.om2vec.sensor_pos_z.to_numpy()]).T
             # first hit time from summary stats
-            ts = event.om2vec.summary_stats.to_numpy()[:, 3]
+            ts = event.om2vec.summary_stats.to_numpy()[:, 3] / 1000. # convert to microseconds
             pos_t = np.concatenate((pos, ts[:, np.newaxis]), axis=1)
             feats = event.om2vec.latents.to_numpy()
         else: # using summary stats
@@ -158,8 +158,10 @@ class PrometheusDataset(torch.utils.data.Dataset):
                             event.om2vec.sensor_pos_y.to_numpy(),
                             event.om2vec.sensor_pos_z.to_numpy()]).T
             # first hit time from summary stats
-            ts = event.om2vec.summary_stats.to_numpy()[:, 3]
+            ts = event.om2vec.summary_stats.to_numpy()[:, 3] / 1000. # convert to microseconds
             pos_t = np.concatenate((pos, ts[:, np.newaxis]), axis=1)
             feats = event.om2vec.summary_stats.to_numpy()
-            
+            # log normalize
+            feats = np.log(feats + 1)
+
         return torch.from_numpy(pos_t).float(), torch.from_numpy(feats).float(), torch.from_numpy(np.array([label])).float() 

@@ -1,4 +1,4 @@
-from neptune.utils.utils import (
+from utils.utils import (
     LogCoshLoss,
     AngularDistanceLoss,
     GaussianNLLLoss,

@@ -14,8 +14,8 @@ sys.path.insert(0, project_root)
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 
-from neptune.models import Neptune
-from neptune.dataloaders.prometheus import PrometheusDataModule
+from models.neptune import Neptune
+from dataloaders.prometheus import PrometheusDataModule
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Neptune: An Efficient Point Transformer for Ultrarelativistic Neutrino Events")

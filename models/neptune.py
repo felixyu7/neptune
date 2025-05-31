@@ -11,7 +11,7 @@ import fpsample
 import time
 
 # Local imports
-from neptune.utils import (
+from utils.utils import (
     farthest_point_sampling, 
     AngularDistanceLoss, 
     VonMisesFisherLoss, 

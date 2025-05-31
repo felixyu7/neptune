@@ -1,4 +1,4 @@
-from neptune.models.neptune import (
+from models.neptune import (
     Neptune,
     PointCloudTokenizer,
     PositionEmbedding
