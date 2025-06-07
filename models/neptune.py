@@ -414,28 +414,9 @@ class Neptune(pl.LightningModule):
         if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
             coords, features, _ = batch
             out = self(coords, features)
-            pred_feat = out["predicted_features"]
-            pred_cent = out["predicted_centroids"]
-            orig_feat = out["original_features_for_loss"]
-            orig_cent = out["original_centroids_for_loss"]
-            masked_indices = out["masked_indices"]
-            valid_token_masks = out["valid_token_masks"]
 
-            # Compute loss only at masked indices and valid tokens
-            feature_losses = []
-            centroid_losses = []
-            batch_size = pred_feat.shape[0]
-            for b in range(batch_size):
-                idx = masked_indices[b]
-                if idx.numel() == 0:
-                    continue
-                feat_loss = F.mse_loss(pred_feat[b, idx], orig_feat[b, idx], reduction="mean")
-                cent_loss = F.mse_loss(pred_cent[b, idx], orig_cent[b, idx], reduction="mean")
-                feature_losses.append(feat_loss)
-                centroid_losses.append(cent_loss)
-            feature_reconstruction_loss = torch.stack(feature_losses).mean() if feature_losses else torch.tensor(0.0, device=pred_feat.device)
-            centroid_reconstruction_loss = torch.stack(centroid_losses).mean() if centroid_losses else torch.tensor(0.0, device=pred_feat.device)
-            total_loss = feature_reconstruction_loss + self.hparams.centroid_loss_weight * centroid_reconstruction_loss
+            # Compute reconstruction losses for pretraining
+            feature_reconstruction_loss, centroid_reconstruction_loss, total_loss = self._compute_pretrain_losses(out)
 
             self.log('pretrain_feature_loss', feature_reconstruction_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
             self.log('pretrain_centroid_loss', centroid_reconstruction_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
@@ -447,33 +428,76 @@ class Neptune(pl.LightningModule):
             return loss
         
     def validation_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Dict[str, Tensor]:
-        loss, preds, labels = self.step(batch)
-        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.hparams.batch_size)
-        self.validation_step_outputs.append({"val_loss": loss.detach(), "preds": preds.detach(), "labels": labels.detach()})
-        return {"val_loss": loss.detach(), "preds": preds.detach(), "labels": labels.detach()}
+        if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
+            coords, features, _ = batch
+            out = self(coords, features)
+
+            # Compute reconstruction losses for pretraining
+            feature_reconstruction_loss, centroid_reconstruction_loss, total_loss = self._compute_pretrain_losses(out)
+
+            self.log('val_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.hparams.batch_size)
+            
+            # For pretrain mode, we don't have meaningful preds/labels for downstream tasks
+            # Store the loss components instead
+            output = {"val_loss": total_loss.detach(), "preds": torch.tensor(0.0), "labels": torch.tensor(0.0)}
+            self.validation_step_outputs.append(output)
+            return output
+        else:
+            loss, preds, labels = self.step(batch)
+            self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.hparams.batch_size)
+            self.validation_step_outputs.append({"val_loss": loss.detach(), "preds": preds.detach(), "labels": labels.detach()})
+            return {"val_loss": loss.detach(), "preds": preds.detach(), "labels": labels.detach()}
     
     def test_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Dict[str, Tensor]:
         coords, features, labels = batch
         start_time = time.time()
-        preds = self(coords, features)
-        end_time = time.time()
-        forward_time = end_time - start_time
         
-        loss_func = self._get_loss_function()
-        loss = loss_func(preds, labels)
-        
-        self.log('test_loss', loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=self.hparams.batch_size)
-        output = {
-            "test_loss": loss.detach(), 
-            "preds": preds.detach(), 
-            "labels": labels.detach(),
-            "forward_time": torch.tensor(forward_time, device=loss.device)
-        }
-        self.test_step_outputs.append(output)
-        return output
+        if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
+            out = self(coords, features)
+            end_time = time.time()
+            forward_time = end_time - start_time
+            
+            # Compute reconstruction losses for pretraining
+            feature_reconstruction_loss, centroid_reconstruction_loss, total_loss = self._compute_pretrain_losses(out)
+
+            self.log('test_loss', total_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=self.hparams.batch_size)
+            output = {
+                "test_loss": total_loss.detach(), 
+                "preds": torch.tensor(0.0), 
+                "labels": torch.tensor(0.0),
+                "forward_time": torch.tensor(forward_time, device=total_loss.device)
+            }
+            self.test_step_outputs.append(output)
+            return output
+        else:
+            preds = self(coords, features)
+            end_time = time.time()
+            forward_time = end_time - start_time
+            
+            loss_func = self._get_loss_function()
+            loss = loss_func(preds, labels)
+            
+            self.log('test_loss', loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=self.hparams.batch_size)
+            output = {
+                "test_loss": loss.detach(), 
+                "preds": preds.detach(), 
+                "labels": labels.detach(),
+                "forward_time": torch.tensor(forward_time, device=loss.device)
+            }
+            self.test_step_outputs.append(output)
+            return output
 
     def _epoch_end(self, step_outputs: List[Dict[str, Tensor]], stage: str):
         if not step_outputs: return 
+        
+        # In pretrain mode, skip downstream task metrics since we don't have meaningful preds/labels
+        if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
+            # Just log the average loss from the step outputs
+            all_losses = torch.stack([x[f'{stage}_loss'] for x in step_outputs])
+            avg_loss = all_losses.mean()
+            self.log(f'{stage}_loss_epoch', avg_loss, prog_bar=(stage=='val'))
+            return
+            
         all_preds = torch.cat([x['preds'] for x in step_outputs], dim=0)
         all_labels = torch.cat([x['labels'] for x in step_outputs], dim=0)
         loss_func = self._get_loss_function()
@@ -502,6 +526,23 @@ class Neptune(pl.LightningModule):
         # Process and save test results
         if not outputs:
             print("WARNING: No test outputs were collected. Results will not be saved.")
+            return
+        
+        # In pretrain mode, just save forward times and skip downstream task metrics
+        if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
+            all_forward_times = torch.cat([x['forward_time'].unsqueeze(0) for x in outputs], dim=0)
+            forward_times_np = all_forward_times.detach().cpu().numpy()
+            
+            self.test_results = {'forward_time': forward_times_np}
+            
+            # Save results to file
+            if self.logger is not None:
+                save_path = f"./results/{self.logger.name}_{self.logger.version}_pretrain_results.npy"
+                os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                np.save(save_path, self.test_results)
+                print(f"Pretrain test results saved to {save_path}")
+            
+            self.test_step_outputs = []
             return
             
         all_preds = torch.cat([x['preds'] for x in outputs], dim=0)
@@ -575,3 +616,39 @@ class Neptune(pl.LightningModule):
         optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.hparams.lr_schedule[1], eta_min=1e-7)
         return [optimizer], [scheduler]
+    
+    def _compute_pretrain_losses(self, forward_output: Dict[str, Any]) -> Tuple[Tensor, Tensor, Tensor]:
+        """
+        Compute reconstruction losses for pretraining from forward pass output.
+        
+        Args:
+            forward_output: Dictionary containing predicted features/centroids and targets
+            
+        Returns:
+            Tuple of (feature_reconstruction_loss, centroid_reconstruction_loss, total_loss)
+        """
+        pred_feat = forward_output["predicted_features"]
+        pred_cent = forward_output["predicted_centroids"]
+        orig_feat = forward_output["original_features_for_loss"]
+        orig_cent = forward_output["original_centroids_for_loss"]
+        masked_indices = forward_output["masked_indices"]
+
+        # Compute loss only at masked indices and valid tokens
+        feature_losses = []
+        centroid_losses = []
+        batch_size = pred_feat.shape[0]
+        
+        for b in range(batch_size):
+            idx = masked_indices[b]
+            if idx.numel() == 0:
+                continue
+            feat_loss = F.mse_loss(pred_feat[b, idx], orig_feat[b, idx], reduction="mean")
+            cent_loss = F.smooth_l1_loss(pred_cent[b, idx], orig_cent[b, idx], reduction="mean")
+            feature_losses.append(feat_loss)
+            centroid_losses.append(cent_loss)
+            
+        feature_reconstruction_loss = torch.stack(feature_losses).mean() if feature_losses else torch.tensor(0.0, device=pred_feat.device)
+        centroid_reconstruction_loss = torch.stack(centroid_losses).mean() if centroid_losses else torch.tensor(0.0, device=pred_feat.device)
+        total_loss = feature_reconstruction_loss + self.hparams.centroid_loss_weight * centroid_reconstruction_loss
+        
+        return feature_reconstruction_loss, centroid_reconstruction_loss, total_loss
