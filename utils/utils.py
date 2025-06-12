@@ -5,6 +5,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import Optional, List, Union, Any, Tuple
 import scipy.special
+import math
 
 def LogCoshLoss(pred: Tensor, truth: Tensor) -> Tensor:
     """LogCosh loss function. approximated for easier to compute gradients"""
@@ -260,47 +261,3 @@ def farthest_point_sampling(points: Tensor, n_samples: int) -> Tensor:
             min_distances = torch.minimum(min_distances, new_distances)
     
     return selected_indices
-
-# Removed downstream_task_loss function as logic is now in Neptune._get_loss_function
-# def downstream_task_loss(preds: Tensor, labels: Tensor, task: str='angular_reco', current_epoch: int=0) -> Tensor:
-#     """
-#     Compute the appropriate loss function based on the downstream task
-#     Args:
-#         preds: Model predictions
-#         labels: Ground truth labels
-#         task: The task type (angular_reco, energy_reco, combined_reco,
-#                            vmf_reco, gaussian_energy_reco)
-#         current_epoch: Current training epoch (unused but kept for compatibility)
-#     Returns:
-#         loss: The computed loss value
-#     """
-#     if task == 'angular_reco':
-#         # Angular reconstruction task (direction only)
-#         # Assumes preds/labels are shape [B, 3]
-#         return AngularDistanceLoss(preds, labels)
-#     elif task == 'energy_reco':
-#         # Energy reconstruction task
-#         # Assumes preds/labels are shape [B, 1] or [B]
-#         if preds.dim() > 1 and preds.shape[1] == 1:
-#             preds = preds.squeeze(1)
-#         if labels.dim() > 1 and labels.shape[1] == 1:
-#             labels = labels.squeeze(1)
-#         return LogCoshLoss(preds, labels)
-#     elif task == 'combined_reco':
-#         # Combined energy and direction reconstruction
-#         # Assumes preds/labels are shape [B, 4]
-#         return CombinedAngleEnergyLoss(preds, labels)
-#     elif task == 'vmf_reco':
-#         # Von Mises-Fisher loss for angular reconstruction
-#         # Assumes preds are unnormalized [B, 3], labels are unit vectors [B, 3]
-#         return VonMisesFisherLoss(preds, labels)
-#     elif task == 'gaussian_energy_reco':
-#         # Gaussian NLL loss for energy reconstruction
-#         # Assumes preds are [B, 2] (mu, var), labels are [B, 1] or [B]
-#         mu = preds[:, 0]
-#         var = preds[:, 1]
-#         if labels.dim() > 1 and labels.shape[1] == 1:
-#             labels = labels.squeeze(1)
-#         return GaussianNLLLoss(mu, var, labels)
-#     else:
-#         raise ValueError(f"Unknown task type: {task}") 

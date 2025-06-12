@@ -20,6 +20,8 @@ from utils.utils import (
     CombinedAngularVMFDistanceLoss
 )
 
+from utils.fb_losses import FB5NLLLoss, FB6NLLLoss, FB8NLLLoss, create_matrix_Gamma_torch
+
 class PointCloudTokenizer(nn.Module):
     """Converts point cloud data into tokens for transformer processing."""
     def __init__(self, 
@@ -304,7 +306,15 @@ class Neptune(pl.LightningModule):
     def _set_output_dim(self):
         task = self.hparams.downstream_task
         loss_choice = self.hparams.loss_fn
-        if task == 'angular_reco': self.output_dim = 3
+        if task == 'angular_reco': 
+            if loss_choice == 'fb8':
+                self.output_dim = 8
+            elif loss_choice == 'fb6':
+                self.output_dim = 6
+            elif loss_choice == 'kent':
+                self.output_dim = 5
+            else:
+                self.output_dim = 3
         elif task == 'energy_reco': self.output_dim = 2 if loss_choice == 'gaussian_nll' else 1
         else: raise ValueError(f"Unknown task: {task}")
 
@@ -312,7 +322,7 @@ class Neptune(pl.LightningModule):
         task = self.hparams.downstream_task
         loss_choice = self.hparams.loss_fn
         valid = {
-            'angular_reco': ['angular_distance', 'vmf', 'combined_angular_vmf'],
+            'angular_reco': ['angular_distance', 'vmf', 'combined_angular_vmf', 'kent', 'fb8', 'fb6'],
             'energy_reco': ['log_cosh', 'gaussian_nll']
         }
         if task not in valid or loss_choice not in valid[task]:
@@ -392,11 +402,54 @@ class Neptune(pl.LightningModule):
         task = self.hparams.downstream_task
         loss_choice = self.hparams.loss_fn
         if task == 'angular_reco':
-            get_labels = lambda labels: labels[:, 1:]
-            if loss_choice == 'angular_distance': return lambda preds, labels: AngularDistanceLoss(preds, get_labels(labels))
-            if loss_choice == 'vmf': return lambda preds, labels: VonMisesFisherLoss(preds, get_labels(labels))
-            if loss_choice == 'combined_angular_vmf': 
-                return lambda preds, labels: CombinedAngularVMFDistanceLoss(preds, get_labels(labels), angular_weight=0.5)
+            if loss_choice == 'fb8':
+                fb8_loss = FB8NLLLoss()
+                def fb8_loss_wrapper(preds, labels):
+                    target = labels[:, 1:]
+                    pred_theta_raw = torch.sigmoid(preds[:, 0:1].to(target.dtype)) * torch.pi  # [B, 1]
+                    pred_phi_raw = torch.sigmoid(preds[:, 1:2].to(target.dtype)) * torch.pi * 2  # [B, 1]
+                    pred_psi_raw = torch.sigmoid(preds[:, 2:3].to(target.dtype)) * torch.pi * 2  # [B, 1]
+                    pred_kappa_raw = F.softplus(preds[:, 3:4]).to(target.dtype)   # [B, 1]
+                    pred_beta_raw = F.softplus(preds[:, 4:5]).to(target.dtype)    # [B, 1]
+                    pred_eta_raw = F.tanh(preds[:, 5:6]).to(target.dtype)         # [B, 1]
+                    pred_alpha_raw = torch.sigmoid(preds[:, 6:7].to(target.dtype)) * torch.pi               # [B, 1]
+                    pred_rho_raw = torch.sigmoid(preds[:, 7:8].to(target.dtype)) * torch.pi * 2               # [B, 1]
+                    return fb8_loss(target, pred_theta_raw, pred_phi_raw, pred_psi_raw,
+                                    pred_kappa_raw, pred_beta_raw, pred_eta_raw, pred_alpha_raw, pred_rho_raw)
+                return fb8_loss_wrapper
+            elif loss_choice == 'fb6':
+                fb6_loss = FB6NLLLoss()
+                def fb6_loss_wrapper(preds, labels):
+                    target = labels[:, 1:]
+                    pred_theta_raw = torch.sigmoid(preds[:, 0:1].to(target.dtype)) * torch.pi
+                    pred_phi_raw = torch.sigmoid(preds[:, 1:2].to(target.dtype)) * torch.pi * 2
+                    pred_psi_raw = torch.sigmoid(preds[:, 2:3].to(target.dtype)) * torch.pi * 2
+                    pred_kappa_raw = F.softplus(preds[:, 3:4]).to(target.dtype)
+                    pred_beta_raw = F.softplus(preds[:, 4:5]).to(target.dtype)
+                    pred_eta_raw = F.tanh(preds[:, 5:6]).to(target.dtype)
+                    return fb6_loss(target, pred_theta_raw, pred_phi_raw, pred_psi_raw,
+                                    pred_kappa_raw, pred_beta_raw, pred_eta_raw)
+                return fb6_loss_wrapper
+            elif loss_choice == 'kent':
+                # Kent distribution loss: expects 8-dim output [mu(3), axis(3), kappa(1), beta(1)]
+                # and 3-dim target (unit vector)
+                kent_loss = FB5NLLLoss()
+                def kent_loss_wrapper(preds, labels):
+                    target = labels[:, 1:]  # Extract direction labels [B, 3]
+                    pred_theta_raw = torch.sigmoid(preds[:, 0:1].to(target.dtype)) * torch.pi  # [B, 1]
+                    pred_phi_raw = torch.sigmoid(preds[:, 1:2].to(target.dtype)) * torch.pi * 2  # [B, 1]
+                    pred_psi_raw = torch.sigmoid(preds[:, 2:3].to(target.dtype)) * torch.pi * 2  # [B, 1]
+                    pred_kappa_raw = F.softplus(preds[:, 3:4])   # [B, 1]
+                    pred_beta_raw = F.softplus(preds[:, 4:5])    # [B, 1]
+                    return kent_loss(target, pred_theta_raw, pred_phi_raw, pred_psi_raw, pred_kappa_raw, pred_beta_raw)
+                return kent_loss_wrapper
+            else:
+                # Other angular losses expect 3-dim output
+                get_labels = lambda labels: labels[:, 1:]
+                if loss_choice == 'angular_distance': return lambda preds, labels: AngularDistanceLoss(preds, get_labels(labels))
+                if loss_choice == 'vmf': return lambda preds, labels: VonMisesFisherLoss(preds, get_labels(labels))
+                if loss_choice == 'combined_angular_vmf': 
+                    return lambda preds, labels: CombinedAngularVMFDistanceLoss(preds, get_labels(labels), angular_weight=0.5)
         elif task == 'energy_reco':
             get_labels = lambda labels: labels[:, 0]
             if loss_choice == 'log_cosh': return lambda preds, labels: LogCoshLoss(preds.squeeze(-1) if preds.dim() > 1 else preds, get_labels(labels))
@@ -505,7 +558,13 @@ class Neptune(pl.LightningModule):
         self.log(f'{stage}_loss_epoch', overall_loss, prog_bar=(stage=='val'))
         if self.hparams.downstream_task == 'angular_reco':
             true_dirs = all_labels[:, 1:]
-            preds_norm = F.normalize(all_preds, p=2, dim=1)
+            if self.hparams.loss_fn == 'fb8' or self.hparams.loss_fn == 'fb6' or self.hparams.loss_fn == 'kent':
+                theta = torch.sigmoid(all_preds[:, 0]) * np.pi
+                phi = torch.sigmoid(all_preds[:, 1]) * np.pi * 2
+                psi = torch.sigmoid(all_preds[:, 2]) * np.pi * 2
+                preds_norm = create_matrix_Gamma_torch(theta, phi, psi)[:,:,0]
+            else:
+                preds_norm = F.normalize(all_preds, p=2, dim=1)
             angular_errors_rad = AngularDistanceLoss(preds_norm, true_dirs, reduction='none') * np.pi
             median_angular_error_rad = torch.median(angular_errors_rad)
             self.log(f'{stage}_median_angular_error_deg', torch.rad2deg(median_angular_error_rad))
@@ -560,8 +619,16 @@ class Neptune(pl.LightningModule):
             # Collect angular reconstruction results
             truth = labels_np[:, 1:4]  # Direction components
             
-            # Calculate angular differences
-            preds_norm = F.normalize(all_preds, p=2, dim=1)
+            if self.hparams.loss_fn == 'fb8' or self.hparams.loss_fn == 'fb6' or self.hparams.loss_fn == 'kent':
+                theta = torch.sigmoid(all_preds[:, 0]) * np.pi
+                phi = torch.sigmoid(all_preds[:, 1]) * np.pi * 2
+                psi = torch.sigmoid(all_preds[:, 2]) * np.pi * 2
+                preds_norm = create_matrix_Gamma_torch(theta, phi, psi)[:,:,0]
+                self.test_results['preds'] = all_preds.detach().cpu().numpy()
+            else:
+                # For other losses, preds are already in Cartesian coordinates
+                preds_norm = F.normalize(all_preds, p=2, dim=1)
+
             preds_norm_np = preds_norm.detach().cpu().numpy()
             
             # Compute directions and metrics
@@ -573,8 +640,9 @@ class Neptune(pl.LightningModule):
             self.test_results['angle_diff'] = angle_errors_deg_np
             self.test_results['true_e'] = labels_np[:, 0]  # Energy component
             
-            # Calculate kappa (magnitude of direction vectors)
-            self.test_results['kappa'] = np.linalg.norm(preds_np, axis=1)
+            if self.hparams.loss_fn == 'vmf':
+                # Calculate kappa (magnitude of direction vectors)
+                self.test_results['kappa'] = np.linalg.norm(preds_np, axis=1)
             
             # Calculate zenith and azimuth angles
             pred_zenith = np.arccos(preds_norm_np[:, 2])

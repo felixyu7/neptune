@@ -106,7 +106,7 @@ def main():
             print("Error: checkpoint must be specified for finetune mode.")
             exit(1)
     else:  # supervised (default)
-        if checkpoint_path != '' and cfg.get('resume_training', False):
+        if checkpoint_path != '':
             print(f"Loading checkpoint for resume_training: {checkpoint_path}")
             model = Neptune.load_from_checkpoint(
                 checkpoint_path,
