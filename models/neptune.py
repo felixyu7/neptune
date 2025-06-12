@@ -273,12 +273,10 @@ class Neptune(pl.LightningModule):
         )
         
         # Mask Embeddings for MPM Pretraining
-        self.feature_mask_embedding = nn.Parameter(torch.randn(1, 1, self.hparams.token_dim))
-        self.centroid_mask_embedding = nn.Parameter(torch.randn(1, 1, 4))
+        self.centroid_mask_embedding = nn.Parameter(torch.randn(1, 1, 3))
         
         # MPM Heads for Pretraining
-        self.mpm_feature_predictor = nn.Linear(self.hparams.token_dim, self.hparams.token_dim)
-        self.mpm_centroid_predictor = nn.Linear(self.hparams.token_dim, 4)
+        self.mpm_centroid_predictor = nn.Linear(self.hparams.token_dim, 3)
         
         # Downstream task specific setup
         if self.hparams.training_mode != 'pretrain':
@@ -334,7 +332,6 @@ class Neptune(pl.LightningModule):
 
         if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
             # 1. Clone original features and centroids for loss calculation
-            original_features_for_loss = tokens.clone()
             original_centroids_for_loss = centroids.clone()
 
             # 2. Masking logic (applied per batch item)
@@ -371,8 +368,7 @@ class Neptune(pl.LightningModule):
                 actual_masked_indices_list.append(item_masked_indices)
 
                 # Apply mask embeddings, ensuring dtype compatibility
-                input_features[b, item_masked_indices, :] = self.feature_mask_embedding.squeeze(0).to(input_features.dtype)
-                input_centroids[b, item_masked_indices, :] = self.centroid_mask_embedding.squeeze(0).to(input_centroids.dtype)
+                input_centroids[b, item_masked_indices, :3] = self.centroid_mask_embedding.squeeze(0).to(input_centroids.dtype)
 
             # 3. Encode masked features and centroids
             encoded_per_token_output = self.encoder(
@@ -380,14 +376,11 @@ class Neptune(pl.LightningModule):
             )
 
             # 4. Predict original features and centroids from encoded output
-            predicted_features = self.mpm_feature_predictor(encoded_per_token_output)
             predicted_centroids = self.mpm_centroid_predictor(encoded_per_token_output)
 
             # 5. Return structure for loss computation
             return {
-                "predicted_features": predicted_features,
                 "predicted_centroids": predicted_centroids,
-                "original_features_for_loss": original_features_for_loss,
                 "original_centroids_for_loss": original_centroids_for_loss,
                 "masked_indices": actual_masked_indices_list, # List of tensors with actual masked indices per batch item
                 "valid_token_masks": valid_token_masks,
@@ -469,9 +462,8 @@ class Neptune(pl.LightningModule):
             out = self(coords, features)
 
             # Compute reconstruction losses for pretraining
-            feature_reconstruction_loss, centroid_reconstruction_loss, total_loss = self._compute_pretrain_losses(out)
+            centroid_reconstruction_loss, total_loss = self._compute_pretrain_losses(out)
 
-            self.log('pretrain_feature_loss', feature_reconstruction_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
             self.log('pretrain_centroid_loss', centroid_reconstruction_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
             self.log('pretrain_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
             return total_loss
@@ -486,7 +478,7 @@ class Neptune(pl.LightningModule):
             out = self(coords, features)
 
             # Compute reconstruction losses for pretraining
-            feature_reconstruction_loss, centroid_reconstruction_loss, total_loss = self._compute_pretrain_losses(out)
+            centroid_reconstruction_loss, total_loss = self._compute_pretrain_losses(out)
 
             self.log('val_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.hparams.batch_size)
             
@@ -511,7 +503,7 @@ class Neptune(pl.LightningModule):
             forward_time = end_time - start_time
             
             # Compute reconstruction losses for pretraining
-            feature_reconstruction_loss, centroid_reconstruction_loss, total_loss = self._compute_pretrain_losses(out)
+            centroid_reconstruction_loss, total_loss = self._compute_pretrain_losses(out)
 
             self.log('test_loss', total_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=self.hparams.batch_size)
             output = {
@@ -685,7 +677,7 @@ class Neptune(pl.LightningModule):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.hparams.lr_schedule[1], eta_min=1e-7)
         return [optimizer], [scheduler]
     
-    def _compute_pretrain_losses(self, forward_output: Dict[str, Any]) -> Tuple[Tensor, Tensor, Tensor]:
+    def _compute_pretrain_losses(self, forward_output: Dict[str, Any]) -> Tuple[Tensor, Tensor]:
         """
         Compute reconstruction losses for pretraining from forward pass output.
         
@@ -693,30 +685,24 @@ class Neptune(pl.LightningModule):
             forward_output: Dictionary containing predicted features/centroids and targets
             
         Returns:
-            Tuple of (feature_reconstruction_loss, centroid_reconstruction_loss, total_loss)
+            Tuple of (centroid_reconstruction_loss, total_loss)
         """
-        pred_feat = forward_output["predicted_features"]
         pred_cent = forward_output["predicted_centroids"]
-        orig_feat = forward_output["original_features_for_loss"]
         orig_cent = forward_output["original_centroids_for_loss"]
         masked_indices = forward_output["masked_indices"]
 
         # Compute loss only at masked indices and valid tokens
-        feature_losses = []
         centroid_losses = []
-        batch_size = pred_feat.shape[0]
+        batch_size = pred_cent.shape[0]
         
         for b in range(batch_size):
             idx = masked_indices[b]
             if idx.numel() == 0:
                 continue
-            feat_loss = F.mse_loss(pred_feat[b, idx], orig_feat[b, idx], reduction="mean")
-            cent_loss = F.smooth_l1_loss(pred_cent[b, idx], orig_cent[b, idx], reduction="mean")
-            feature_losses.append(feat_loss)
+            cent_loss = F.smooth_l1_loss(pred_cent[b, idx], orig_cent[b, idx, :3], reduction="mean")
             centroid_losses.append(cent_loss)
             
-        feature_reconstruction_loss = torch.stack(feature_losses).mean() if feature_losses else torch.tensor(0.0, device=pred_feat.device)
-        centroid_reconstruction_loss = torch.stack(centroid_losses).mean() if centroid_losses else torch.tensor(0.0, device=pred_feat.device)
-        total_loss = feature_reconstruction_loss + self.hparams.centroid_loss_weight * centroid_reconstruction_loss
+        centroid_reconstruction_loss = torch.stack(centroid_losses).mean() if centroid_losses else torch.tensor(0.0, device=pred_cent.device)
+        total_loss = self.hparams.centroid_loss_weight * centroid_reconstruction_loss
         
-        return feature_reconstruction_loss, centroid_reconstruction_loss, total_loss
+        return centroid_reconstruction_loss, total_loss
