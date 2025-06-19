@@ -11,7 +11,7 @@ import sys
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, project_root)
 
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers import WandbLogger, CSVLogger
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 
 from models.neptune import Neptune
@@ -187,8 +187,12 @@ def main():
             trainer.fit(model=model, datamodule=dm)
     else:
         # Test mode
-        logger = WandbLogger(project=cfg['project_name'], save_dir=cfg['project_save_dir'])
-        logger.experiment.config["batch_size"] = cfg['training_options']['batch_size']
+        # logger = WandbLogger(project=cfg['project_name'], save_dir=cfg['project_save_dir'])
+        # logger.experiment.config["batch_size"] = cfg['training_options']['batch_size']
+        logger = CSVLogger(
+            save_dir=os.path.join(cfg['project_save_dir'], cfg['project_name'], 'logs'),
+            name='test_logs'
+        )
         
         trainer = pl.Trainer(
             accelerator=cfg['accelerator'], 

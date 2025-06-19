@@ -20,7 +20,7 @@ from utils.utils import (
     CombinedAngularVMFDistanceLoss
 )
 
-from utils.fb_losses import FB5NLLLoss, FB6NLLLoss, FB8NLLLoss, create_matrix_Gamma_torch
+from utils.fb_losses import FB5NLLLoss, FB6NLLLoss, EfficientFB8NLLLoss, create_matrix_Gamma_torch, spherical_coordinates_to_nu_torch
 
 class PointCloudTokenizer(nn.Module):
     """Converts point cloud data into tokens for transformer processing."""
@@ -295,6 +295,10 @@ class Neptune(pl.LightningModule):
             self.classifier = None # Not used in pretrain mode
             self.output_dim = None # Not applicable in pretrain mode
         
+        # kappa parameters for FB8 loss
+        if loss_fn == 'fb8':
+            self.soft_kappa_cap = 150.
+
         # Results storage for test metrics
         self.test_results = {}
         # Manual storage for test outputs when not in training mode
@@ -396,13 +400,13 @@ class Neptune(pl.LightningModule):
         loss_choice = self.hparams.loss_fn
         if task == 'angular_reco':
             if loss_choice == 'fb8':
-                fb8_loss = FB8NLLLoss()
+                fb8_loss = EfficientFB8NLLLoss()
                 def fb8_loss_wrapper(preds, labels):
                     target = labels[:, 1:]
                     pred_theta_raw = torch.sigmoid(preds[:, 0:1].to(target.dtype)) * torch.pi  # [B, 1]
                     pred_phi_raw = torch.sigmoid(preds[:, 1:2].to(target.dtype)) * torch.pi * 2  # [B, 1]
                     pred_psi_raw = torch.sigmoid(preds[:, 2:3].to(target.dtype)) * torch.pi * 2  # [B, 1]
-                    pred_kappa_raw = F.softplus(preds[:, 3:4]).to(target.dtype)   # [B, 1]
+                    pred_kappa_raw = F.softplus(preds[:, 3:4] + self.soft_kappa_cap).to(target.dtype)   # [B, 1]
                     pred_beta_raw = F.softplus(preds[:, 4:5]).to(target.dtype)    # [B, 1]
                     pred_eta_raw = F.tanh(preds[:, 5:6]).to(target.dtype)         # [B, 1]
                     pred_alpha_raw = torch.sigmoid(preds[:, 6:7].to(target.dtype)) * torch.pi               # [B, 1]
@@ -432,8 +436,8 @@ class Neptune(pl.LightningModule):
                     pred_theta_raw = torch.sigmoid(preds[:, 0:1].to(target.dtype)) * torch.pi  # [B, 1]
                     pred_phi_raw = torch.sigmoid(preds[:, 1:2].to(target.dtype)) * torch.pi * 2  # [B, 1]
                     pred_psi_raw = torch.sigmoid(preds[:, 2:3].to(target.dtype)) * torch.pi * 2  # [B, 1]
-                    pred_kappa_raw = F.softplus(preds[:, 3:4])   # [B, 1]
-                    pred_beta_raw = F.softplus(preds[:, 4:5])    # [B, 1]
+                    pred_kappa_raw = F.softplus(preds[:, 3:4]).to(target.dtype)   # [B, 1]
+                    pred_beta_raw = F.softplus(preds[:, 4:5]).to(target.dtype)    # [B, 1]
                     return kent_loss(target, pred_theta_raw, pred_phi_raw, pred_psi_raw, pred_kappa_raw, pred_beta_raw)
                 return kent_loss_wrapper
             else:
@@ -554,7 +558,14 @@ class Neptune(pl.LightningModule):
                 theta = torch.sigmoid(all_preds[:, 0]) * np.pi
                 phi = torch.sigmoid(all_preds[:, 1]) * np.pi * 2
                 psi = torch.sigmoid(all_preds[:, 2]) * np.pi * 2
-                preds_norm = create_matrix_Gamma_torch(theta, phi, psi)[:,:,0]
+                Gamma = create_matrix_Gamma_torch(theta, phi, psi)
+                if self.hparams.loss_fn == 'fb8':
+                    alpha = torch.sigmoid(all_preds[:, 6]) * np.pi
+                    rho = torch.sigmoid(all_preds[:, 7]) * np.pi * 2
+                    nu = spherical_coordinates_to_nu_torch(alpha, rho)
+                    preds_norm = torch.bmm(Gamma, nu.unsqueeze(2)).squeeze(2)
+                else:
+                    preds_norm = Gamma[:,:,0]
             else:
                 preds_norm = F.normalize(all_preds, p=2, dim=1)
             angular_errors_rad = AngularDistanceLoss(preds_norm, true_dirs, reduction='none') * np.pi
@@ -615,7 +626,14 @@ class Neptune(pl.LightningModule):
                 theta = torch.sigmoid(all_preds[:, 0]) * np.pi
                 phi = torch.sigmoid(all_preds[:, 1]) * np.pi * 2
                 psi = torch.sigmoid(all_preds[:, 2]) * np.pi * 2
-                preds_norm = create_matrix_Gamma_torch(theta, phi, psi)[:,:,0]
+                Gamma = create_matrix_Gamma_torch(theta, phi, psi)
+                if self.hparams.loss_fn == 'fb8':
+                    alpha = torch.sigmoid(all_preds[:, 6]) * np.pi
+                    rho = torch.sigmoid(all_preds[:, 7]) * np.pi * 2
+                    nu = spherical_coordinates_to_nu_torch(alpha, rho)
+                    preds_norm = torch.bmm(Gamma, nu.unsqueeze(2)).squeeze(2)
+                else:
+                    preds_norm = Gamma[:,:,0]
                 self.test_results['preds'] = all_preds.detach().cpu().numpy()
             else:
                 # For other losses, preds are already in Cartesian coordinates

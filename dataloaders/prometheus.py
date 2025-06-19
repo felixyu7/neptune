@@ -87,9 +87,10 @@ class PrometheusDataset(torch.utils.data.Dataset):
     
     Handles loading data from parquet files and preprocessing it for the model.
     """
-    def __init__(self, files, use_om2vec):
+    def __init__(self, files, use_om2vec, use_summary_stats=False):
         self.files = files
         self.use_om2vec = use_om2vec
+        self.use_summary_stats = use_summary_stats
 
         # Count number of events in each file
         num_events = []
@@ -151,7 +152,7 @@ class PrometheusDataset(torch.utils.data.Dataset):
             ts = event.om2vec.summary_stats.to_numpy()[:, 3] / 1000. # convert to microseconds
             pos_t = np.concatenate((pos, ts[:, np.newaxis]), axis=1)
             feats = event.om2vec.latents.to_numpy()
-        else: # using summary stats
+        elif self.use_summary_stats: # using summary stats
             pos = np.array([event.om2vec.sensor_pos_x.to_numpy(),
                             event.om2vec.sensor_pos_y.to_numpy(),
                             event.om2vec.sensor_pos_z.to_numpy()]).T
@@ -161,5 +162,18 @@ class PrometheusDataset(torch.utils.data.Dataset):
             feats = event.om2vec.summary_stats.to_numpy()
             # log normalize
             feats = np.log(feats + 1)
+        else: # using full pulse series
+            pos_t = np.array([event.photons.sensor_pos_x.to_numpy(),
+                              event.photons.sensor_pos_y.to_numpy(),
+                              event.photons.sensor_pos_z.to_numpy(),
+                              event.photons.t.to_numpy() - event.photons.t.to_numpy().min()]).T
+            
+            # Bin times (3 ns)
+            time_bins = np.floor(pos_t[:, 3] / 3.0) * 3.0
+            rows = np.column_stack((pos_t[:, :3], time_bins))    # shape (N_hits, 4)
+            unique_rows, counts = np.unique(rows, axis=0, return_counts=True)
+            pos_t = unique_rows.astype(np.float32)
+            pos_t /= 1000.0
+            feats = np.log(counts + 1).astype(np.float32)[:, None]   # (N_bins, 1)
 
         return torch.from_numpy(pos_t).float(), torch.from_numpy(feats).float(), torch.from_numpy(np.array([label])).float()
