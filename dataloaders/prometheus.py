@@ -34,7 +34,11 @@ class PrometheusDataModule(pl.LightningDataModule):
                 self.cfg['data_options']['shuffle_files']
             )
             self.train_dataset = PrometheusDataset(train_files,
-                                                   self.cfg['data_options']['use_om2vec'])
+                                                   self.cfg['data_options'].get('use_om2vec', False),
+                                                   self.cfg['data_options'].get('use_summary_stats', False),
+                                                   self.cfg['data_options'].get('add_noise', False),
+                                                   self.cfg['data_options'].get('time_variance', 1.0),
+                                                   self.cfg['data_options'].get('dropout_fraction', 0.1))
             
         valid_files = get_file_names(
             self.cfg['data_options']['valid_data_files'], 
@@ -42,7 +46,11 @@ class PrometheusDataModule(pl.LightningDataModule):
             self.cfg['data_options']['shuffle_files']
         )
         self.valid_dataset = PrometheusDataset(valid_files,
-                                               self.cfg['data_options']['use_om2vec'])
+                                               self.cfg['data_options'].get('use_om2vec', False),
+                                               self.cfg['data_options'].get('use_summary_stats', False),
+                                               self.cfg['data_options'].get('add_noise', False),
+                                               self.cfg['data_options'].get('time_variance', 1.0),
+                                               self.cfg['data_options'].get('dropout_fraction', 0.1))
 
     def train_dataloader(self):
         """Returns the training dataloader."""
@@ -87,10 +95,13 @@ class PrometheusDataset(torch.utils.data.Dataset):
     
     Handles loading data from parquet files and preprocessing it for the model.
     """
-    def __init__(self, files, use_om2vec, use_summary_stats=False):
+    def __init__(self, files, use_om2vec, use_summary_stats=False, add_noise=False, time_variance=1.0, dropout_fraction=0.1):
         self.files = files
         self.use_om2vec = use_om2vec
         self.use_summary_stats = use_summary_stats
+        self.add_noise = add_noise
+        self.time_variance = time_variance
+        self.dropout_fraction = dropout_fraction
 
         # Count number of events in each file
         num_events = []
@@ -173,6 +184,18 @@ class PrometheusDataset(torch.utils.data.Dataset):
             rows = np.column_stack((pos_t[:, :3], time_bins))    # shape (N_hits, 4)
             unique_rows, counts = np.unique(rows, axis=0, return_counts=True)
             pos_t = unique_rows.astype(np.float32)
+            
+            if self.add_noise:
+                # 1. Add random timing noise to the binned time
+                time_noise = np.random.normal(0, np.sqrt(self.time_variance), size=pos_t.shape[0])
+                pos_t[:, 3] += time_noise
+
+                # 2. Apply random photon efficiency noise (dropout)
+                n_photons = pos_t.shape[0]
+                dropout_mask = np.random.random(n_photons) > self.dropout_fraction
+                pos_t = pos_t[dropout_mask]
+                counts = counts[dropout_mask]
+
             pos_t /= 1000.0
             feats = np.log(counts + 1).astype(np.float32)[:, None]   # (N_bins, 1)
 
