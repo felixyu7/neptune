@@ -55,7 +55,7 @@ class ParquetFileSampler(Sampler):
                 yield indices[i:i+self.batch_size].tolist()
 
     def __len__(self) -> int:
-       return len(self.data_source)
+       return (len(self.data_source) + self.batch_size - 1) // self.batch_size
 
 class IrregularDataCollator(object):
     """

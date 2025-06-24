@@ -76,7 +76,9 @@ def main():
             weight_decay=cfg['training_options']['weight_decay'],
             training_mode='pretrain',
             pretrain_masking_ratio=masking_ratio, # hparam name is pretrain_masking_ratio
-            centroid_loss_weight=centroid_loss_weight # Pass centroid_loss_weight
+            centroid_loss_weight=centroid_loss_weight, # Pass centroid_loss_weight
+            coral_regularization=cfg['regularization_options'].get('coral_regularization', False),
+            coral_regularization_weight=cfg['regularization_options'].get('coral_regularization_weight', 1.0)
         )
     elif training_mode == 'finetune':
         if checkpoint_path != '':
@@ -100,7 +102,9 @@ def main():
                 lr=cfg['training_options']['lr'],
                 lr_schedule=cfg['training_options']['lr_schedule'],
                 weight_decay=cfg['training_options']['weight_decay'],
-                training_mode='finetune'
+                training_mode='finetune',
+                coral_regularization=cfg['regularization_options'].get('coral_regularization', False),
+                coral_regularization_weight=cfg['regularization_options'].get('coral_regularization_weight', 1.0)
             )
         else:
             print("Error: checkpoint must be specified for finetune mode.")
@@ -127,7 +131,9 @@ def main():
                 lr=cfg['training_options']['lr'],
                 lr_schedule=cfg['training_options']['lr_schedule'],
                 weight_decay=cfg['training_options']['weight_decay'],
-                training_mode='supervised'
+                training_mode='supervised',
+                coral_regularization=cfg['regularization_options'].get('coral_regularization', False),
+                coral_regularization_weight=cfg['regularization_options'].get('coral_regularization_weight', 1.0)
             )
         else:
             model = Neptune(
@@ -147,7 +153,9 @@ def main():
                 lr=cfg['training_options']['lr'],
                 lr_schedule=cfg['training_options']['lr_schedule'],
                 weight_decay=cfg['training_options']['weight_decay'],
-                training_mode='supervised'
+                training_mode='supervised',
+                coral_regularization=cfg['regularization_options'].get('coral_regularization', False),
+                coral_regularization_weight=cfg['regularization_options'].get('coral_regularization_weight', 1.0)
             )
             
     # Setup trainer

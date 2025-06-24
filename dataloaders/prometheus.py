@@ -229,4 +229,4 @@ class PrometheusDataset(torch.utils.data.Dataset):
         if self.is_real_data:
             return torch.from_numpy(pos_t).float(), torch.from_numpy(feats).float()
         else:
-            return torch.from_numpy(pos_t).float(), torch.from_numpy(feats).float(), torch.from_numpy(np.array([label])).float()
+            return torch.from_numpy(pos_t).float(), torch.from_numpy(feats).float(), torch.from_numpy(np.array(label)).float()
