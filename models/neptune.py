@@ -176,24 +176,43 @@ class PointTransformerEncoder(nn.Module):
         # Output normalization
         self.ln = nn.LayerNorm(token_dim)
     
-    def forward(self, tokens, centroids, masks=None, return_per_token_features=False):
+    def forward(self, tokens, centroids, masks=None, return_per_token_features=False, return_intermediate_features=False):
         """Process tokens through transformer architecture."""
         # Add positional embeddings
         pos_embed_out = self.pos_embed(centroids)
         tokens = tokens + pos_embed_out
 
-        # Apply transformer layers
+        # Collect intermediate features for Deep CORAL
+        intermediate_features = []
+        
+        # Apply transformer layers one by one to collect intermediate activations
         if masks is not None:
             attention_mask = ~masks
-            tokens = self.layers(tokens, src_key_padding_mask=attention_mask)
         else:
-            tokens = self.layers(tokens)
+            attention_mask = None
+            
+        # Manual iteration through transformer layers
+        for layer in self.layers.layers:
+            tokens = layer(tokens, src_key_padding_mask=attention_mask)
+            if return_intermediate_features:
+                # Apply global pooling to intermediate tokens for CORAL
+                if masks is not None:
+                    valid_tokens = tokens * masks.unsqueeze(-1)
+                    token_sum = valid_tokens.sum(dim=1)
+                    valid_count = masks.sum(dim=1, keepdim=True).clamp(min=1)
+                    pooled_features = token_sum / valid_count
+                else:
+                    pooled_features = tokens.mean(dim=1)
+                intermediate_features.append(pooled_features)
         
         # Apply final normalization
         normed_tokens = self.ln(tokens)
 
         if return_per_token_features:
+            if return_intermediate_features:
+                return normed_tokens, intermediate_features
             return normed_tokens
+            
         # Global average pooling
         if masks is not None:
             valid_tokens = normed_tokens * masks.unsqueeze(-1)
@@ -202,6 +221,9 @@ class PointTransformerEncoder(nn.Module):
             global_features = token_sum / valid_count
         else:
             global_features = normed_tokens.mean(dim=1)
+            
+        if return_intermediate_features:
+            return global_features, intermediate_features
         return global_features
 
 class PositionEmbedding(nn.Module):
@@ -251,7 +273,9 @@ class Neptune(pl.LightningModule):
         centroid_loss_weight: float = 1.0,
         pretrain_masking_ratio: float = 0.15,
         coral_regularization: bool = False,
-        coral_regularization_weight: float = 1.0
+        coral_regularization_weight: float = 1.0,
+        deep_coral_layers: List[int] = [5, 8],
+        deep_coral_weights: List[float] = [1.0, 0.5]
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -402,11 +426,15 @@ class Neptune(pl.LightningModule):
             }
         else:
             # Standard supervised forward
-            global_features = self.encoder(tokens, centroids, valid_token_masks) # was 'masks'
-            output = self.classifier(global_features)
             if self.hparams.coral_regularization:
-                return output, global_features
-            return output
+                # Get both global features and intermediate features for Deep CORAL
+                global_features, intermediate_features = self.encoder(tokens, centroids, valid_token_masks, return_intermediate_features=True)
+                output = self.classifier(global_features)
+                return output, global_features, intermediate_features
+            else:
+                global_features = self.encoder(tokens, centroids, valid_token_masks)
+                output = self.classifier(global_features)
+                return output
 
     def _get_loss_function(self) -> callable:
         task = self.hparams.downstream_task
@@ -483,9 +511,38 @@ class Neptune(pl.LightningModule):
         
         return loss
 
+    def deep_coral_loss(self, mc_intermediate_features: List[Tensor], data_intermediate_features: List[Tensor]) -> Tensor:
+        """
+        Compute Deep CORAL loss on multiple intermediate transformer layers.
+        
+        Args:
+            mc_intermediate_features: List of intermediate feature tensors from MC data
+            data_intermediate_features: List of intermediate feature tensors from real data
+            
+        Returns:
+            Combined Deep CORAL loss across specified layers
+        """
+        total_loss = torch.tensor(0.0, device=mc_intermediate_features[0].device)
+        
+        for layer_idx, weight in zip(self.hparams.deep_coral_layers, self.hparams.deep_coral_weights):
+            if layer_idx < len(mc_intermediate_features) and layer_idx < len(data_intermediate_features):
+                mc_features = mc_intermediate_features[layer_idx]
+                data_features = data_intermediate_features[layer_idx]
+                layer_coral_loss = self.coral_loss(mc_features, data_features)
+                total_loss += weight * layer_coral_loss
+                
+        return total_loss
+
     def step(self, batch: Tuple[Tensor, Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
         coords, features, labels = batch
-        preds = self(coords, features)
+        output = self(coords, features)
+        
+        # Handle CORAL case where forward returns (preds, global_features, intermediate_features)
+        if self.hparams.coral_regularization and isinstance(output, tuple):
+            preds, _, _ = output  # Extract predictions, ignore global and intermediate features
+        else:
+            preds = output
+            
         loss_func = self._get_loss_function()
         loss = loss_func(preds, labels)
         return loss, preds, labels
@@ -507,22 +564,27 @@ class Neptune(pl.LightningModule):
                 
                 # MC forward pass
                 mc_coords, mc_features, mc_labels = mc_batch
-                mc_preds, mc_global_features = self(mc_coords, mc_features)
+                mc_preds, mc_global_features, mc_intermediate_features = self(mc_coords, mc_features)
                 
                 # Data forward pass
                 data_coords, data_features = data_batch
-                _, data_global_features = self(data_coords, data_features)
+                _, data_global_features, data_intermediate_features = self(data_coords, data_features)
                 
                 # Standard loss
                 loss_func = self._get_loss_function()
                 loss = loss_func(mc_preds, mc_labels)
                 
-                # CORAL loss
-                coral_loss = self.coral_loss(mc_global_features, data_global_features)
-                total_loss = loss + self.hparams.coral_regularization_weight * coral_loss
+                # Deep CORAL loss (includes both global and intermediate features)
+                global_coral_loss = self.coral_loss(mc_global_features, data_global_features)
+                deep_coral_loss = self.deep_coral_loss(mc_intermediate_features, data_intermediate_features)
+                total_coral_loss = global_coral_loss + deep_coral_loss
+                
+                total_loss = loss + self.hparams.coral_regularization_weight * total_coral_loss
                 
                 self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
-                self.log('train_coral_loss', coral_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
+                self.log('train_global_coral_loss', global_coral_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
+                self.log('train_deep_coral_loss', deep_coral_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
+                self.log('train_total_coral_loss', total_coral_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
                 self.log('train_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
                 
                 return total_loss
@@ -574,9 +636,15 @@ class Neptune(pl.LightningModule):
             self.test_step_outputs.append(output)
             return output
         else:
-            preds = self(coords, features)
+            output = self(coords, features)
             end_time = time.time()
             forward_time = end_time - start_time
+            
+            # Handle CORAL case where forward returns (preds, global_features, intermediate_features)
+            if self.hparams.coral_regularization and isinstance(output, tuple):
+                preds, _, _ = output  # Extract predictions, ignore global and intermediate features
+            else:
+                preds = output
             
             loss_func = self._get_loss_function()
             loss = loss_func(preds, labels)

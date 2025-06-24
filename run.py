@@ -78,7 +78,9 @@ def main():
             pretrain_masking_ratio=masking_ratio, # hparam name is pretrain_masking_ratio
             centroid_loss_weight=centroid_loss_weight, # Pass centroid_loss_weight
             coral_regularization=cfg['regularization_options'].get('coral_regularization', False),
-            coral_regularization_weight=cfg['regularization_options'].get('coral_regularization_weight', 1.0)
+            coral_regularization_weight=cfg['regularization_options'].get('coral_regularization_weight', 1.0),
+            deep_coral_layers=cfg['regularization_options'].get('deep_coral_layers', [5, 8]),
+            deep_coral_weights=cfg['regularization_options'].get('deep_coral_weights', [1.0, 0.5])
         )
     elif training_mode == 'finetune':
         if checkpoint_path != '':
@@ -104,7 +106,9 @@ def main():
                 weight_decay=cfg['training_options']['weight_decay'],
                 training_mode='finetune',
                 coral_regularization=cfg['regularization_options'].get('coral_regularization', False),
-                coral_regularization_weight=cfg['regularization_options'].get('coral_regularization_weight', 1.0)
+                coral_regularization_weight=cfg['regularization_options'].get('coral_regularization_weight', 1.0),
+                deep_coral_layers=cfg['regularization_options'].get('deep_coral_layers', [5, 8]),
+                deep_coral_weights=cfg['regularization_options'].get('deep_coral_weights', [1.0, 0.5])
             )
         else:
             print("Error: checkpoint must be specified for finetune mode.")
@@ -133,7 +137,9 @@ def main():
                 weight_decay=cfg['training_options']['weight_decay'],
                 training_mode='supervised',
                 coral_regularization=cfg['regularization_options'].get('coral_regularization', False),
-                coral_regularization_weight=cfg['regularization_options'].get('coral_regularization_weight', 1.0)
+                coral_regularization_weight=cfg['regularization_options'].get('coral_regularization_weight', 1.0),
+                deep_coral_layers=cfg['regularization_options'].get('deep_coral_layers', [5, 8]),
+                deep_coral_weights=cfg['regularization_options'].get('deep_coral_weights', [1.0, 0.5])
             )
         else:
             model = Neptune(
@@ -155,7 +161,9 @@ def main():
                 weight_decay=cfg['training_options']['weight_decay'],
                 training_mode='supervised',
                 coral_regularization=cfg['regularization_options'].get('coral_regularization', False),
-                coral_regularization_weight=cfg['regularization_options'].get('coral_regularization_weight', 1.0)
+                coral_regularization_weight=cfg['regularization_options'].get('coral_regularization_weight', 1.0),
+                deep_coral_layers=cfg['regularization_options'].get('deep_coral_layers', [5, 8]),
+                deep_coral_weights=cfg['regularization_options'].get('deep_coral_weights', [1.0, 0.5])
             )
             
     # Setup trainer
