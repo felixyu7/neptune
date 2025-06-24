@@ -6,7 +6,7 @@ import lightning.pytorch as pl
 import awkward as ak
 import pyarrow.parquet as pq
 
-from dataloaders.data_utils import IrregularDataCollator, ZippedDataCollator, get_file_names, ParquetFileSampler
+from dataloaders.data_utils import IrregularDataCollator, ZippedDataloader, get_file_names, ParquetFileSampler
  
 class PrometheusDataModule(pl.LightningDataModule):
     """
@@ -84,18 +84,16 @@ class PrometheusDataModule(pl.LightningDataModule):
                                                         num_workers=self.cfg['training_options']['num_workers'])
             
             # Create a zipped dataloader
-            return ZippedDataCollator([train_dataloader, real_dataloader])
+            return ZippedDataloader([train_dataloader, real_dataloader])
         else:
             return train_dataloader
     
     def val_dataloader(self):
         """Returns the validation dataloader."""
         sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
-        collate_fn = IrregularDataCollator()
-        return torch.utils.data.DataLoader(self.valid_dataset, 
-                                           batch_size = self.cfg['training_options']['batch_size'], 
-                                           sampler=sampler,
-                                           collate_fn=collate_fn,
+        return torch.utils.data.DataLoader(self.valid_dataset,
+                                           batch_sampler=sampler,
+                                           collate_fn=IrregularDataCollator(),
                                            pin_memory=True,
                                            persistent_workers=True,
                                            num_workers=self.cfg['training_options']['num_workers'])
@@ -103,11 +101,9 @@ class PrometheusDataModule(pl.LightningDataModule):
     def test_dataloader(self):
         """Returns the test dataloader (same as validation for now)."""
         sampler = ParquetFileSampler(self.valid_dataset, self.valid_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
-        collate_fn = IrregularDataCollator()
-        return torch.utils.data.DataLoader(self.valid_dataset, 
-                                           batch_size = self.cfg['training_options']['batch_size'], 
-                                           sampler=sampler,
-                                           collate_fn=collate_fn,
+        return torch.utils.data.DataLoader(self.valid_dataset,
+                                           batch_sampler=sampler,
+                                           collate_fn=IrregularDataCollator(),
                                            pin_memory=True,
                                            persistent_workers=True,
                                            num_workers=self.cfg['training_options']['num_workers'])

@@ -52,7 +52,7 @@ class ParquetFileSampler(Sampler):
             end_idx = self.cumulative_lengths[file_index + 1]
             indices = np.random.permutation(np.arange(start_idx, end_idx))
             for i in range(0, len(indices), self.batch_size):
-                yield from indices[i:i+self.batch_size].tolist()
+                yield indices[i:i+self.batch_size].tolist()
 
     def __len__(self) -> int:
        return len(self.data_source)
@@ -93,7 +93,7 @@ class IrregularDataCollator(object):
         else:
             return bcoords, feats_batch
         
-class ZippedDataCollator:
+class ZippedDataloader:
     def __init__(self, dataloaders):
         self.dataloaders = dataloaders
 
