@@ -179,6 +179,18 @@ class PrometheusDataset(torch.utils.data.Dataset):
                               event.photons.sensor_pos_z.to_numpy(),
                               event.photons.t.to_numpy() - event.photons.t.to_numpy().min()]).T
             
+            if self.add_noise:
+                # 1. Apply position-dependent photon efficiency noise (dropout)
+                n_photons = pos_t.shape[0]
+                # Normalize z to [0, 1] for linear dropout scaling
+                z = pos_t[:, 2]
+                z_min, z_max = z.min(), z.max()
+                z_norm = (z - z_min) / (z_max - z_min + 1e-8)
+                # Dropout fraction varies linearly from 0 at min(z) to self.dropout_fraction at max(z)
+                dropout_probs = z_norm * self.dropout_fraction
+                dropout_mask = np.random.random(n_photons) > dropout_probs
+                pos_t = pos_t[dropout_mask]
+            
             # Bin times (3 ns)
             time_bins = np.floor(pos_t[:, 3] / 3.0) * 3.0
             rows = np.column_stack((pos_t[:, :3], time_bins))    # shape (N_hits, 4)
@@ -186,15 +198,9 @@ class PrometheusDataset(torch.utils.data.Dataset):
             pos_t = unique_rows.astype(np.float32)
             
             if self.add_noise:
-                # 1. Add random timing noise to the binned time
-                time_noise = np.random.normal(0, np.sqrt(self.time_variance), size=pos_t.shape[0])
+                # 2. Add random timing noise to the binned time
+                time_noise = np.random.normal(0, self.time_variance, size=pos_t.shape[0])
                 pos_t[:, 3] += time_noise
-
-                # 2. Apply random photon efficiency noise (dropout)
-                n_photons = pos_t.shape[0]
-                dropout_mask = np.random.random(n_photons) > self.dropout_fraction
-                pos_t = pos_t[dropout_mask]
-                counts = counts[dropout_mask]
 
             pos_t /= 1000.0
             feats = np.log(counts + 1).astype(np.float32)[:, None]   # (N_bins, 1)

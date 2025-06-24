@@ -149,7 +149,7 @@ def main():
                 weight_decay=cfg['training_options']['weight_decay'],
                 training_mode='supervised'
             )
-
+            
     # Setup trainer
     if cfg['training']:
         # Configure WandB logging

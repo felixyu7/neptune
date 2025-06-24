@@ -185,22 +185,37 @@ def fb8_to_Bv(theta: torch.Tensor, phi: torch.Tensor, psi: torch.Tensor,
     
     return B_traceless, v
 
-def _cet_fft(Lambda: torch.Tensor, gamma: torch.Tensor, N: int = 400,
-             c: float = 30.0,
-             omega_d: float = 1.0,
-             omega_u: float = 2.0
+def _cet_fft(Lambda: torch.Tensor, gamma: torch.Tensor, N: int = 1024,
+             c: float = None,
+             omega_d: float = 0.5,
+             omega_u: float = 1.5
              ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Return log(C), d(logC)/dΛ, d(logC)/dγ for each batch row, using fp64 for stability.
-    This version is modified to more closely follow the original adaptive proposal
-    from Chen et al. (2020), where the grid parameters depend on the input eigenvalues.
+    This version uses adaptive c parameter based on gamma magnitude to handle high-kappa regimes.
     """
     original_dtype = Lambda.dtype
-    Lambda_64 = Lambda.to(torch.float64)
-    gamma_64 = gamma.to(torch.float64)
+    Lambda_64 = Lambda.to(torch.float32)
+    gamma_64 = gamma.to(torch.float32)
     
     B, p = Lambda_64.shape
     assert p == 3, "Only S² supported (p=3)"
+
+    # Adaptive c parameter based on gamma magnitude
+    # For high gamma values, c needs to scale to avoid numerical issues
+    if c is None:
+        max_gamma = gamma_64.abs().max()
+        max_lambda = Lambda_64.abs().max()
+        effective_scale = torch.max(max_gamma, max_lambda)
+
+        if effective_scale <= 10:
+            c = 25.0
+        elif effective_scale <= 80:
+            c = 0.5 * effective_scale
+        elif effective_scale <= 250:
+            c = 0.6 * effective_scale
+        else:
+            c = 0.7 * effective_scale
 
     # Shift eigenvalues for numerical stability
     Λ_max, Λ_max_indices = Lambda_64.max(dim=1, keepdim=True)
@@ -209,9 +224,13 @@ def _cet_fft(Lambda: torch.Tensor, gamma: torch.Tensor, N: int = 400,
     # 1. Implement Adaptive 'd'
     # The theory from Chen et al. (2020) requires 'd' to be chosen based on the
     # eigenvalues (Λ) and the contour location (c). This re-introduces adaptivity.
-    # d must be <= min(c + Λ_shift_i). We choose the max possible d for best accuracy.
+    # d must be <= min(c + Λ_shift_i).
+    if effective_scale <= 80:
+        d_factor = 0.25
+    else:
+        d_factor = 0.1
     min_lambda_shift, _ = torch.min(Λ_shift, dim=1, keepdim=True)
-    d = (c + min_lambda_shift).clamp_min(1e-9) # Ensure d is positive
+    d = (d_factor * (c + min_lambda_shift)).clamp_min(1e-9) # Ensure d is positive
 
     # 2. Update h, p1, p2 formulas based on Chen et al. (2020)
     # These are now tensors of shape (B, 1) because 'd' is adaptive.
@@ -226,7 +245,7 @@ def _cet_fft(Lambda: torch.Tensor, gamma: torch.Tensor, N: int = 400,
     log_w = torch.log(0.5 * torch.special.erfc(nh.abs() / p1 - p2))
     
     # Denominator in the integrand's exponent. This broadcasts correctly.
-    # We use a constant 'c' for all samples in the batch for stability.
+    # We use the adaptive 'c' for all samples in the batch for stability.
     denom = -Λ_shift.unsqueeze(-1) + 1j * nh.unsqueeze(1) + c
     
     # Calculate the log-magnitude and phase of the complex term A_n

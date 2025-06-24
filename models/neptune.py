@@ -294,10 +294,19 @@ class Neptune(pl.LightningModule):
         else:
             self.classifier = None # Not used in pretrain mode
             self.output_dim = None # Not applicable in pretrain mode
-        
-        # kappa parameters for FB8 loss
-        if loss_fn == 'fb8':
-            self.soft_kappa_cap = 150.
+
+        # if self.hparams.training_mode == "finetune":
+        #     # 1) freeze every parameter in the model
+        #     for p in self.parameters():
+        #         p.requires_grad = False
+
+        #     # 2) un-freeze ONLY the final LayerNorm inside the encoder
+        #     for p in self.encoder.ln.parameters():   # <-- the `ln` you defined
+        #         p.requires_grad = True
+
+        #     # 3) un-freeze the classifier head
+        #     for p in self.classifier.parameters():
+        #         p.requires_grad = True
 
         # Results storage for test metrics
         self.test_results = {}
@@ -406,8 +415,8 @@ class Neptune(pl.LightningModule):
                     pred_theta_raw = torch.sigmoid(preds[:, 0:1].to(target.dtype)) * torch.pi  # [B, 1]
                     pred_phi_raw = torch.sigmoid(preds[:, 1:2].to(target.dtype)) * torch.pi * 2  # [B, 1]
                     pred_psi_raw = torch.sigmoid(preds[:, 2:3].to(target.dtype)) * torch.pi * 2  # [B, 1]
-                    pred_kappa_raw = F.softplus(preds[:, 3:4] + self.soft_kappa_cap).to(target.dtype)   # [B, 1]
-                    pred_beta_raw = F.softplus(preds[:, 4:5]).to(target.dtype)    # [B, 1]
+                    pred_kappa_raw = F.softplus(preds[:, 3:4]).to(target.dtype)   # [B, 1]
+                    pred_beta_raw = F.softplus(preds[:, 4:5]).clamp(max=10.0).to(target.dtype)    # [B, 1]
                     pred_eta_raw = F.tanh(preds[:, 5:6]).to(target.dtype)         # [B, 1]
                     pred_alpha_raw = torch.sigmoid(preds[:, 6:7].to(target.dtype)) * torch.pi               # [B, 1]
                     pred_rho_raw = torch.sigmoid(preds[:, 7:8].to(target.dtype)) * torch.pi * 2               # [B, 1]
@@ -691,7 +700,9 @@ class Neptune(pl.LightningModule):
         self.test_step_outputs = []
 
     def configure_optimizers(self) -> Dict[str, Any]:
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        trainable = [p for p in self.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable, lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        # optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.hparams.lr_schedule[1], eta_min=1e-7)
         return [optimizer], [scheduler]
     
