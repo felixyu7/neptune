@@ -6,8 +6,8 @@ import lightning.pytorch as pl
 import awkward as ak
 import pyarrow.parquet as pq
 
-from dataloaders.data_utils import IrregularDataCollator, get_file_names, ParquetFileSampler
-
+from dataloaders.data_utils import IrregularDataCollator, ZippedDataCollator, get_file_names, ParquetFileSampler
+ 
 class PrometheusDataModule(pl.LightningDataModule):
     """
     PyTorch Lightning data module for Prometheus dataset.
@@ -39,9 +39,22 @@ class PrometheusDataModule(pl.LightningDataModule):
                                                    self.cfg['data_options'].get('add_noise', False),
                                                    self.cfg['data_options'].get('time_variance', 1.0),
                                                    self.cfg['data_options'].get('dropout_fraction', 0.1))
-            
+            if self.cfg['regularization_options']['coral_regularization']:
+                real_files = get_file_names(
+                    self.cfg['data_options']['real_data_files'],
+                    self.cfg['data_options']['real_data_file_ranges'],
+                    self.cfg['data_options']['shuffle_files']
+                )
+                self.real_dataset = PrometheusDataset(real_files,
+                                                    self.cfg['data_options'].get('use_om2vec', False),
+                                                    self.cfg['data_options'].get('use_summary_stats', False),
+                                                    self.cfg['data_options'].get('add_noise', False),
+                                                    self.cfg['data_options'].get('time_variance', 1.0),
+                                                    self.cfg['data_options'].get('dropout_fraction', 0.1),
+                                                    is_real_data=True)
+             
         valid_files = get_file_names(
-            self.cfg['data_options']['valid_data_files'], 
+            self.cfg['data_options']['valid_data_files'],
             self.cfg['data_options']['valid_data_file_ranges'],
             self.cfg['data_options']['shuffle_files']
         )
@@ -54,16 +67,26 @@ class PrometheusDataModule(pl.LightningDataModule):
 
     def train_dataloader(self):
         """Returns the training dataloader."""
-        sampler = ParquetFileSampler(self.train_dataset, self.train_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
-        collate_fn = IrregularDataCollator()
-        dataloader = torch.utils.data.DataLoader(self.train_dataset, 
-                                            batch_size = self.cfg['training_options']['batch_size'], 
-                                            sampler=sampler,
-                                            collate_fn=collate_fn,
-                                            pin_memory=True,
-                                            persistent_workers=True,
-                                            num_workers=self.cfg['training_options']['num_workers'])
-        return dataloader
+        train_sampler = ParquetFileSampler(self.train_dataset, self.train_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+        train_dataloader = torch.utils.data.DataLoader(self.train_dataset,
+                                                    batch_sampler=train_sampler,
+                                                    collate_fn=IrregularDataCollator(),
+                                                    pin_memory=True,
+                                                    persistent_workers=True,
+                                                    num_workers=self.cfg['training_options']['num_workers'])
+        if self.cfg['regularization_options']['coral_regularization']:
+            real_sampler = ParquetFileSampler(self.real_dataset, self.real_dataset.cumulative_lengths, self.cfg['training_options']['batch_size'])
+            real_dataloader = torch.utils.data.DataLoader(self.real_dataset,
+                                                        batch_sampler=real_sampler,
+                                                        collate_fn=IrregularDataCollator(has_labels=False),
+                                                        pin_memory=True,
+                                                        persistent_workers=True,
+                                                        num_workers=self.cfg['training_options']['num_workers'])
+            
+            # Create a zipped dataloader
+            return ZippedDataCollator([train_dataloader, real_dataloader])
+        else:
+            return train_dataloader
     
     def val_dataloader(self):
         """Returns the validation dataloader."""
@@ -95,10 +118,11 @@ class PrometheusDataset(torch.utils.data.Dataset):
     
     Handles loading data from parquet files and preprocessing it for the model.
     """
-    def __init__(self, files, use_om2vec, use_summary_stats=False, add_noise=False, time_variance=1.0, dropout_fraction=0.1):
+    def __init__(self, files, use_om2vec, use_summary_stats=False, add_noise=False, time_variance=1.0, dropout_fraction=0.1, is_real_data=False):
         self.files = files
         self.use_om2vec = use_om2vec
         self.use_summary_stats = use_summary_stats
+        self.is_real_data = is_real_data
         self.add_noise = add_noise
         self.time_variance = time_variance
         self.dropout_fraction = dropout_fraction
@@ -140,20 +164,21 @@ class PrometheusDataset(torch.utils.data.Dataset):
         
         event = self.current_data[true_idx]
         
-        # Extract MC truth information
-        zenith = event.mc_truth.initial_state_zenith
-        azimuth = event.mc_truth.initial_state_azimuth
+        if not self.is_real_data:
+            # Extract MC truth information
+            zenith = event.mc_truth.initial_state_zenith
+            azimuth = event.mc_truth.initial_state_azimuth
 
-        dir_x = np.sin(zenith) * np.cos(azimuth)
-        dir_y = np.sin(zenith) * np.sin(azimuth)
-        dir_z = np.cos(zenith)
-        
-        log_energy = np.log10(event.mc_truth.initial_state_energy)
-        
-        label = [log_energy,
-                 dir_x,
-                 dir_y,
-                 dir_z]
+            dir_x = np.sin(zenith) * np.cos(azimuth)
+            dir_y = np.sin(zenith) * np.sin(azimuth)
+            dir_z = np.cos(zenith)
+            
+            log_energy = np.log10(event.mc_truth.initial_state_energy)
+            
+            label = [log_energy,
+                    dir_x,
+                    dir_y,
+                    dir_z]
         
         if self.use_om2vec:
             pos = np.array([event.om2vec.sensor_pos_x.to_numpy(),
@@ -205,4 +230,7 @@ class PrometheusDataset(torch.utils.data.Dataset):
             pos_t /= 1000.0
             feats = np.log(counts + 1).astype(np.float32)[:, None]   # (N_bins, 1)
 
-        return torch.from_numpy(pos_t).float(), torch.from_numpy(feats).float(), torch.from_numpy(np.array([label])).float()
+        if self.is_real_data:
+            return torch.from_numpy(pos_t).float(), torch.from_numpy(feats).float()
+        else:
+            return torch.from_numpy(pos_t).float(), torch.from_numpy(feats).float(), torch.from_numpy(np.array([label])).float()

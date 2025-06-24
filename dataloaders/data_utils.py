@@ -64,11 +64,14 @@ class IrregularDataCollator(object):
     Handles batching of variable-sized point clouds by adding batch index
     to coordinates.
     """
-    def __init__(self):
-        pass
+    def __init__(self, has_labels=True):
+        self.has_labels = has_labels
         
-    def __call__(self, batch: List[Tuple[Tensor, Tensor, Tensor]]) -> Tuple[Tensor, Tensor, Tensor]:
-        pos, feats, labels = list(zip(*batch))
+    def __call__(self, batch: List[Tuple[Tensor, ...]]) -> Union[Tuple[Tensor, Tensor, Tensor], Tuple[Tensor, Tensor]]:
+        if self.has_labels:
+            pos, feats, labels = list(zip(*batch))
+        else:
+            pos, feats = list(zip(*batch))
         
         # Ensure pos is a list of Tensors before passing to batched_coordinates
         pos_tensors = [torch.as_tensor(p) if not torch.is_tensor(p) else p for p in pos]
@@ -81,16 +84,29 @@ class IrregularDataCollator(object):
         else:
             feats_batch = torch.from_numpy(np.concatenate(feats, axis=0)).float()
 
-        if isinstance(labels[0], torch.Tensor):
-            labels_batch = torch.cat(labels, dim=0).float()
+        if self.has_labels:
+            if isinstance(labels[0], torch.Tensor):
+                labels_batch = torch.cat(labels, dim=0).float()
+            else:
+                labels_batch = torch.from_numpy(np.concatenate(labels, axis=0)).float()
+            return bcoords, feats_batch, labels_batch
         else:
-            labels_batch = torch.from_numpy(np.concatenate(labels, axis=0)).float()
-
-        return bcoords, feats_batch, labels_batch
+            return bcoords, feats_batch
         
-def batched_coordinates(list_of_coords: List[Tensor], 
-                      dtype: Optional[torch.dtype] = None, 
-                      device: Optional[Union[torch.device, str]] = None, 
+class ZippedDataCollator:
+    def __init__(self, dataloaders):
+        self.dataloaders = dataloaders
+
+    def __iter__(self):
+        for batch in zip(*self.dataloaders):
+            yield list(batch)
+
+    def __len__(self):
+        return min(len(dl) for dl in self.dataloaders)
+
+def batched_coordinates(list_of_coords: List[Tensor],
+                      dtype: Optional[torch.dtype] = None,
+                      device: Optional[Union[torch.device, str]] = None,
                       requires_grad: bool = False) -> Tensor:
     """
     Convert a list of coordinate tensors to a batched tensor with batch indices.
