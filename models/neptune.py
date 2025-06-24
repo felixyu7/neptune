@@ -527,7 +527,8 @@ class Neptune(pl.LightningModule):
                 
                 return total_loss
             else:
-                loss, _, _ = self.step(batch)
+                coords, features, labels = batch
+                loss, _, _ = self.step((coords, features, labels))
                 self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
                 return loss
         
