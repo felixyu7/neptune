@@ -7,6 +7,7 @@ from torch import Tensor
 from torch.utils.data import Sampler, Dataset
 from typing import List, Tuple, Optional, Union, Any
 
+
 def get_file_names(data_dirs: List[str], ranges: List[List[int]], shuffle_files: bool = False) -> List[str]:
     """
     Get file names from directories within specified ranges.
