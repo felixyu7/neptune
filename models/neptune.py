@@ -249,9 +249,7 @@ class Neptune(pl.LightningModule):
         weight_decay: float = 1e-5,
         training_mode: str = 'supervised',
         centroid_loss_weight: float = 1.0,
-        pretrain_masking_ratio: float = 0.15,
-        coral_regularization: bool = False,
-        coral_regularization_weight: float = 1.0
+        pretrain_masking_ratio: float = 0.15
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -404,8 +402,6 @@ class Neptune(pl.LightningModule):
             # Standard supervised forward
             global_features = self.encoder(tokens, centroids, valid_token_masks) # was 'masks'
             output = self.classifier(global_features)
-            if self.hparams.coral_regularization:
-                return output, global_features
             return output
 
     def _get_loss_function(self) -> callable:
@@ -466,38 +462,14 @@ class Neptune(pl.LightningModule):
             if loss_choice == 'gaussian_nll': return lambda preds, labels: GaussianNLLLoss(preds[:, 0], preds[:, 1], get_labels(labels))
         raise ValueError(f"Unhandled task/loss: {task}/{loss_choice}")
 
-    def coral_loss(self, source_features, target_features):
-        d = source_features.size(1)
-        
-        # source covariance
-        xm = torch.mean(source_features, 0, keepdim=True) - source_features
-        xc = torch.matmul(torch.transpose(xm, 0, 1), xm)
-
-        # target covariance
-        xmt = torch.mean(target_features, 0, keepdim=True) - target_features
-        xct = torch.matmul(torch.transpose(xmt, 0, 1), xmt)
-        
-        # frobenius norm between source and target covariance matrices
-        loss = torch.mean(torch.mul((xc - xct), (xc - xct)))
-        loss = loss / (4 * d * d)
-        
-        return loss
-
     def step(self, batch: Tuple[Tensor, Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
         coords, features, labels = batch
-        output = self(coords, features)
-        
-        # Handle CORAL case where forward returns (preds, global_features)
-        if self.hparams.coral_regularization and isinstance(output, tuple):
-            preds, _ = output  # Extract predictions, ignore global features
-        else:
-            preds = output
-            
+        preds = self(coords, features)
         loss_func = self._get_loss_function()
         loss = loss_func(preds, labels)
         return loss, preds, labels
         
-    def training_step(self, batch: List[Any], batch_idx: int) -> Tensor:
+    def training_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Tensor:
         if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
             coords, features, _ = batch
             out = self(coords, features)
@@ -509,34 +481,9 @@ class Neptune(pl.LightningModule):
             self.log('pretrain_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
             return total_loss
         else:
-            if self.hparams.coral_regularization:
-                mc_batch, data_batch = batch
-                
-                # MC forward pass
-                mc_coords, mc_features, mc_labels = mc_batch
-                mc_preds, mc_global_features = self(mc_coords, mc_features)
-                
-                # Data forward pass
-                data_coords, data_features = data_batch
-                _, data_global_features = self(data_coords, data_features)
-                
-                # Standard loss
-                loss_func = self._get_loss_function()
-                loss = loss_func(mc_preds, mc_labels)
-                
-                # CORAL loss
-                coral_loss = self.coral_loss(mc_global_features, data_global_features)
-                total_loss = loss + self.hparams.coral_regularization_weight * coral_loss
-                
-                self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
-                self.log('train_coral_loss', coral_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
-                self.log('train_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
-                
-                return total_loss
-            else:
-                loss, _, _ = self.step(batch)
-                self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
-                return loss
+            loss, _, _ = self.step(batch)
+            self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
+            return loss
         
     def validation_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Dict[str, Tensor]:
         if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
@@ -581,15 +528,9 @@ class Neptune(pl.LightningModule):
             self.test_step_outputs.append(output)
             return output
         else:
-            output = self(coords, features)
+            preds = self(coords, features)
             end_time = time.time()
             forward_time = end_time - start_time
-            
-            # Handle CORAL case where forward returns (preds, global_features)
-            if self.hparams.coral_regularization and isinstance(output, tuple):
-                preds, _ = output  # Extract predictions, ignore global features
-            else:
-                preds = output
             
             loss_func = self._get_loss_function()
             loss = loss_func(preds, labels)

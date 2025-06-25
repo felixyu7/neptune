@@ -7,7 +7,6 @@ from torch import Tensor
 from torch.utils.data import Sampler, Dataset
 from typing import List, Tuple, Optional, Union, Any
 
-
 def get_file_names(data_dirs: List[str], ranges: List[List[int]], shuffle_files: bool = False) -> List[str]:
     """
     Get file names from directories within specified ranges.
@@ -53,10 +52,10 @@ class ParquetFileSampler(Sampler):
             end_idx = self.cumulative_lengths[file_index + 1]
             indices = np.random.permutation(np.arange(start_idx, end_idx))
             for i in range(0, len(indices), self.batch_size):
-                yield indices[i:i+self.batch_size].tolist()
+                yield from indices[i:i+self.batch_size].tolist()
 
     def __len__(self) -> int:
-       return (len(self.data_source) + self.batch_size - 1) // self.batch_size
+       return len(self.data_source)
 
 class IrregularDataCollator(object):
     """
@@ -65,14 +64,11 @@ class IrregularDataCollator(object):
     Handles batching of variable-sized point clouds by adding batch index
     to coordinates.
     """
-    def __init__(self, has_labels=True):
-        self.has_labels = has_labels
+    def __init__(self):
+        pass
         
-    def __call__(self, batch: List[Tuple[Tensor, ...]]) -> Union[Tuple[Tensor, Tensor, Tensor], Tuple[Tensor, Tensor]]:
-        if self.has_labels:
-            pos, feats, labels = list(zip(*batch))
-        else:
-            pos, feats = list(zip(*batch))
+    def __call__(self, batch: List[Tuple[Tensor, Tensor, Tensor]]) -> Tuple[Tensor, Tensor, Tensor]:
+        pos, feats, labels = list(zip(*batch))
         
         # Ensure pos is a list of Tensors before passing to batched_coordinates
         pos_tensors = [torch.as_tensor(p) if not torch.is_tensor(p) else p for p in pos]
@@ -85,29 +81,16 @@ class IrregularDataCollator(object):
         else:
             feats_batch = torch.from_numpy(np.concatenate(feats, axis=0)).float()
 
-        if self.has_labels:
-            if isinstance(labels[0], torch.Tensor):
-                labels_batch = torch.cat(labels, dim=0).float()
-            else:
-                labels_batch = torch.from_numpy(np.concatenate(labels, axis=0)).float()
-            return bcoords, feats_batch, labels_batch
+        if isinstance(labels[0], torch.Tensor):
+            labels_batch = torch.cat(labels, dim=0).float()
         else:
-            return bcoords, feats_batch
+            labels_batch = torch.from_numpy(np.concatenate(labels, axis=0)).float()
+
+        return bcoords, feats_batch, labels_batch
         
-class ZippedDataloader:
-    def __init__(self, dataloaders):
-        self.dataloaders = dataloaders
-
-    def __iter__(self):
-        for batch in zip(*self.dataloaders):
-            yield list(batch)
-
-    def __len__(self):
-        return min(len(dl) for dl in self.dataloaders)
-
-def batched_coordinates(list_of_coords: List[Tensor],
-                      dtype: Optional[torch.dtype] = None,
-                      device: Optional[Union[torch.device, str]] = None,
+def batched_coordinates(list_of_coords: List[Tensor], 
+                      dtype: Optional[torch.dtype] = None, 
+                      device: Optional[Union[torch.device, str]] = None, 
                       requires_grad: bool = False) -> Tensor:
     """
     Convert a list of coordinate tensors to a batched tensor with batch indices.
