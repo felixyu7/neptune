@@ -44,7 +44,9 @@ def main():
     training_mode = cfg.get('training_mode', 'supervised')
     pretrain_opts = cfg.get('pretrain_options', {})
     masking_ratio = pretrain_opts.get('masking_ratio', 0.15)
-    centroid_loss_weight = pretrain_opts.get('centroid_loss_weight', 1.0) # Get centroid_loss_weight
+    centroid_loss_weight = pretrain_opts.get('centroid_loss_weight', 1.0)
+    pretrain_task = pretrain_opts.get('pretrain_task', 'masking')
+    rotation_loss_weight = pretrain_opts.get('rotation_loss_weight', 1.0)
     checkpoint_path = cfg.get('checkpoint', '')
 
     # Dataloader selection
@@ -75,8 +77,10 @@ def main():
             lr_schedule=cfg['training_options']['lr_schedule'],
             weight_decay=cfg['training_options']['weight_decay'],
             training_mode='pretrain',
-            pretrain_masking_ratio=masking_ratio, # hparam name is pretrain_masking_ratio
-            centroid_loss_weight=centroid_loss_weight # Pass centroid_loss_weight
+            pretrain_masking_ratio=masking_ratio,
+            centroid_loss_weight=centroid_loss_weight,
+            pretrain_task=pretrain_task,
+            rotation_loss_weight=rotation_loss_weight
         )
     elif training_mode == 'finetune':
         if checkpoint_path != '':
