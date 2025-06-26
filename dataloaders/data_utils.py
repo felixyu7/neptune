@@ -137,18 +137,3 @@ def batched_coordinates(list_of_coords: List[Tensor],
         out.requires_grad_(True)
 
     return out
-
-def random_rotation_matrix():
-    """
-    Generates a random 3D rotation matrix.
-    """
-    axis = np.random.randn(3)
-    axis /= np.linalg.norm(axis)
-    angle = np.random.uniform(0, 2 * np.pi)
-    cos_a, sin_a = np.cos(angle), np.sin(angle)
-    x, y, z = axis
-    return np.array([
-        [cos_a + x**2 * (1 - cos_a), x * y * (1 - cos_a) - z * sin_a, x * z * (1 - cos_a) + y * sin_a],
-        [y * x * (1 - cos_a) + z * sin_a, cos_a + y**2 * (1 - cos_a), y * z * (1 - cos_a) - x * sin_a],
-        [z * x * (1 - cos_a) - y * sin_a, z * y * (1 - cos_a) + x * sin_a, cos_a + z**2 * (1 - cos_a)]
-    ])

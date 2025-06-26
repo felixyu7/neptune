@@ -6,7 +6,7 @@ import lightning.pytorch as pl
 import awkward as ak
 import pyarrow.parquet as pq
 
-from dataloaders.data_utils import IrregularDataCollator, get_file_names, ParquetFileSampler, random_rotation_matrix
+from dataloaders.data_utils import IrregularDataCollator, get_file_names, ParquetFileSampler
 
 class PrometheusDataModule(pl.LightningDataModule):
     """
@@ -38,8 +38,7 @@ class PrometheusDataModule(pl.LightningDataModule):
                                                    self.cfg['data_options'].get('use_summary_stats', False),
                                                    self.cfg['data_options'].get('add_noise', False),
                                                    self.cfg['data_options'].get('time_variance', 1.0),
-                                                   self.cfg['data_options'].get('dropout_fraction', 0.1),
-                                                   self.cfg['pretrain_options'].get('pretrain_task', 'masking'))
+                                                   self.cfg['data_options'].get('dropout_fraction', 0.1))
             
         valid_files = get_file_names(
             self.cfg['data_options']['valid_data_files'], 
@@ -51,8 +50,7 @@ class PrometheusDataModule(pl.LightningDataModule):
                                                self.cfg['data_options'].get('use_summary_stats', False),
                                                self.cfg['data_options'].get('add_noise', False),
                                                self.cfg['data_options'].get('time_variance', 1.0),
-                                               self.cfg['data_options'].get('dropout_fraction', 0.1),
-                                               self.cfg['pretrain_options'].get('pretrain_task', 'masking'))
+                                               self.cfg['data_options'].get('dropout_fraction', 0.1))
 
     def train_dataloader(self):
         """Returns the training dataloader."""
@@ -97,14 +95,13 @@ class PrometheusDataset(torch.utils.data.Dataset):
     
     Handles loading data from parquet files and preprocessing it for the model.
     """
-    def __init__(self, files, use_om2vec, use_summary_stats=False, add_noise=False, time_variance=1.0, dropout_fraction=0.1, pretrain_task='masking'):
+    def __init__(self, files, use_om2vec, use_summary_stats=False, add_noise=False, time_variance=1.0, dropout_fraction=0.1):
         self.files = files
         self.use_om2vec = use_om2vec
         self.use_summary_stats = use_summary_stats
         self.add_noise = add_noise
         self.time_variance = time_variance
         self.dropout_fraction = dropout_fraction
-        self.pretrain_task = pretrain_task
 
         # Count number of events in each file
         num_events = []
@@ -208,10 +205,4 @@ class PrometheusDataset(torch.utils.data.Dataset):
             pos_t /= 1000.0
             feats = np.log(counts + 1).astype(np.float32)[:, None]   # (N_bins, 1)
 
-        if self.pretrain_task == 'rotation':
-            rotation = random_rotation_matrix()
-            pos_t[:, :3] = np.dot(pos_t[:, :3], rotation.T)
-            label = rotation.flatten()
-            return torch.from_numpy(pos_t).float(), torch.from_numpy(feats).float(), torch.from_numpy(label).float()
-        else:
-            return torch.from_numpy(pos_t).float(), torch.from_numpy(feats).float(), torch.from_numpy(np.array([label])).float()
+        return torch.from_numpy(pos_t).float(), torch.from_numpy(feats).float(), torch.from_numpy(np.array([label])).float()

@@ -250,8 +250,8 @@ class Neptune(pl.LightningModule):
         training_mode: str = 'supervised',
         centroid_loss_weight: float = 1.0,
         pretrain_masking_ratio: float = 0.15,
-        pretrain_task: str = 'masking',
-        rotation_loss_weight: float = 1.0
+        pretrain_task: str = 'spatial',
+        time_loss_weight: float = 1.0
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -276,10 +276,11 @@ class Neptune(pl.LightningModule):
         
         # Mask Embeddings for MPM Pretraining
         self.centroid_mask_embedding = nn.Parameter(torch.randn(1, 1, 3))
+        self.time_mask_embedding = nn.Parameter(torch.randn(1, 1, 1))
         
         # MPM Heads for Pretraining
         self.mpm_centroid_predictor = nn.Linear(self.hparams.token_dim, 3)
-        self.rotation_predictor = nn.Linear(self.hparams.token_dim, 9)
+        self.mpm_time_predictor = nn.Linear(self.hparams.token_dim, 1)
         
         # Downstream task specific setup
         if self.hparams.training_mode != 'pretrain':
@@ -347,65 +348,68 @@ class Neptune(pl.LightningModule):
         tokens, centroids, valid_token_masks = self.tokenizer(coords, features) # valid_token_masks was 'masks'
 
         if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
-            if self.hparams.pretrain_task == 'masking':
-                # 1. Clone original features and centroids for loss calculation
-                original_centroids_for_loss = centroids.clone()
+            # 1. Clone original features and centroids for loss calculation
+            original_centroids_for_loss = centroids.clone()
 
-                # 2. Masking logic (applied per batch item)
-                batch_size, num_tokens, _ = tokens.shape
-                device = tokens.device
+            # 2. Masking logic (applied per batch item)
+            batch_size, num_tokens, _ = tokens.shape
+            device = tokens.device
+            
+            input_features = tokens.clone()
+            input_centroids = centroids.clone()
+            
+            # Store selected masked indices for each batch item (for loss calculation)
+            # This needs to be a list of tensors, as the number of masked tokens can vary per item if num_valid varies.
+            # However, the design in training_step implies masked_indices is already handled as a list.
+            # Let's ensure it's created correctly here.
+            actual_masked_indices_list = []
+
+            for b in range(batch_size):
+                # Consider only valid tokens for masking
+                current_valid_indices = torch.where(valid_token_masks[b])[0]
+                num_valid_tokens_for_item = current_valid_indices.shape[0]
+
+                if num_valid_tokens_for_item == 0:
+                    actual_masked_indices_list.append(torch.empty(0, dtype=torch.long, device=device))
+                    continue
+
+                # Determine number of tokens to mask for this specific item
+                num_to_mask_for_item = max(1, int(self.hparams.pretrain_masking_ratio * num_valid_tokens_for_item))
                 
-                input_features = tokens.clone()
-                input_centroids = centroids.clone()
+                # Randomly select among the valid tokens
+                perm = torch.randperm(num_valid_tokens_for_item, device=device)
+                selected_indices_in_valid_set = perm[:num_to_mask_for_item]
                 
-                # Store selected masked indices for each batch item (for loss calculation)
-                # This needs to be a list of tensors, as the number of masked tokens can vary per item if num_valid varies.
-                # However, the design in training_step implies masked_indices is already handled as a list.
-                # Let's ensure it's created correctly here.
-                actual_masked_indices_list = []
+                # Map these back to original token indices for this batch item
+                item_masked_indices = current_valid_indices[selected_indices_in_valid_set]
+                actual_masked_indices_list.append(item_masked_indices)
 
-                for b in range(batch_size):
-                    # Consider only valid tokens for masking
-                    current_valid_indices = torch.where(valid_token_masks[b])[0]
-                    num_valid_tokens_for_item = current_valid_indices.shape[0]
-
-                    if num_valid_tokens_for_item == 0:
-                        actual_masked_indices_list.append(torch.empty(0, dtype=torch.long, device=device))
-                        continue
-
-                    # Determine number of tokens to mask for this specific item
-                    num_to_mask_for_item = max(1, int(self.hparams.pretrain_masking_ratio * num_valid_tokens_for_item))
-                    
-                    # Randomly select among the valid tokens
-                    perm = torch.randperm(num_valid_tokens_for_item, device=device)
-                    selected_indices_in_valid_set = perm[:num_to_mask_for_item]
-                    
-                    # Map these back to original token indices for this batch item
-                    item_masked_indices = current_valid_indices[selected_indices_in_valid_set]
-                    actual_masked_indices_list.append(item_masked_indices)
-
-                    # Apply mask embeddings, ensuring dtype compatibility
+                # Apply mask embeddings, ensuring dtype compatibility
+                if self.hparams.pretrain_task == 'spatial':
                     input_centroids[b, item_masked_indices, :3] = self.centroid_mask_embedding.squeeze(0).to(input_centroids.dtype)
+                elif self.hparams.pretrain_task == 'temporal':
+                    input_centroids[b, item_masked_indices, 3:4] = self.time_mask_embedding.squeeze(0).to(input_centroids.dtype)
+                elif self.hparams.pretrain_task == 'spatiotemporal':
+                    input_centroids[b, item_masked_indices, :3] = self.centroid_mask_embedding.squeeze(0).to(input_centroids.dtype)
+                    input_centroids[b, item_masked_indices, 3:4] = self.time_mask_embedding.squeeze(0).to(input_centroids.dtype)
 
-                # 3. Encode masked features and centroids
-                encoded_per_token_output = self.encoder(
-                    input_features, input_centroids, valid_token_masks, return_per_token_features=True
-                )
+            # 3. Encode masked features and centroids
+            encoded_per_token_output = self.encoder(
+                input_features, input_centroids, valid_token_masks, return_per_token_features=True
+            )
 
-                # 4. Predict original features and centroids from encoded output
-                predicted_centroids = self.mpm_centroid_predictor(encoded_per_token_output)
+            # 4. Predict original features and centroids from encoded output
+            predicted_centroids = self.mpm_centroid_predictor(encoded_per_token_output)
+            predicted_time = self.mpm_time_predictor(encoded_per_token_output)
 
-                # 5. Return structure for loss computation
-                return {
-                    "predicted_centroids": predicted_centroids,
-                    "original_centroids_for_loss": original_centroids_for_loss,
-                    "masked_indices": actual_masked_indices_list, # List of tensors with actual masked indices per batch item
-                    "valid_token_masks": valid_token_masks,
-                }
-            elif self.hparams.pretrain_task == 'rotation':
-                global_features = self.encoder(tokens, centroids, valid_token_masks)
-                predicted_rotation = self.rotation_predictor(global_features)
-                return {"predicted_rotation": predicted_rotation}
+            # 5. Return structure for loss computation
+            return {
+                "predicted_centroids": predicted_centroids,
+                "predicted_time": predicted_time,
+                "original_centroids_for_loss": original_centroids_for_loss,
+                "masked_indices": actual_masked_indices_list, # List of tensors with actual masked indices per batch item
+                "valid_token_masks": valid_token_masks,
+            }
         else:
             # Standard supervised forward
             global_features = self.encoder(tokens, centroids, valid_token_masks) # was 'masks'
@@ -479,18 +483,18 @@ class Neptune(pl.LightningModule):
         
     def training_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Tensor:
         if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
-            coords, features, labels = batch
+            coords, features, _ = batch
             out = self(coords, features)
 
-            if self.hparams.pretrain_task == 'masking':
-                # Compute reconstruction losses for pretraining
-                centroid_reconstruction_loss, total_loss = self._compute_pretrain_losses(out)
-                self.log('pretrain_centroid_loss', centroid_reconstruction_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
-                self.log('pretrain_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
-            elif self.hparams.pretrain_task == 'rotation':
-                rotation_loss, total_loss = self._compute_rotation_loss(out, labels)
-                self.log('pretrain_rotation_loss', rotation_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
-                self.log('pretrain_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
+            # Compute reconstruction losses for pretraining
+            losses = self._compute_pretrain_losses(out)
+            total_loss = losses['total_loss']
+
+            self.log('pretrain_total_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
+            if 'centroid_loss' in losses:
+                self.log('pretrain_centroid_loss', losses['centroid_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
+            if 'time_loss' in losses:
+                self.log('pretrain_time_loss', losses['time_loss'], on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
             return total_loss
         else:
             loss, _, _ = self.step(batch)
@@ -499,14 +503,12 @@ class Neptune(pl.LightningModule):
         
     def validation_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Dict[str, Tensor]:
         if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
-            coords, features, labels = batch
+            coords, features, _ = batch
             out = self(coords, features)
 
-            if self.hparams.pretrain_task == 'masking':
-                # Compute reconstruction losses for pretraining
-                centroid_reconstruction_loss, total_loss = self._compute_pretrain_losses(out)
-            elif self.hparams.pretrain_task == 'rotation':
-                rotation_loss, total_loss = self._compute_rotation_loss(out, labels)
+            # Compute reconstruction losses for pretraining
+            losses = self._compute_pretrain_losses(out)
+            total_loss = losses['total_loss']
 
             self.log('val_loss', total_loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=self.hparams.batch_size)
             
@@ -530,16 +532,14 @@ class Neptune(pl.LightningModule):
             end_time = time.time()
             forward_time = end_time - start_time
             
-            if self.hparams.pretrain_task == 'masking':
-                # Compute reconstruction losses for pretraining
-                centroid_reconstruction_loss, total_loss = self._compute_pretrain_losses(out)
-            elif self.hparams.pretrain_task == 'rotation':
-                rotation_loss, total_loss = self._compute_rotation_loss(out, labels)
+            # Compute reconstruction losses for pretraining
+            losses = self._compute_pretrain_losses(out)
+            total_loss = losses['total_loss']
 
             self.log('test_loss', total_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=self.hparams.batch_size)
             output = {
-                "test_loss": total_loss.detach(),
-                "preds": torch.tensor(0.0),
+                "test_loss": total_loss.detach(), 
+                "preds": torch.tensor(0.0), 
                 "labels": torch.tensor(0.0),
                 "forward_time": torch.tensor(forward_time, device=total_loss.device)
             }
@@ -724,7 +724,7 @@ class Neptune(pl.LightningModule):
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.hparams.lr_schedule[1], eta_min=1e-7)
         return [optimizer], [scheduler]
     
-    def _compute_pretrain_losses(self, forward_output: Dict[str, Any]) -> Tuple[Tensor, Tensor]:
+    def _compute_pretrain_losses(self, forward_output: Dict[str, Any]) -> Dict[str, Tensor]:
         """
         Compute reconstruction losses for pretraining from forward pass output.
         
@@ -732,44 +732,44 @@ class Neptune(pl.LightningModule):
             forward_output: Dictionary containing predicted features/centroids and targets
             
         Returns:
-            Tuple of (centroid_reconstruction_loss, total_loss)
+            Dictionary of losses
         """
-        pred_cent = forward_output["predicted_centroids"]
-        orig_cent = forward_output["original_centroids_for_loss"]
         masked_indices = forward_output["masked_indices"]
+        batch_size = forward_output["original_centroids_for_loss"].shape[0]
+        device = forward_output["original_centroids_for_loss"].device
+        
+        total_loss = torch.tensor(0.0, device=device)
+        losses = {}
 
-        # Compute loss only at masked indices and valid tokens
-        centroid_losses = []
-        batch_size = pred_cent.shape[0]
-        
-        for b in range(batch_size):
-            idx = masked_indices[b]
-            if idx.numel() == 0:
-                continue
-            cent_loss = F.smooth_l1_loss(pred_cent[b, idx], orig_cent[b, idx, :3], reduction="mean")
-            centroid_losses.append(cent_loss)
+        if self.hparams.pretrain_task in ['spatial', 'spatiotemporal']:
+            pred_cent = forward_output["predicted_centroids"]
+            orig_cent = forward_output["original_centroids_for_loss"]
+            centroid_losses = []
+            for b in range(batch_size):
+                idx = masked_indices[b]
+                if idx.numel() == 0:
+                    continue
+                cent_loss = F.smooth_l1_loss(pred_cent[b, idx], orig_cent[b, idx, :3], reduction="mean")
+                centroid_losses.append(cent_loss)
             
-        centroid_reconstruction_loss = torch.stack(centroid_losses).mean() if centroid_losses else torch.tensor(0.0, device=pred_cent.device)
-        total_loss = self.hparams.centroid_loss_weight * centroid_reconstruction_loss
-        
-        return centroid_reconstruction_loss, total_loss
+            centroid_reconstruction_loss = torch.stack(centroid_losses).mean() if centroid_losses else torch.tensor(0.0, device=device)
+            total_loss += self.hparams.centroid_loss_weight * centroid_reconstruction_loss
+            losses['centroid_loss'] = centroid_reconstruction_loss
 
-    def _compute_rotation_loss(self, forward_output: Dict[str, Any], labels: Tensor) -> Tuple[Tensor, Tensor]:
-        """
-        Compute rotation loss for pretraining from forward pass output.
-        
-        Args:
-            forward_output: Dictionary containing predicted rotation
-            labels: Ground truth rotation matrix
+        if self.hparams.pretrain_task in ['temporal', 'spatiotemporal']:
+            pred_time = forward_output["predicted_time"]
+            orig_time = forward_output["original_centroids_for_loss"][:, :, 3:4]
+            time_losses = []
+            for b in range(batch_size):
+                idx = masked_indices[b]
+                if idx.numel() == 0:
+                    continue
+                time_loss = F.smooth_l1_loss(pred_time[b, idx], orig_time[b, idx], reduction="mean")
+                time_losses.append(time_loss)
             
-        Returns:
-            Tuple of (rotation_loss, total_loss)
-        """
-        predicted_rotation = forward_output["predicted_rotation"]
-        true_rotation = labels
-        
-        # Compute L2 loss for rotation matrix
-        rotation_loss = F.mse_loss(predicted_rotation, true_rotation)
-        
-        total_loss = self.hparams.rotation_loss_weight * rotation_loss
-        return rotation_loss, total_loss
+            time_reconstruction_loss = torch.stack(time_losses).mean() if time_losses else torch.tensor(0.0, device=device)
+            total_loss += self.hparams.time_loss_weight * time_reconstruction_loss
+            losses['time_loss'] = time_reconstruction_loss
+
+        losses['total_loss'] = total_loss
+        return losses
