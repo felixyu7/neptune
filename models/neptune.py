@@ -17,7 +17,8 @@ from utils.utils import (
     VonMisesFisherLoss, 
     LogCoshLoss, 
     GaussianNLLLoss,
-    CombinedAngularVMFDistanceLoss
+    CombinedAngularVMFDistanceLoss,
+    block_expand
 )
 
 from utils.fb_losses import FB5NLLLoss, FB6NLLLoss, EfficientFB8NLLLoss, create_matrix_Gamma_torch, spherical_coordinates_to_nu_torch
@@ -300,17 +301,8 @@ class Neptune(pl.LightningModule):
             self.output_dim = None # Not applicable in pretrain mode
 
         # if self.hparams.training_mode == "finetune":
-        #     # 1) freeze every parameter in the model
-        #     for p in self.parameters():
-        #         p.requires_grad = False
-
-        #     # 2) un-freeze ONLY the final LayerNorm inside the encoder
-        #     for p in self.encoder.ln.parameters():   # <-- the `ln` you defined
-        #         p.requires_grad = True
-
-        #     # 3) un-freeze the classifier head
-        #     for p in self.classifier.parameters():
-        #         p.requires_grad = True
+        #     # block expansion fine tuning
+        #     block_expand(self.encoder.layers, group_size=self.hparams.num_layers // 3)
 
         # Results storage for test metrics
         self.test_results = {}
@@ -718,9 +710,11 @@ class Neptune(pl.LightningModule):
         self.test_step_outputs = []
 
     def configure_optimizers(self) -> Dict[str, Any]:
-        trainable = [p for p in self.parameters() if p.requires_grad]
-        optimizer = torch.optim.AdamW(trainable, lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
-        # optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        if self.hparams.training_mode == "finetune":
+            trainable = [p for p in self.parameters() if p.requires_grad]
+            optimizer = torch.optim.AdamW(trainable, lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
+        else:
+            optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.lr, weight_decay=self.hparams.weight_decay)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, self.hparams.lr_schedule[1], eta_min=1e-7)
         return [optimizer], [scheduler]
     

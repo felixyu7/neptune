@@ -6,6 +6,7 @@ from torch import Tensor
 from typing import Optional, List, Union, Any, Tuple
 import scipy.special
 import math
+import copy
 
 def LogCoshLoss(pred: Tensor, truth: Tensor) -> Tensor:
     """LogCosh loss function. approximated for easier to compute gradients"""
@@ -261,3 +262,44 @@ def farthest_point_sampling(points: Tensor, n_samples: int) -> Tensor:
             min_distances = torch.minimum(min_distances, new_distances)
     
     return selected_indices
+
+def make_identity_block(block: nn.Module):
+    """Clone a TransformerEncoderLayer / ViT block and zero-init two projections
+       so the residual path is an exact identity at initialisation."""
+    new = copy.deepcopy(block)
+    
+    # 1) attention out proj  ==> 0
+    nn.init.zeros_(new.self_attn.out_proj.weight)
+    if new.self_attn.out_proj.bias is not None:
+        nn.init.zeros_(new.self_attn.out_proj.bias)
+
+    # 2) MLP second proj     ==> 0
+    if hasattr(new, "linear2"):              # PyTorch encoder layer
+        nn.init.zeros_(new.linear2.weight)
+        nn.init.zeros_(new.linear2.bias)
+    else:                                    # timm ViT block
+        nn.init.zeros_(new.mlp.fc2.weight)
+        nn.init.zeros_(new.mlp.fc2.bias)
+
+    # Optional: zero DropPath so nothing leaks early
+    if hasattr(new, "drop_path"):
+        new.drop_path = nn.Identity()
+    for p in new.parameters():
+        p.requires_grad_(True)
+    return new
+
+def block_expand(encoder: nn.TransformerEncoder, group_size: int = 2):
+    """Expand an encoder in-place by adding one identity block after every
+       `group_size` original layers.  Original params are frozen; new ones train."""
+    new_layers = nn.ModuleList()
+    for i, blk in enumerate(encoder.layers):
+        # keep original – but freeze it
+        for p in blk.parameters(): p.requires_grad_(False)
+        new_layers.append(blk)
+
+        # after a full group, insert an identity copy
+        if (i + 1) % group_size == 0:
+            new_layers.append(make_identity_block(blk))
+
+    encoder.layers = new_layers
+    encoder.num_layers = len(new_layers)
