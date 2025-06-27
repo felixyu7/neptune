@@ -303,3 +303,22 @@ def block_expand(encoder: nn.TransformerEncoder, group_size: int = 2):
 
     encoder.layers = new_layers
     encoder.num_layers = len(new_layers)
+class WeightedBCELoss(nn.Module):
+    def __init__(self, pos_weight: float = 1.0):
+        super().__init__()
+        self.pos_weight = torch.tensor(pos_weight)
+
+    def forward(self, pred: Tensor, truth: Tensor) -> Tensor:
+        """
+        Args:
+            pred: Predicted logits [B, 1]
+            truth: True labels [B, 1]
+        """
+        if self.pos_weight.device != pred.device:
+            self.pos_weight = self.pos_weight.to(pred.device)
+            
+        return F.binary_cross_entropy_with_logits(
+            pred, 
+            truth, 
+            pos_weight=self.pos_weight
+        )

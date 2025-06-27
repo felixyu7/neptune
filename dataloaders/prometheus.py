@@ -150,10 +150,18 @@ class PrometheusDataset(torch.utils.data.Dataset):
         
         log_energy = np.log10(event.mc_truth.initial_state_energy)
         
+        # class labels for single vs. double cascade
+        pdg_code = event.mc_truth.final_state_type[0]
+        if pdg_code == 15: # tau minus
+            class_label = 1
+        else:
+            class_label = 0
+            
         label = [log_energy,
                  dir_x,
                  dir_y,
-                 dir_z]
+                 dir_z,
+                 class_label]
         
         if self.use_om2vec:
             pos = np.array([event.om2vec.sensor_pos_x.to_numpy(),

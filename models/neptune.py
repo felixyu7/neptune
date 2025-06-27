@@ -18,6 +18,7 @@ from utils.utils import (
     LogCoshLoss, 
     GaussianNLLLoss,
     CombinedAngularVMFDistanceLoss,
+    WeightedBCELoss,
     block_expand
 )
 
@@ -323,6 +324,7 @@ class Neptune(pl.LightningModule):
             else:
                 self.output_dim = 3
         elif task == 'energy_reco': self.output_dim = 2 if loss_choice == 'gaussian_nll' else 1
+        elif task == 'binary_classification': self.output_dim = 1
         else: raise ValueError(f"Unknown task: {task}")
 
     def _validate_loss_fn(self):
@@ -330,7 +332,8 @@ class Neptune(pl.LightningModule):
         loss_choice = self.hparams.loss_fn
         valid = {
             'angular_reco': ['angular_distance', 'vmf', 'combined_angular_vmf', 'kent', 'fb8', 'fb6'],
-            'energy_reco': ['log_cosh', 'gaussian_nll']
+            'energy_reco': ['log_cosh', 'gaussian_nll'],
+            'binary_classification': ['weighted_bce']
         }
         if task not in valid or loss_choice not in valid[task]:
             raise ValueError(f"Invalid task/loss combo: {task}/{loss_choice}")
@@ -464,6 +467,10 @@ class Neptune(pl.LightningModule):
             get_labels = lambda labels: labels[:, 0]
             if loss_choice == 'log_cosh': return lambda preds, labels: LogCoshLoss(preds.squeeze(-1) if preds.dim() > 1 else preds, get_labels(labels))
             if loss_choice == 'gaussian_nll': return lambda preds, labels: GaussianNLLLoss(preds[:, 0], preds[:, 1], get_labels(labels))
+        elif task == 'binary_classification':
+            get_labels = lambda labels: labels[:, 4]
+            if loss_choice == 'weighted_bce':
+                return WeightedBCELoss(pos_weight=self.hparams.get('pos_weight', 1.0))
         raise ValueError(f"Unhandled task/loss: {task}/{loss_choice}")
 
     def step(self, batch: Tuple[Tensor, Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
