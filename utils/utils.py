@@ -303,6 +303,51 @@ def block_expand(encoder: nn.TransformerEncoder, group_size: int = 2):
 
     encoder.layers = new_layers
     encoder.num_layers = len(new_layers)
+
+def focal_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    alpha: float = 0.95,
+    gamma: float = 2.0,
+    reduction: str = "mean",
+) -> torch.Tensor:
+    """
+    Binary focal loss.
+    Args
+    ----
+    logits : Tensor of shape (N, *)  – raw model outputs.
+    targets : Tensor of same shape – binary labels in {0,1}.
+    alpha : balancing factor for the positive class.
+            0 <= alpha <= 1.  If None, no class balancing is applied.
+    gamma : focusing parameter.  gamma≥0; 0 reduces to ordinary BCE.
+    reduction : 'none' | 'mean' | 'sum' – mirrors PyTorch conventions.
+    """
+    # Convert logits to probabilities
+    probas = torch.sigmoid(logits)
+    probas_pt = probas * targets + (1 - probas) * (1 - targets)  # p_t
+
+    # BCE term
+    bce_loss = F.binary_cross_entropy_with_logits(
+        logits, targets, reduction="none"
+    )
+
+    # Modulating factor & optional alpha weighting
+    mod_factor = (1.0 - probas_pt).pow(gamma)
+    if alpha is not None:
+        alpha_factor = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_factor * mod_factor * bce_loss
+    else:
+        loss = mod_factor * bce_loss
+
+    if reduction == "mean":
+        return loss.mean()
+    elif reduction == "sum":
+        return loss.sum()
+    elif reduction == "none":
+        return loss
+    else:
+        raise ValueError(f"Unsupported reduction: {reduction}")
+    
 class WeightedBCELoss(nn.Module):
     def __init__(self, pos_weight: float = 1.0):
         super().__init__()

@@ -178,7 +178,7 @@ def main():
             gradient_clip_val=1.0,
             logger=wandb_logger, 
             callbacks=[checkpoint_callback, lr_monitor],
-            num_sanity_val_steps=0
+            num_sanity_val_steps=2
         )
         
         # Train the model

@@ -10,6 +10,8 @@ import os
 import fpsample
 import time
 
+from sklearn.metrics import precision_recall_curve, auc
+
 # Local imports
 from utils.utils import (
     farthest_point_sampling, 
@@ -19,6 +21,7 @@ from utils.utils import (
     GaussianNLLLoss,
     CombinedAngularVMFDistanceLoss,
     WeightedBCELoss,
+    focal_loss,
     block_expand
 )
 
@@ -109,7 +112,7 @@ class PointCloudTokenizer(nn.Module):
                 num_valid_tokens = num_points
             else:
                 # Select centroids using Farthest Point Sampling (bucket_fps_kdline_sampling)
-                fps_indices = fpsample.bucket_fps_kdline_sampling(points_for_sampling.detach().cpu().numpy(), self.max_tokens, h=3)
+                fps_indices = fpsample.bucket_fps_kdline_sampling(points_for_sampling.float().detach().cpu().numpy(), self.max_tokens, h=3)
                 batch_centroids = points_for_sampling[fps_indices]  # [max_tokens, 4]
                 
                 # Find k-Nearest Neighbors for each centroid
@@ -301,9 +304,9 @@ class Neptune(pl.LightningModule):
             self.classifier = None # Not used in pretrain mode
             self.output_dim = None # Not applicable in pretrain mode
 
-        # if self.hparams.training_mode == "finetune":
-        #     # block expansion fine tuning
-        #     block_expand(self.encoder.layers, group_size=self.hparams.num_layers // 3)
+        if self.hparams.training_mode == "finetune":
+            # block expansion fine tuning
+            block_expand(self.encoder.layers, group_size=self.hparams.num_layers // 3)
 
         # Results storage for test metrics
         self.test_results = {}
@@ -333,7 +336,7 @@ class Neptune(pl.LightningModule):
         valid = {
             'angular_reco': ['angular_distance', 'vmf', 'combined_angular_vmf', 'kent', 'fb8', 'fb6'],
             'energy_reco': ['log_cosh', 'gaussian_nll'],
-            'binary_classification': ['weighted_bce']
+            'binary_classification': ['weighted_bce', 'focal_loss']
         }
         if task not in valid or loss_choice not in valid[task]:
             raise ValueError(f"Invalid task/loss combo: {task}/{loss_choice}")
@@ -418,7 +421,7 @@ class Neptune(pl.LightningModule):
             if loss_choice == 'fb8':
                 fb8_loss = EfficientFB8NLLLoss()
                 def fb8_loss_wrapper(preds, labels):
-                    target = labels[:, 1:]
+                    target = labels[:, 1:4]
                     pred_theta_raw = torch.sigmoid(preds[:, 0:1].to(target.dtype)) * torch.pi  # [B, 1]
                     pred_phi_raw = torch.sigmoid(preds[:, 1:2].to(target.dtype)) * torch.pi * 2  # [B, 1]
                     pred_psi_raw = torch.sigmoid(preds[:, 2:3].to(target.dtype)) * torch.pi * 2  # [B, 1]
@@ -458,7 +461,7 @@ class Neptune(pl.LightningModule):
                 return kent_loss_wrapper
             else:
                 # Other angular losses expect 3-dim output
-                get_labels = lambda labels: labels[:, 1:]
+                get_labels = lambda labels: labels[:, 1:4]
                 if loss_choice == 'angular_distance': return lambda preds, labels: AngularDistanceLoss(preds, get_labels(labels))
                 if loss_choice == 'vmf': return lambda preds, labels: VonMisesFisherLoss(preds, get_labels(labels))
                 if loss_choice == 'combined_angular_vmf': 
@@ -468,18 +471,25 @@ class Neptune(pl.LightningModule):
             if loss_choice == 'log_cosh': return lambda preds, labels: LogCoshLoss(preds.squeeze(-1) if preds.dim() > 1 else preds, get_labels(labels))
             if loss_choice == 'gaussian_nll': return lambda preds, labels: GaussianNLLLoss(preds[:, 0], preds[:, 1], get_labels(labels))
         elif task == 'binary_classification':
-            get_labels = lambda labels: labels[:, 4]
             if loss_choice == 'weighted_bce':
                 return WeightedBCELoss(pos_weight=self.hparams.get('pos_weight', 1.0))
+            if loss_choice == 'focal_loss':
+                return lambda preds, labels: focal_loss(preds, labels)
         raise ValueError(f"Unhandled task/loss: {task}/{loss_choice}")
 
     def step(self, batch: Tuple[Tensor, Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
         coords, features, labels = batch
         preds = self(coords, features)
         loss_func = self._get_loss_function()
-        loss = loss_func(preds, labels)
+
+        if self.hparams.downstream_task == 'binary_classification':
+            class_labels = labels[:, 4:5]
+            loss = loss_func(preds, class_labels)
+        else:
+            loss = loss_func(preds, labels)
+            
         return loss, preds, labels
-        
+
     def training_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Tensor:
         if getattr(self.hparams, "training_mode", "supervised") == "pretrain":
             coords, features, _ = batch
@@ -550,7 +560,11 @@ class Neptune(pl.LightningModule):
             forward_time = end_time - start_time
             
             loss_func = self._get_loss_function()
-            loss = loss_func(preds, labels)
+            if self.hparams.downstream_task == 'binary_classification':
+                class_labels = labels[:, 4:5]
+                loss = loss_func(preds, class_labels)
+            else:
+                loss = loss_func(preds, labels)
             
             self.log('test_loss', loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=self.hparams.batch_size)
             output = {
@@ -576,10 +590,14 @@ class Neptune(pl.LightningModule):
         all_preds = torch.cat([x['preds'] for x in step_outputs], dim=0)
         all_labels = torch.cat([x['labels'] for x in step_outputs], dim=0)
         loss_func = self._get_loss_function()
-        overall_loss = loss_func(all_preds, all_labels)
+        if self.hparams.downstream_task == 'binary_classification':
+            class_labels = all_labels[:, 4:5]
+            overall_loss = loss_func(all_preds, class_labels)
+        else:
+            overall_loss = loss_func(all_preds, all_labels)
         self.log(f'{stage}_loss_epoch', overall_loss, prog_bar=(stage=='val'))
         if self.hparams.downstream_task == 'angular_reco':
-            true_dirs = all_labels[:, 1:]
+            true_dirs = all_labels[:, 1:4]
             if self.hparams.loss_fn == 'fb8' or self.hparams.loss_fn == 'fb6' or self.hparams.loss_fn == 'kent':
                 theta = torch.sigmoid(all_preds[:, 0]) * np.pi
                 phi = torch.sigmoid(all_preds[:, 1]) * np.pi * 2
@@ -601,6 +619,12 @@ class Neptune(pl.LightningModule):
         if self.hparams.downstream_task == 'energy_reco':
             energy_errors = torch.abs(all_preds[:, 0] - all_labels[:, 0])
             self.log(f'{stage}_mean_energy_error', energy_errors.mean())
+        if self.hparams.downstream_task == 'binary_classification':
+            scores = torch.sigmoid(all_preds.flatten()).float().detach().cpu().numpy()
+            truth = all_labels[:, 4].flatten().float().detach().cpu().numpy()
+            precision, recall, _ = precision_recall_curve(truth, scores)
+            pr_auc = auc(recall, precision)
+            self.log(f'{stage}_pr_auc', pr_auc)
             
     def on_validation_epoch_end(self):
         outputs = self.validation_step_outputs
@@ -638,9 +662,9 @@ class Neptune(pl.LightningModule):
         all_forward_times = torch.cat([x['forward_time'].unsqueeze(0) for x in outputs], dim=0)
 
         # Convert to numpy arrays for saving
-        preds_np = all_preds.detach().cpu().numpy()
-        labels_np = all_labels.detach().cpu().numpy()
-        forward_times_np = all_forward_times.detach().cpu().numpy()
+        preds_np = all_preds.float().detach().cpu().numpy()
+        labels_np = all_labels.float().detach().cpu().numpy()
+        forward_times_np = all_forward_times.float().detach().cpu().numpy()
 
         self.test_results = {}
 
@@ -668,7 +692,7 @@ class Neptune(pl.LightningModule):
             preds_norm_np = preds_norm.detach().cpu().numpy()
             
             # Compute directions and metrics
-            angle_errors_rad = AngularDistanceLoss(preds_norm, all_labels[:, 1:], reduction='none') * np.pi
+            angle_errors_rad = AngularDistanceLoss(preds_norm, all_labels[:, 1:4], reduction='none') * np.pi
             angle_errors_deg = torch.rad2deg(angle_errors_rad)
             angle_errors_deg_np = angle_errors_deg.detach().cpu().numpy()
             
@@ -703,6 +727,10 @@ class Neptune(pl.LightningModule):
             else:
                 self.test_results['preds'] = preds_np.squeeze()
             self.test_results['truth'] = labels_np[:, 0]
+        elif self.hparams.downstream_task == 'binary_classification':
+            # Collect binary classification results
+            self.test_results['preds'] = preds_np.squeeze()
+            self.test_results['truth'] = labels_np[:, 4]
         
         # Add forward times to the results
         self.test_results['forward_time'] = forward_times_np
