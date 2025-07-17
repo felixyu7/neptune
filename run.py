@@ -102,7 +102,10 @@ def main():
                 lr=cfg['training_options']['lr'],
                 lr_schedule=cfg['training_options']['lr_schedule'],
                 weight_decay=cfg['training_options']['weight_decay'],
-                training_mode='finetune'
+                training_mode='finetune',
+                sh_l_max=cfg['model_options'].get('sh_l_max', 4),
+                sh_n_theta=cfg['model_options'].get('sh_n_theta', 64),
+                sh_n_lambda=cfg['model_options'].get('sh_n_lambda', 128)
             )
         else:
             print("Error: checkpoint must be specified for finetune mode.")
@@ -129,7 +132,10 @@ def main():
                 lr=cfg['training_options']['lr'],
                 lr_schedule=cfg['training_options']['lr_schedule'],
                 weight_decay=cfg['training_options']['weight_decay'],
-                training_mode='supervised'
+                training_mode='supervised',
+                sh_l_max=cfg['model_options'].get('sh_l_max', 4),
+                sh_n_theta=cfg['model_options'].get('sh_n_theta', 64),
+                sh_n_lambda=cfg['model_options'].get('sh_n_lambda', 128)
             )
         else:
             model = Neptune(
@@ -149,7 +155,10 @@ def main():
                 lr=cfg['training_options']['lr'],
                 lr_schedule=cfg['training_options']['lr_schedule'],
                 weight_decay=cfg['training_options']['weight_decay'],
-                training_mode='supervised'
+                training_mode='supervised',
+                sh_l_max=cfg['model_options'].get('sh_l_max', 4),
+                sh_n_theta=cfg['model_options'].get('sh_n_theta', 64),
+                sh_n_lambda=cfg['model_options'].get('sh_n_lambda', 128)
             )
             
     # Setup trainer

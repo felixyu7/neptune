@@ -26,6 +26,7 @@ from utils.utils import (
 )
 
 from utils.fb_losses import FB5NLLLoss, FB6NLLLoss, EfficientFB8NLLLoss, create_matrix_Gamma_torch, spherical_coordinates_to_nu_torch
+from utils.sh_loss import SHLoss
 
 class PointCloudTokenizer(nn.Module):
     """Converts point cloud data into tokens for transformer processing."""
@@ -256,7 +257,10 @@ class Neptune(pl.LightningModule):
         centroid_loss_weight: float = 1.0,
         pretrain_masking_ratio: float = 0.15,
         pretrain_task: str = 'spatial',
-        time_loss_weight: float = 1.0
+        time_loss_weight: float = 1.0,
+        sh_l_max: int = 4,
+        sh_n_theta: int = 64,
+        sh_n_lambda: int = 128
     ):
         super().__init__()
         self.save_hyperparameters()
@@ -324,6 +328,8 @@ class Neptune(pl.LightningModule):
                 self.output_dim = 6
             elif loss_choice == 'kent':
                 self.output_dim = 5
+            elif loss_choice == 'sh':
+                self.output_dim = (self.hparams.sh_l_max + 1)**2
             else:
                 self.output_dim = 3
         elif task == 'energy_reco': self.output_dim = 2 if loss_choice == 'gaussian_nll' else 1
@@ -334,7 +340,7 @@ class Neptune(pl.LightningModule):
         task = self.hparams.downstream_task
         loss_choice = self.hparams.loss_fn
         valid = {
-            'angular_reco': ['angular_distance', 'vmf', 'combined_angular_vmf', 'kent', 'fb8', 'fb6'],
+            'angular_reco': ['angular_distance', 'vmf', 'combined_angular_vmf', 'kent', 'fb8', 'fb6', 'sh'],
             'energy_reco': ['log_cosh', 'gaussian_nll'],
             'binary_classification': ['weighted_bce', 'focal_loss']
         }
@@ -459,6 +465,15 @@ class Neptune(pl.LightningModule):
                     pred_beta_raw = F.softplus(preds[:, 4:5]).to(target.dtype)    # [B, 1]
                     return kent_loss(target, pred_theta_raw, pred_phi_raw, pred_psi_raw, pred_kappa_raw, pred_beta_raw)
                 return kent_loss_wrapper
+            elif loss_choice == 'sh':
+                sh_loss = SHLoss(l_max=self.hparams.sh_l_max,
+                                 n_theta=self.hparams.sh_n_theta,
+                                 n_lambda=self.hparams.sh_n_lambda)
+                def sh_loss_wrapper(preds, labels):
+                    target = labels[:, 1:4]
+                    # SHLoss returns per-sample NLL, so we take the mean
+                    return sh_loss(preds, target).mean()
+                return sh_loss_wrapper
             else:
                 # Other angular losses expect 3-dim output
                 get_labels = lambda labels: labels[:, 1:4]
