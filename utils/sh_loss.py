@@ -88,8 +88,13 @@ class SHComponents(nn.Module):
         # For real spherical harmonics, the number of coefficients is (l_max + 1)^2
         self.n_coeffs = (l_max + 1)**2
         
-        # Initialize inverse SH transform (coefficients -> grid)
-        self.inverse_sht = harmonics.InverseRealSHT(n_theta, n_lambda, grid=grid)
+        # Initialize inverse SH transform with explicit truncation
+        # This ensures we only use the first (l_max+1) modes in each dimension
+        self.inverse_sht = harmonics.InverseRealSHT(n_theta, n_lambda, 
+                                                   lmax=l_max+1, mmax=l_max+1, 
+                                                   grid=grid)
+        
+        # inverse_sht already initialized above
         
         # Get quadrature weights for integration
         if grid == "legendre-gauss":
@@ -120,6 +125,10 @@ class SHComponents(nn.Module):
         # Create coordinate grids for interpolation
         self.register_buffer('theta_grid', theta_2d)
         self.register_buffer('lambda_grid', lambda_2d)
+
+        # Create Cartesian coordinate grid for mean direction calculation
+        cartesian_grid = spherical_to_cartesian(theta_2d, lambda_2d)
+        self.register_buffer('cartesian_grid', cartesian_grid)
     
     def coefficients_to_grid(self, coefficients: torch.Tensor) -> torch.Tensor:
         """
@@ -135,31 +144,35 @@ class SHComponents(nn.Module):
         lmax = self.inverse_sht.lmax
         mmax = self.inverse_sht.mmax
         
+        # Create coefficient tensor in torch-harmonics format
         coeff_tensor = torch.zeros(*batch_shape, lmax, mmax, 
                                   dtype=torch.complex128, device=coefficients.device)
         
-        # Map from flat coefficient array to complex tensor for torch-harmonics
-        # The format is (l, m) indexing for real spherical harmonics.
-        # m=0 terms are real, m>0 terms are complex (cos and sin parts).
+        # Map from flat coefficient array to complex tensor for torch-harmonics.
+        # This is the crucial step for correctly implementing real spherical harmonics.
+        # The (l, m) coefficient corresponds to the real (cosine) and imaginary (sine) parts.
         coeff_idx = 0
         for l in range(self.l_max + 1):
-            if l >= lmax: continue
-            
-            # m = 0 term (real)
-            if coeff_idx < self.n_coeffs:
+            # m = 0 term (zonal harmonic), which is purely real
+            if coeff_idx < self.n_coeffs and l < lmax:
                 coeff_tensor[..., l, 0] = coefficients[..., coeff_idx].to(torch.complex128)
                 coeff_idx += 1
             
-            # m > 0 terms (complex)
+            # m > 0 terms (tesseral harmonics) have cosine and sine components
             for m in range(1, l + 1):
-                if m >= mmax: continue
-                
-                if coeff_idx + 1 < self.n_coeffs:
-                    real_part = coefficients[..., coeff_idx]
-                    imag_part = coefficients[..., coeff_idx + 1]
-                    coeff_tensor[..., l, m] = torch.complex(real_part, imag_part)
-                    coeff_idx += 2
+                if m < mmax:
+                    # Cosine coefficient (real part)
+                    if coeff_idx < self.n_coeffs:
+                        coeff_tensor[..., l, m] = coefficients[..., coeff_idx].to(torch.complex128)
+                        coeff_idx += 1
+                    
+                    # Sine coefficient (imaginary part)
+                    if coeff_idx < self.n_coeffs:
+                        coeff_tensor[..., l, m] += coefficients[..., coeff_idx].to(torch.complex128) * 1j
+                        coeff_idx += 1
         
+        # Ensure the SHT module is on the same device as the coefficients
+        self.inverse_sht.to(coefficients.device)
         grid_values = self.inverse_sht(coeff_tensor)
         return torch.real(grid_values)
     
@@ -173,14 +186,15 @@ class SHComponents(nn.Module):
         Returns:
             integral: Tensor of shape (...) containing integrated values
         """
-        weighted_values = values * self.integration_weights
+        weighted_values = values * self.integration_weights.to(values.device)
         integral = torch.sum(weighted_values, dim=(-2, -1))
         return integral
     
     def interpolate_at_point(self, grid_values: torch.Tensor, theta: torch.Tensor,
                            phi: torch.Tensor) -> torch.Tensor:
         """
-        Interpolate grid values at specific spherical coordinates using F.grid_sample.
+        Interpolate grid values at specific spherical coordinates using grid-aware bilinear interpolation.
+        This handles non-uniform grids correctly, unlike F.grid_sample which assumes uniform spacing.
         
         Args:
             grid_values: Tensor of shape (..., n_theta, n_lambda)
@@ -191,33 +205,58 @@ class SHComponents(nn.Module):
             interpolated: Tensor of shape (...) containing interpolated values
         """
         batch_shape = grid_values.shape[:-2]
-        grid_values_unsqueezed = grid_values.unsqueeze(-3)
+        device = grid_values.device
         
-        # Pad the grid for circular interpolation in the phi (longitude) dimension
-        grid_padded = F.pad(grid_values_unsqueezed.float(), (0, 1, 0, 0), mode='circular')
-
-        # Normalize coordinates to [-1, 1] for grid_sample
-        y_norm = (theta / math.pi) * 2 - 1
-        x_norm = (phi / math.pi) - 1
+        # Get grid coordinates
+        theta_coords = self.theta_coords.to(device)
+        lambda_coords = self.lambda_coords.to(device)
         
-        # Create sampling grid
-        sampling_grid = torch.stack([x_norm, y_norm], dim=-1)
-        while len(sampling_grid.shape) < 4:
-            sampling_grid = sampling_grid.unsqueeze(1)
-            
-        # Perform interpolation
-        interpolated = F.grid_sample(
-            grid_padded,
-            sampling_grid.float(),
-            mode='bilinear',
-            padding_mode='zeros',
-            align_corners=True
-        )
+        # Handle theta (latitude) interpolation - non-uniform grid
+        # Find the left theta index for each target theta
+        theta_idx_left = torch.searchsorted(theta_coords, theta, right=False)
+        theta_idx_left = torch.clamp(theta_idx_left - 1, 0, self.n_theta - 2)
+        theta_idx_right = theta_idx_left + 1
         
-        result = interpolated.squeeze()
-        if batch_shape:
-            result = result.view(*batch_shape)
-            
+        # Compute theta interpolation weights
+        theta_left = theta_coords[theta_idx_left]
+        theta_right = theta_coords[theta_idx_right]
+        theta_weight = (theta - theta_left) / (theta_right - theta_left + 1e-10)
+        
+        # Handle phi (longitude) interpolation - uniform grid with periodicity
+        # Normalize phi to [0, 2π] range
+        phi_norm = phi % (2 * math.pi)
+        
+        # Find the left phi index for each target phi
+        phi_idx_left = torch.searchsorted(lambda_coords, phi_norm, right=False)
+        phi_idx_left = torch.clamp(phi_idx_left - 1, 0, self.n_lambda - 1)
+        phi_idx_right = (phi_idx_left + 1) % self.n_lambda  # Handle periodicity
+        
+        # Compute phi interpolation weights
+        phi_left = lambda_coords[phi_idx_left]
+        phi_right = lambda_coords[phi_idx_right]
+        
+        # Handle the periodic case where phi_right < phi_left
+        phi_diff = phi_right - phi_left
+        phi_diff = torch.where(phi_diff < 0, phi_diff + 2 * math.pi, phi_diff)
+        phi_weight = (phi_norm - phi_left) / (phi_diff + 1e-10)
+        
+        # Perform bilinear interpolation
+        # Get the four corner values using proper batch indexing
+        # We need to create batch indices to avoid fancy indexing issues
+        batch_indices = torch.arange(grid_values.shape[0], device=device)
+        
+        val_00 = grid_values[batch_indices, theta_idx_left, phi_idx_left]      # (theta_left, phi_left)
+        val_01 = grid_values[batch_indices, theta_idx_left, phi_idx_right]     # (theta_left, phi_right)
+        val_10 = grid_values[batch_indices, theta_idx_right, phi_idx_left]     # (theta_right, phi_left)
+        val_11 = grid_values[batch_indices, theta_idx_right, phi_idx_right]    # (theta_right, phi_right)
+        
+        # Interpolate in phi direction first
+        val_0 = val_00 * (1 - phi_weight) + val_01 * phi_weight
+        val_1 = val_10 * (1 - phi_weight) + val_11 * phi_weight
+        
+        # Then interpolate in theta direction
+        result = val_0 * (1 - theta_weight) + val_1 * theta_weight
+        
         return result
 
 
@@ -225,6 +264,19 @@ class SHLoss(nn.Module):
     """
     Spherical Harmonic Loss Module
     """
+    
+    @staticmethod
+    def get_n_coeffs(l_max: int) -> int:
+        """
+        Static method to get the number of coefficients for a given l_max.
+        
+        Args:
+            l_max: Maximum spherical harmonic degree
+            
+        Returns:
+            n_coeffs: Number of coefficients
+        """
+        return (l_max + 1)**2
     
     def __init__(self, l_max: int = 4, n_theta: int = 64, n_lambda: int = 128, 
                  grid: str = "legendre-gauss", eps: float = 1e-8):
@@ -242,7 +294,17 @@ class SHLoss(nn.Module):
         
         self.l_max = l_max
         self.eps = eps
+        self.n_coeffs = (l_max + 1)**2
         self.sh_components = SHComponents(l_max, n_theta, n_lambda, grid)
+        
+    def get_n_coeffs_instance(self) -> int:
+        """
+        Get the number of coefficients required for this SH loss configuration.
+        
+        Returns:
+            n_coeffs: Number of coefficients
+        """
+        return self.n_coeffs
         
     def forward(self, sh_coefficients: torch.Tensor, target_directions: torch.Tensor) -> torch.Tensor:
         """
@@ -300,3 +362,40 @@ class SHLoss(nn.Module):
         coordinates = (self.sh_components.theta_grid, self.sh_components.lambda_grid)
         
         return prob_distribution, coordinates
+    
+    def predict_mean_direction(self, sh_coefficients: torch.Tensor) -> torch.Tensor:
+        """
+        Predict the mean direction from the SH distribution.
+
+        Args:
+            sh_coefficients: Tensor of shape (batch_size, n_coeffs)
+
+        Returns:
+            mean_direction: Tensor of shape (batch_size, 3) containing the mean direction vector
+        """
+        # Get the probability distribution on the grid
+        prob_dist, _ = self.predict_distribution(sh_coefficients)
+
+        # Get the Cartesian coordinates grid
+        cartesian_grid = self.sh_components.cartesian_grid.to(prob_dist.device)
+
+        # Weight the Cartesian vectors by the probability distribution
+        # The shape of prob_dist is (batch, n_theta, n_lambda)
+        # The shape of cartesian_grid is (n_theta, n_lambda, 3)
+        # We want to get (batch, n_theta, n_lambda, 3)
+        weighted_vectors = prob_dist.unsqueeze(-1) * cartesian_grid
+
+        # Integrate over the sphere to get the mean vector
+        # The integration weights are (n_theta, n_lambda)
+        integration_weights = self.sh_components.integration_weights.to(prob_dist.device)
+        
+        # Reshape weights for broadcasting: (1, n_theta, n_lambda, 1)
+        integration_weights_reshaped = integration_weights.unsqueeze(0).unsqueeze(-1)
+
+        # Perform the integration by element-wise multiplication and summing
+        mean_vector = torch.sum(weighted_vectors * integration_weights_reshaped, dim=(-3, -2))
+
+        # Normalize the resulting vector to get the mean direction
+        mean_direction = F.normalize(mean_vector, p=2, dim=-1)
+
+        return mean_direction

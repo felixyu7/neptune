@@ -581,6 +581,8 @@ class Neptune(pl.LightningModule):
             else:
                 loss = loss_func(preds, labels)
             
+            import pdb; pdb.set_trace()
+            
             self.log('test_loss', loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=self.hparams.batch_size)
             output = {
                 "test_loss": loss.detach(), 
@@ -605,28 +607,61 @@ class Neptune(pl.LightningModule):
         all_preds = torch.cat([x['preds'] for x in step_outputs], dim=0)
         all_labels = torch.cat([x['labels'] for x in step_outputs], dim=0)
         loss_func = self._get_loss_function()
-        if self.hparams.downstream_task == 'binary_classification':
-            class_labels = all_labels[:, 4:5]
-            overall_loss = loss_func(all_preds, class_labels)
-        else:
-            overall_loss = loss_func(all_preds, all_labels)
+
+        # Process in chunks to avoid OOM errors with large validation sets
+        chunk_size = self.hparams.batch_size
+        num_samples = all_preds.shape[0]
+        overall_loss = 0.0
+        num_chunks = (num_samples + chunk_size - 1) // chunk_size
+
+        for i in range(num_chunks):
+            start_idx = i * chunk_size
+            end_idx = min((i + 1) * chunk_size, num_samples)
+            chunk_preds = all_preds[start_idx:end_idx]
+            chunk_labels = all_labels[start_idx:end_idx]
+
+            if self.hparams.downstream_task == 'binary_classification':
+                class_labels = chunk_labels[:, 4:5]
+                loss_chunk = loss_func(chunk_preds, class_labels)
+            else:
+                loss_chunk = loss_func(chunk_preds, chunk_labels)
+            
+            overall_loss += loss_chunk.item() * len(chunk_preds)
+
+        overall_loss /= num_samples
         self.log(f'{stage}_loss_epoch', overall_loss, prog_bar=(stage=='val'))
         if self.hparams.downstream_task == 'angular_reco':
             true_dirs = all_labels[:, 1:4]
-            if self.hparams.loss_fn == 'fb8' or self.hparams.loss_fn == 'fb6' or self.hparams.loss_fn == 'kent':
-                theta = torch.sigmoid(all_preds[:, 0]) * np.pi
-                phi = torch.sigmoid(all_preds[:, 1]) * np.pi * 2
-                psi = torch.sigmoid(all_preds[:, 2]) * np.pi * 2
-                Gamma = create_matrix_Gamma_torch(theta, phi, psi)
-                if self.hparams.loss_fn == 'fb8':
-                    alpha = torch.sigmoid(all_preds[:, 6]) * np.pi
-                    rho = torch.sigmoid(all_preds[:, 7]) * np.pi * 2
-                    nu = spherical_coordinates_to_nu_torch(alpha, rho)
-                    preds_norm = torch.bmm(Gamma, nu.unsqueeze(2)).squeeze(2)
+            
+            # Process predictions in chunks for metric calculation to avoid OOM
+            preds_norm_list = []
+            for i in range(num_chunks):
+                start_idx = i * chunk_size
+                end_idx = min((i + 1) * chunk_size, num_samples)
+                chunk_preds = all_preds[start_idx:end_idx]
+
+                if self.hparams.loss_fn == 'fb8' or self.hparams.loss_fn == 'fb6' or self.hparams.loss_fn == 'kent':
+                    theta = torch.sigmoid(chunk_preds[:, 0]) * np.pi
+                    phi = torch.sigmoid(chunk_preds[:, 1]) * np.pi * 2
+                    psi = torch.sigmoid(chunk_preds[:, 2]) * np.pi * 2
+                    Gamma = create_matrix_Gamma_torch(theta, phi, psi)
+                    if self.hparams.loss_fn == 'fb8':
+                        alpha = torch.sigmoid(chunk_preds[:, 6]) * np.pi
+                        rho = torch.sigmoid(chunk_preds[:, 7]) * np.pi * 2
+                        nu = spherical_coordinates_to_nu_torch(alpha, rho)
+                        preds_norm_chunk = torch.bmm(Gamma, nu.unsqueeze(2)).squeeze(2)
+                    else:
+                        preds_norm_chunk = Gamma[:,:,0]
+                elif self.hparams.loss_fn == 'sh':
+                    loss_func_instance = SHLoss(l_max=self.hparams.sh_l_max,
+                                                n_theta=self.hparams.sh_n_theta,
+                                                n_lambda=self.hparams.sh_n_lambda)
+                    preds_norm_chunk = loss_func_instance.predict_mean_direction(chunk_preds)
                 else:
-                    preds_norm = Gamma[:,:,0]
-            else:
-                preds_norm = F.normalize(all_preds, p=2, dim=1)
+                    preds_norm_chunk = F.normalize(chunk_preds, p=2, dim=1)
+                preds_norm_list.append(preds_norm_chunk)
+
+            preds_norm = torch.cat(preds_norm_list, dim=0)
             angular_errors_rad = AngularDistanceLoss(preds_norm, true_dirs, reduction='none') * np.pi
             median_angular_error_rad = torch.median(angular_errors_rad)
             self.log(f'{stage}_median_angular_error_deg', torch.rad2deg(median_angular_error_rad))
