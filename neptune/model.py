@@ -1,8 +1,5 @@
 """
 Neptune: A transformer-based point cloud processing model for neutrino event reconstruction.
-
-This module provides the core NeptuneModel, a pure PyTorch nn.Module implementation
-that can be easily integrated into any training framework or pipeline.
 """
 
 import torch
@@ -223,12 +220,7 @@ class PointTransformerEncoder(nn.Module):
 
 class NeptuneModel(nn.Module):
     """
-    Neptune: A transformer-based point cloud processing model.
-    
-    This is a pure PyTorch nn.Module implementation that can be used in any training framework.
-    The model processes point clouds through tokenization, transformer encoding, and 
-    classification/regression heads.
-    
+    Main model class.
     Args:
         in_channels: Number of input feature channels per point
         num_patches: Maximum number of tokens after point cloud tokenization

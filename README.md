@@ -1,9 +1,9 @@
-## Neptune
+# Neptune: An Efficient Point Transformer for Ultrarelativistic Neutrino Events
 
-Transformer for point cloud-based neutrino telescope event reconstruction.
+Neptune (a**N** **E**fficient **P**oint **T**ransformer for **U**ltrarelativistic **N**eutrino **E**vents) is a transformer-based point cloud processing model specifically designed for neutrino event reconstruction. (WIP, not yet on PyPI)
 
 ```bash
-pip install neptune-reco
+pip install -e .
 ```
 
 ## Usage
@@ -26,6 +26,20 @@ coords = torch.randn(1000, 5)
 features = torch.randn(1000, 6)
 
 out = model(coords, features) # [batch_size, 3]
+
+# train with angular distance loss for 3D directions
+import torch.nn.functional as F
+
+def angular_distance_loss(pred, truth):
+    pred_norm = F.normalize(pred, dim=1)
+    truth_norm = F.normalize(truth, dim=1) 
+    cos_sim = F.cosine_similarity(pred_norm, truth_norm)
+    return torch.acos(torch.clamp(cos_sim, -1+1e-7, 1-1e-7)).mean()
+
+# training loop
+directions = torch.randn(batch_size, 3)  # true directions
+loss = angular_distance_loss(out, directions)
+loss.backward()
 ```
 
 ## How it works

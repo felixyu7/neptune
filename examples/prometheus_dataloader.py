@@ -1,8 +1,3 @@
-"""
-Prometheus Data Module for Neptune Examples.
-Extracted and simplified from original implementation.
-"""
-
 import os
 import glob
 import torch

@@ -1,10 +1,3 @@
-"""
-Neptune Lightning Wrapper for Examples
-
-This creates a PyTorch Lightning wrapper around our clean Neptune model,
-preserving the original training interface while using the new package.
-"""
-
 import torch
 import torch.nn.functional as F
 import lightning.pytorch as pl

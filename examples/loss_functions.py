@@ -1,8 +1,3 @@
-"""
-Essential loss functions for Neptune examples.
-Extracted from original implementation, keeping only what's needed for angular/energy reconstruction.
-"""
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
