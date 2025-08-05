@@ -67,6 +67,7 @@ def main():
             k_neighbors=cfg['model_options']['k_neighbors'],
             pool_method=cfg['model_options']['pool_method'],
             pre_norm=cfg['model_options']['pre_norm'],
+            mlp_layers=cfg['model_options']['mlp_layers'],
             batch_size=cfg['training_options']['batch_size'],
             lr=cfg['training_options']['lr'],
             lr_schedule=cfg['training_options']['lr_schedule'],

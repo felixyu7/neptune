@@ -181,23 +181,23 @@ def main():
 
     dataset_dirs = []
     
-    output_dir = Path("/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/training_MC_scrambled")
+    output_dir = Path("/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/training_MC_scrambled_nu_only")
     ledger_path = Path("./ledger")
     
     shard_size = 25_000
     buffer = 250_000
     batch = 10_000
-    threads = 16
+    threads = 32
     
     dataset_dirs = [
         "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/NuGen_22852/labels/000000-000999/",
         "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/NuGen_22853/labels/000000-000999/",
         "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/NuGen_22855/labels/000000-000999/",
         "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/NuGen_22856/labels/000000-000999/",
-        "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/CORSIKA_22803/labels/000000-000999/",
-        "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/CORSIKA_22803/labels/001000-001999/",
-        "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/CORSIKA_22803/labels/002000-002999/",
-        "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/CORSIKA_22803/labels/003000-003999/",
+        # "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/CORSIKA_22803/labels/000000-000999/",
+        # "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/CORSIKA_22803/labels/001000-001999/",
+        # "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/CORSIKA_22803/labels/002000-002999/",
+        # "/n/holylfs05/LABS/arguelles_delgado_lab/Everyone/pweigel/MC/CORSIKA_22803/labels/003000-003999/",
     ]
     dataset_dirs = [Path(ds) for ds in dataset_dirs]
 
