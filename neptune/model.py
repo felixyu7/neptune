@@ -1,7 +1,6 @@
 """
 Neptune: A transformer-based point cloud processing model for neutrino event reconstruction.
 """
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,7 +8,6 @@ from torch import Tensor
 from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from typing import List, Tuple, Optional
 import fpsample
-
 
 class PointCloudTokenizer(nn.Module):
     """Converts point cloud data into tokens for transformer processing."""

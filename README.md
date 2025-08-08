@@ -63,7 +63,7 @@ loss.backward()
 
 ## Training examples
 
-See `examples/` for PyTorch Lightning integration with neutrino datasets
+See `examples/` for PyTorch Lightning integration with Prometheus datasets
 
 ## Requirements
 

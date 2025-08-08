@@ -6,6 +6,7 @@ import lightning.pytorch as pl
 import awkward as ak
 import pyarrow.parquet as pq
 import random
+import nt_summary_stats
 from torch import Tensor
 from torch.utils.data import Sampler, Dataset
 from typing import List, Tuple, Optional, Union
@@ -128,35 +129,43 @@ class PrometheusDataset(torch.utils.data.Dataset):
         data = pq.ParquetFile(self.files[file_idx])
         row_group = data.read_row_group(0)  # Assume single row group for simplicity
         
-        # Convert to awkward array
+        # Convert to pandas DataFrame
         table = row_group.to_pandas()
         
-        # Extract event data (simplified - adjust based on your data format)
+        # Extract event data
         event_data = table.iloc[local_idx]
         
-        # Extract coordinates (x, y, z, t)
-        # Adjust these field names based on your actual Prometheus data format
+        # Extract photon hit data from the nested structure
+        photons = event_data['photons']
+        mc_truth = event_data['mc_truth']
+        
+        # Use nt-summary-stats to process the event and get sensor-level features
+        sensor_positions, sensor_stats = nt_summary_stats.process_prometheus_event(photons)
+        
+        # sensor_positions: (N_sensors, 3) - x, y, z coordinates
+        # sensor_stats: (N_sensors, 9) - [time_mean, time_std, time_min, time_max, n_hits, charge_sum, charge_mean, charge_std, duration]
+        
+        # Create 4D coordinates: x, y, z, t (using time_mean for t)
         pos = np.column_stack([
-            event_data.get('x', np.array([])),
-            event_data.get('y', np.array([])), 
-            event_data.get('z', np.array([])),
-            event_data.get('t', np.array([]))
+            sensor_positions[:, 0],  # x
+            sensor_positions[:, 1],  # y
+            sensor_positions[:, 2],  # z
+            sensor_stats[:, 0]       # time_mean as t coordinate
         ]).astype(np.float32)
         
-        # Extract features (charge, auxiliary features)
-        feats = np.column_stack([
-            event_data.get('charge', np.array([])),
-            # Add other feature columns as needed
-        ]).astype(np.float32)
+        # Use all 9 summary statistics as features
+        feats = sensor_stats.astype(np.float32)  # [time_mean, time_std, time_min, time_max, n_hits, charge_sum, charge_mean, charge_std, duration]
         
-        # Extract labels (energy, direction, etc.)
-        labels = np.array([
-            event_data.get('energy', 0.0),      # Energy
-            event_data.get('dir_x', 0.0),       # Direction x
-            event_data.get('dir_y', 0.0),       # Direction y  
-            event_data.get('dir_z', 1.0),       # Direction z
-            # Add other labels as needed
-        ]).astype(np.float32)
+        # Extract labels from mc_truth for angular reconstruction
+        initial_zenith = mc_truth['initial_state_zenith']
+        initial_azimuth = mc_truth['initial_state_azimuth']
+        
+        # Convert spherical to Cartesian direction
+        dir_x = np.sin(initial_zenith) * np.cos(initial_azimuth)
+        dir_y = np.sin(initial_zenith) * np.sin(initial_azimuth)
+        dir_z = np.cos(initial_zenith)
+        
+        labels = np.array([dir_x, dir_y, dir_z], dtype=np.float32)
         
         return pos, feats, labels
 
