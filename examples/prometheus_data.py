@@ -40,24 +40,22 @@ class ParquetFileSampler(Sampler):
        self.batch_size = batch_size
 
     def __iter__(self):
+        """
+        Iterate through files in random order, but keep all events from a file
+        together (randomly permuted within the file) before moving to the next.
+        This preserves file-level locality and avoids thrashing the parquet
+        reader cache while still providing per-epoch randomness.
+        """
         n_files = len(self.cumulative_lengths) - 1
         file_order = np.random.permutation(n_files)
-        
-        # Collect all indices with their file association
-        all_indices_with_files = []
         for file_index in file_order:
             start_idx = self.cumulative_lengths[file_index]
             end_idx = self.cumulative_lengths[file_index + 1]
+            # Random permutation of indices within this file
             indices = np.random.permutation(np.arange(start_idx, end_idx))
-            all_indices_with_files.extend(indices.tolist())
-        
-        # Shuffle all indices across files for maximum diversity
-        np.random.shuffle(all_indices_with_files)
-        
-        # Yield in batch sizes
-        for i in range(0, len(all_indices_with_files), self.batch_size):
-            batch = all_indices_with_files[i:i+self.batch_size]
-            yield from batch
+            # Yield indices sequentially (DataLoader will batch them)
+            for idx in indices:
+                yield idx
 
     def __len__(self) -> int:
        return len(self.data_source)
@@ -169,18 +167,19 @@ class PrometheusDataset(torch.utils.data.Dataset):
         feats = sensor_stats.astype(np.float32)
         feats = np.log(feats + 1)
         
-        # Extract labels from mc_truth
-        initial_zenith = np.log10(mc_truth['initial_state_zenith'])
+        # Extract labels from mc_truth (keep raw zenith/azimuth; log-transform energy)
+        initial_zenith = mc_truth['initial_state_zenith']
         initial_azimuth = mc_truth['initial_state_azimuth']
-        initial_energy = mc_truth.get('initial_state_energy', 0.0)  # Default to 0 if not available
+        initial_energy = mc_truth.get('initial_state_energy', 0.0)
+        log_energy = np.log10(max(initial_energy, 1e-6))
         
-        # Convert spherical to Cartesian direction
+        # Convert spherical to Cartesian direction using raw angles
         dir_x = np.sin(initial_zenith) * np.cos(initial_azimuth)
         dir_y = np.sin(initial_zenith) * np.sin(initial_azimuth)
         dir_z = np.cos(initial_zenith)
         
-        # Format labels as [energy, dir_x, dir_y, dir_z] to match Lightning version
-        labels = np.array([initial_energy, dir_x, dir_y, dir_z], dtype=np.float32)
+        # Labels: [log_energy, dir_x, dir_y, dir_z]
+        labels = np.array([log_energy, dir_x, dir_y, dir_z], dtype=np.float32)
         
         return pos, feats, labels
 

@@ -84,26 +84,36 @@ class LogCMK(torch.autograd.Function):
         return None, grad_output * grads
 
 
-def VonMisesFisherLoss(pred: Tensor, truth: Tensor, kappa_switch: float = 100., eps: float = 1e-6) -> Tensor:
+def log_cmk_exact(m: int, kappa: Tensor) -> Tensor:
+    return LogCMK.apply(m, kappa)
+
+def log_cmk_approx(m: int, kappa: Tensor) -> Tensor:
+    v = m / 2.0 - 0.5
+    a = torch.sqrt((v + 1) ** 2 + kappa**2)
+    b = v - 1
+    log_term = torch.log(b + a).clamp(max=85)
+    return -a + b * log_term
+
+def VonMisesFisherLoss(pred: Tensor, truth: Tensor, kappa_switch: float = 100., reg_factor: float = 0.0, eps: float = 1e-6) -> Tensor:
     """
-    Von Mises-Fisher loss function for directional data.
+    Stable Von Mises-Fisher negative log-likelihood (matches reference implementation).
+    Loss = -log C_m(kappa) - kappa * <mu_hat, x> + reg_factor * kappa.
     """
-    m = truth.size(1)  # Dimension (3 for 3D direction)
+    m = truth.size(1)
     kappa = torch.norm(pred, dim=1).clamp(min=eps)
     dotprod = torch.sum(F.normalize(pred, dim=1) * truth, dim=1)
-    
+
     kappa_switch_tensor = torch.tensor([kappa_switch], device=kappa.device, dtype=kappa.dtype)
     mask_exact = kappa < kappa_switch_tensor
     mask_approx = ~mask_exact
     log_cmk_val = torch.zeros_like(kappa)
-    
-    # Exact computation for small kappa
+
     if mask_exact.any():
-        log_cmk_val[mask_exact] = LogCMK.apply(m, kappa[mask_exact])
-    
-    # Approximate computation for large kappa
+        log_cmk_val[mask_exact] = log_cmk_exact(m, kappa[mask_exact])
+
     if mask_approx.any():
-        log_cmk_val[mask_approx] = kappa[mask_approx] - (m / 2 - 1) * torch.log(kappa[mask_approx]) - (m / 2) * np.log(2 * np.pi) - torch.log(torch.tensor(m / 2 - 1).to(kappa.device))
-    
-    loss = -kappa * dotprod + log_cmk_val
-    return torch.mean(loss)
+        offset = log_cmk_approx(m, kappa_switch_tensor) - log_cmk_exact(m, kappa_switch_tensor)
+        log_cmk_val[mask_approx] = log_cmk_approx(m, kappa[mask_approx]) - offset
+
+    elements = -log_cmk_val - (kappa * dotprod) + (reg_factor * kappa)
+    return elements.mean()
