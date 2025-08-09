@@ -2,116 +2,105 @@ import argparse
 import os
 import yaml
 import torch
-import lightning.pytorch as pl
+from pathlib import Path
 
-from lightning.pytorch.loggers import WandbLogger
-from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
+from neptune import NeptuneModel
+from trainer import Trainer
+from prometheus_data import create_dataloaders
 
-# Import cleaned dataloaders
-from prometheus_dataloader import PrometheusDataModule
-
-# Import our Neptune Lightning wrapper
-from neptune_lightning import NeptuneLightning
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Neptune: An Efficient Point Transformer for Ultrarelativistic Neutrino Events")
-    parser.add_argument(
-        "-c", "--cfg_file", required=True, help="path to config file"
-    )
+    parser = argparse.ArgumentParser(description="Neptune: Vanilla PyTorch Training")
+    parser.add_argument("-c", "--cfg_file", required=True, help="path to config file")
+    parser.add_argument("--no-wandb", action="store_true", help="disable wandb logging")
     return parser.parse_args()
 
+
 def main():
-    # Parse args
     args = parse_args()
     
     # Load configuration
     with open(args.cfg_file, 'r') as cfg_file:
         cfg = yaml.load(cfg_file, Loader=yaml.FullLoader)
-
-    # Initialize dataloader
-    if cfg['dataloader'] == 'prometheus':
-        dm = PrometheusDataModule(cfg)
-    else:
-        print(f"Unknown dataloader: {cfg['dataloader']}")
-        print("Only 'prometheus' dataloader is supported in this example")
-        exit(1)
-    dm.setup()
-
-    # Initialize model
-    if cfg['checkpoint'] != '' and not cfg['resume_training']:
-        # Load from checkpoint
-        print(f"Loading checkpoint: {cfg['checkpoint']}")
-        model = NeptuneLightning.load_from_checkpoint(cfg['checkpoint'])
-    else:
-        # Initialize new model using our clean Neptune package
-        model = NeptuneLightning(
-            in_channels=cfg['model_options']['in_channels'],
-            num_patches=cfg['model_options']['num_patches'],
-            token_dim=cfg['model_options']['token_dim'],
-            num_layers=cfg['model_options']['num_layers'],
-            num_heads=cfg['model_options']['num_heads'],
-            hidden_dim=cfg['model_options']['hidden_dim'],
-            dropout=cfg['model_options']['dropout'],
-            downstream_task=cfg['model_options']['downstream_task'],
-            loss_fn=cfg['model_options']['loss_fn'],
-            k_neighbors=cfg['model_options']['k_neighbors'],
-            pool_method=cfg['model_options']['pool_method'],
-            mlp_layers=cfg['model_options'].get('mlp_layers', [256, 512, 768]),
-            batch_size=cfg['training_options']['batch_size'],
-            lr=cfg['training_options']['lr'],
-            lr_schedule=cfg['training_options']['lr_schedule'],
-            weight_decay=cfg['training_options']['weight_decay']
-        )
-
-    # Setup trainer
-    if cfg['training']:
-        # Configure WandB logging
-        logger = WandbLogger(
-            project=cfg['project_name'],
-            save_dir=cfg['project_save_dir']
-        )
-        
-        # Configure callbacks
-        checkpoint_callback = ModelCheckpoint(
-            dirpath=os.path.join(cfg['project_save_dir'], 'checkpoints'),
-            filename='neptune-{epoch:02d}-{val_loss:.2f}',
-            monitor='val_loss',
-            mode='min',
-            save_top_k=3,
-            every_n_epochs=cfg['training_options']['save_epochs']
-        )
-        
-        lr_monitor = LearningRateMonitor(logging_interval='step')
-        
-        # Initialize trainer
-        trainer = pl.Trainer(
-            max_epochs=cfg['training_options']['epochs'],
-            accelerator=cfg['accelerator'],
-            devices=cfg['num_devices'],
-            precision=cfg['training_options']['precision'],
-            logger=logger,
-            callbacks=[checkpoint_callback, lr_monitor],
-            enable_checkpointing=True,
-            log_every_n_steps=50,
-        )
-        
-        # Train model
-        if cfg['resume_training'] and cfg['checkpoint'] != '':
-            trainer.fit(model, dm, ckpt_path=cfg['checkpoint'])
-        else:
-            trainer.fit(model, dm)
     
+    # Set device
+    accelerator = cfg['accelerator'].lower()
+    if accelerator == 'gpu' and torch.cuda.is_available():
+        device = torch.device('cuda')
+    elif accelerator == 'mps' and torch.backends.mps.is_available():
+        device = torch.device('mps')
+    elif accelerator in ['gpu', 'mps']:  # Requested but not available
+        print(f"Warning: {accelerator.upper()} requested but not available, falling back to CPU")
+        device = torch.device('cpu')
     else:
-        # Testing mode
-        trainer = pl.Trainer(
-            accelerator=cfg['accelerator'],
-            devices=cfg['num_devices'],
-            precision=cfg['training_options'].get('test_precision', 'bf16-mixed'),
-            logger=False,
-            enable_checkpointing=False,
-        )
-        
-        trainer.test(model, dm)
+        device = torch.device('cpu')
+    
+    print(f"Using device: {device}")
+    
+    # Create dataloaders
+    if cfg['dataloader'] != 'prometheus':
+        raise ValueError(f"Only 'prometheus' dataloader supported, got {cfg['dataloader']}")
+    
+    train_loader, val_loader = create_dataloaders(cfg)
+    
+    # Initialize model
+    model_options = cfg['model_options']
+    
+    # Determine output dimension based on task
+    if model_options['downstream_task'] == 'angular_reco':
+        output_dim = 3
+    elif model_options['downstream_task'] == 'energy_reco':
+        output_dim = 2 if model_options['loss_fn'] == 'gaussian_nll' else 1
+    else:
+        raise ValueError(f"Unknown task: {model_options['downstream_task']}")
+    
+    model = NeptuneModel(
+        in_channels=model_options['in_channels'],
+        num_patches=model_options['num_patches'],
+        token_dim=model_options['token_dim'],
+        num_layers=model_options['num_layers'],
+        num_heads=model_options['num_heads'],
+        hidden_dim=model_options['hidden_dim'],
+        dropout=model_options['dropout'],
+        output_dim=output_dim,
+        k_neighbors=model_options['k_neighbors'],
+        pool_method=model_options['pool_method'],
+        mlp_layers=model_options.get('mlp_layers', [256, 512, 768])
+    ).to(device)
+    
+    # Setup logging
+    use_wandb = not args.no_wandb
+    if use_wandb:
+        try:
+            import wandb
+            wandb.init(
+                project=cfg['project_name'],
+                config=cfg,
+                dir=cfg['project_save_dir']
+            )
+        except ImportError:
+            print("WandB not available, falling back to CSV logging")
+            use_wandb = False
+    
+    # Create trainer
+    trainer = Trainer(
+        model=model,
+        device=device,
+        cfg=cfg,
+        use_wandb=use_wandb
+    )
+    
+    # Load checkpoint if specified
+    if cfg.get('checkpoint', '') and os.path.exists(cfg['checkpoint']):
+        print(f"Loading checkpoint: {cfg['checkpoint']}")
+        trainer.load_checkpoint(cfg['checkpoint'], resume_training=cfg.get('resume_training', False))
+    
+    # Train or test
+    if cfg['training']:
+        trainer.fit(train_loader, val_loader)
+    else:
+        trainer.test(val_loader)
+
 
 if __name__ == '__main__':
     main()
