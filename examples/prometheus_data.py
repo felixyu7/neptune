@@ -155,23 +155,22 @@ class PrometheusDataset(torch.utils.data.Dataset):
         
         # Use nt-summary-stats to process the event and get sensor-level features
         sensor_positions, sensor_stats = nt_summary_stats.process_prometheus_event(photons)
-        
-        # sensor_positions: (N_sensors, 3) - x, y, z coordinates
-        # sensor_stats: (N_sensors, 9) - [time_mean, time_std, time_min, time_max, n_hits, charge_sum, charge_mean, charge_std, duration]
-        
+
         # Create 4D coordinates: x, y, z, t (using time_mean for t)
         pos = np.column_stack([
             sensor_positions[:, 0],  # x
             sensor_positions[:, 1],  # y
             sensor_positions[:, 2],  # z
-            sensor_stats[:, 0]       # time_mean as t coordinate
+            sensor_stats[:, 3]       # first hit time
         ]).astype(np.float32)
+        pos = pos / 1000. # convert to km / microseconds
         
         # Use all 9 summary statistics as features
-        feats = sensor_stats.astype(np.float32)  # [time_mean, time_std, time_min, time_max, n_hits, charge_sum, charge_mean, charge_std, duration]
+        feats = sensor_stats.astype(np.float32)
+        feats = np.log(feats + 1)
         
         # Extract labels from mc_truth
-        initial_zenith = mc_truth['initial_state_zenith']
+        initial_zenith = np.log10(mc_truth['initial_state_zenith'])
         initial_azimuth = mc_truth['initial_state_azimuth']
         initial_energy = mc_truth.get('initial_state_energy', 0.0)  # Default to 0 if not available
         
