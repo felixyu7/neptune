@@ -217,6 +217,19 @@ class Trainer:
             checkpoint_path = self.checkpoint_dir / f'neptune-epoch-{self.current_epoch:02d}.pt'
             torch.save(checkpoint, checkpoint_path)
             print(f'Checkpoint saved: {checkpoint_path}')
+            
+            if self.use_wandb:
+                try:
+                    import wandb
+                    artifact_name = f"{wandb.run.name or wandb.run.id}-checkpoint"
+                    artifact = wandb.Artifact(artifact_name, type='model', metadata={'epoch': self.current_epoch, **metrics})
+                    artifact.add_file(str(checkpoint_path))
+                    wandb.log_artifact(artifact)
+                    print(f"Logged wandb artifact: {artifact_name}")
+                except ImportError:
+                    pass # wandb not installed
+                except Exception as e:
+                    print(f"Could not save wandb artifact: {e}")
         
         # Best model checkpoint
         if is_best:
