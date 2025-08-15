@@ -5,8 +5,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from typing import List, Tuple, Optional
+from .transformers import NeptuneTransformerEncoder, NeptuneTransformerEncoderLayer
 import fpsample
 
 class PointCloudTokenizer(nn.Module):
@@ -141,7 +141,7 @@ class PointCloudTokenizer(nn.Module):
         return tokens, centroids, masks
 
 
-class PositionEmbedding(nn.Module):
+class CentroidEncoder(nn.Module):
     """MLP for encoding position information into tokens."""
     
     def __init__(self, in_dim=4, hidden_dims=[64, 256, 768], out_dim=768):
@@ -174,18 +174,16 @@ class PointTransformerEncoder(nn.Module):
         self.token_dim = token_dim
         
         # Position embedding component
-        self.pos_embed = PositionEmbedding(out_dim=token_dim)
+        self.pos_embed = CentroidEncoder(out_dim=token_dim)
 
-        # Standard transformer
-        encoder_layer = TransformerEncoderLayer(
+        # Custom Neptune transformer
+        encoder_layer = NeptuneTransformerEncoderLayer(
             d_model=token_dim,
             nhead=num_heads,
             dim_feedforward=hidden_dim,
             dropout=dropout,
-            activation='gelu',
-            batch_first=True
         )
-        self.layers = TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.layers = NeptuneTransformerEncoder(encoder_layer, num_layers=num_layers)
         
         # Output normalization
         self.ln = nn.LayerNorm(token_dim)
@@ -198,8 +196,7 @@ class PointTransformerEncoder(nn.Module):
 
         # Apply transformer layers
         if masks is not None:
-            attention_mask = ~masks
-            tokens = self.layers(tokens, src_key_padding_mask=attention_mask)
+            tokens = self.layers(tokens, src_key_padding_mask=masks)
         else:
             tokens = self.layers(tokens)
         

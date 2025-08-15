@@ -67,7 +67,7 @@ class SwiGLU(nn.Module):
         return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 
-class CustomTransformerEncoderLayer(nn.Module):
+class NeptuneTransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, 
                  activation="gelu", layer_norm_eps=1e-5, bias=False):
         super().__init__()
@@ -173,7 +173,7 @@ class CustomTransformerEncoderLayer(nn.Module):
         return attn_mask
 
 
-class CustomTransformerEncoder(nn.Module):
+class NeptuneTransformerEncoder(nn.Module):
     def __init__(self, encoder_layer, num_layers, norm=None):
         super().__init__()
         # Create separate instances for each layer to avoid weight sharing
@@ -185,8 +185,8 @@ class CustomTransformerEncoder(nn.Module):
 
     def _get_cloned_layer(self, module):
         """Create a new layer with the same parameters"""
-        if isinstance(module, CustomTransformerEncoderLayer):
-            return CustomTransformerEncoderLayer(
+        if isinstance(module, NeptuneTransformerEncoderLayer):
+            return NeptuneTransformerEncoderLayer(
                 d_model=module.d_model,
                 nhead=module.nhead,
                 dim_feedforward=module.ffn.w1.out_features,
