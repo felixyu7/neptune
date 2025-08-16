@@ -196,7 +196,8 @@ class PointTransformerEncoder(nn.Module):
 
         # Apply transformer layers
         if masks is not None:
-            tokens = self.layers(tokens, src_key_padding_mask=masks)
+            attention_masks = ~masks
+            tokens = self.layers(tokens, src_key_padding_mask=attention_masks)
         else:
             tokens = self.layers(tokens)
         

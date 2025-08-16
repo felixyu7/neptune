@@ -184,7 +184,7 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         # Key padding mask: (B, S_k) -> (B,1,1,S_k)
         if key_padding_mask is not None:
             # Standard PyTorch: True = padding (to be masked)
-            kpm = key_padding_mask.to(torch.bool).to(device).unsqueeze(1).unsqueeze(2)  # (B,1,1,S_k)
+            kpm = ~(key_padding_mask).to(torch.bool).to(device).unsqueeze(1).unsqueeze(2)  # (B,1,1,S_k)
             if attn_mask is None:
                 attn_mask = kpm
             else:
