@@ -5,6 +5,7 @@ import torch.nn.functional as F
 class RoPE(nn.Module):
     def __init__(self, dim, max_seq_len=512, base=10000):
         super().__init__()
+        assert dim % 2 == 0, f"RoPE dim must be even (got dim={dim})"
         self.dim = dim
         self.max_seq_len = max_seq_len
         self.base = base
@@ -69,12 +70,13 @@ class SwiGLU(nn.Module):
 
 class NeptuneTransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, 
-                 activation="gelu", layer_norm_eps=1e-5, bias=False):
+                 layer_norm_eps=1e-5, bias=False, rope_max_seq_len=512, rope_base=10000):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
         self.head_dim = d_model // nhead
         assert d_model % nhead == 0, "d_model must be divisible by nhead"
+        assert self.head_dim % 2 == 0, f"head_dim must be even for RoPE (got {self.head_dim})"
         
         # Multi-head attention components - using bias=False for stability
         self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=bias)
@@ -93,7 +95,13 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         self.ffn = SwiGLU(d_model, dim_feedforward, dropout, bias=bias)
         
         # RoPE
-        self.rope = RoPE(dim=self.head_dim)
+        self.rope = RoPE(dim=self.head_dim, max_seq_len=rope_max_seq_len, base=rope_base)
+        
+        # Store hyperparameters for cloning
+        self.layer_norm_eps = layer_norm_eps
+        self.bias = bias
+        self.rope_max_seq_len = rope_max_seq_len
+        self.rope_base = rope_base
         
         # Dropout
         self.dropout = nn.Dropout(dropout)
@@ -118,7 +126,7 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         
         # Prepare attention mask
         attn_mask = self._prepare_attention_mask(
-            batch_size, seq_len, is_causal, src_key_padding_mask, q.device
+            batch_size, seq_len, is_causal, src_key_padding_mask, q.device, src_mask=src_mask
         )
         
         # Apply attention
@@ -144,33 +152,51 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         
         return x
     
-    def _prepare_attention_mask(self, batch_size, seq_len, is_causal, key_padding_mask, device):
-        """Prepare and combine attention masks"""
+    def _prepare_attention_mask(self, batch_size, seq_len, is_causal, key_padding_mask, device, src_mask=None):
+        """
+        Returns a boolean mask where True values are DISALLOWED (masked).
+        - key_padding_mask: (B, S_k), True where positions are padding to be masked.
+        - src_mask: broadcastable to (S_q, S_k) or (B, S_q, S_k) or (B, 1, S_q, S_k).
+        """
         attn_mask = None
         
-        # Causal mask
+        # Causal mask: (S_q, S_k)
         if is_causal:
             causal_mask = torch.triu(
                 torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), 
                 diagonal=1
             )
-            attn_mask = causal_mask
+            attn_mask = causal_mask  # True above diagonal -> masked
         
-        # Key padding mask
-        if key_padding_mask is not None:
-            # key_padding_mask shape: (B, S) - True for valid positions
-            padding_mask = ~key_padding_mask.bool()  # Invert: True for positions to mask
-            padding_mask = padding_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S)
-            
-            if attn_mask is None:
-                attn_mask = padding_mask
+        # src_mask: accept (S_q, S_k) or (B, S_q, S_k)
+        if src_mask is not None:
+            src_mask = src_mask.to(torch.bool).to(device)
+            if src_mask.dim() == 2:           # (S_q, S_k)
+                src_mask = src_mask.unsqueeze(0).unsqueeze(0)  # (1,1,S_q,S_k)
+            elif src_mask.dim() == 3:         # (B,S_q,S_k)
+                src_mask = src_mask.unsqueeze(1)               # (B,1,S_q,S_k)
+            elif src_mask.dim() == 4:         # already batched/headed
+                pass
             else:
-                # Combine masks
-                attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, S, S)
-                attn_mask = attn_mask.expand(batch_size, 1, -1, -1)  # (B, 1, S, S)
-                attn_mask = attn_mask | padding_mask.expand(-1, -1, seq_len, -1)
+                raise ValueError("src_mask rank must be 2, 3 or 4")
+            attn_mask = src_mask if attn_mask is None else (attn_mask.unsqueeze(0).unsqueeze(0) | src_mask)
         
-        return attn_mask
+        # Key padding mask: (B, S_k) -> (B,1,1,S_k)
+        if key_padding_mask is not None:
+            # Standard PyTorch: True = padding (to be masked)
+            kpm = key_padding_mask.to(torch.bool).to(device).unsqueeze(1).unsqueeze(2)  # (B,1,1,S_k)
+            if attn_mask is None:
+                attn_mask = kpm
+            else:
+                # Ensure attn_mask is broadcastable to (B,1,S_q,S_k)
+                if attn_mask.dim() == 2:  # (S_q,S_k)
+                    attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # (1,1,S_q,S_k)
+                elif attn_mask.dim() == 4 and attn_mask.size(0) == 1:
+                    pass  # already (1,1,S_q,S_k)
+                # Combine (broadcast over heads)
+                attn_mask = (attn_mask.expand(batch_size, 1, seq_len, -1) | kpm.expand(batch_size, 1, seq_len, -1))
+        
+        return attn_mask  # broadcastable to (B, nhead, S_q, S_k)
 
 
 class NeptuneTransformerEncoder(nn.Module):
@@ -190,7 +216,11 @@ class NeptuneTransformerEncoder(nn.Module):
                 d_model=module.d_model,
                 nhead=module.nhead,
                 dim_feedforward=module.ffn.w1.out_features,
-                dropout=module.dropout.p
+                dropout=module.dropout.p,
+                layer_norm_eps=module.layer_norm_eps,
+                bias=module.bias,
+                rope_max_seq_len=module.rope_max_seq_len,
+                rope_base=module.rope_base,
             )
         else:
             import copy
