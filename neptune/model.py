@@ -20,8 +20,8 @@ class PointCloudTokenizer(nn.Module):
                  k_neighbors: int = 16, 
                  pool_method: str = 'max'):
         super().__init__()
-        if pool_method not in ['max', 'mean']:
-            raise ValueError(f"pool_method must be 'max' or 'mean', got {pool_method}")
+        if pool_method not in ['max', 'mean', 'attention']:
+            raise ValueError(f"pool_method must be 'max', 'mean', or 'attention', got {pool_method}")
             
         self.max_tokens = max_tokens
         self.token_dim = token_dim
@@ -46,6 +46,14 @@ class PointCloudTokenizer(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(token_dim, token_dim)
         )
+        
+        # Attention pooling for neighborhood aggregation
+        if pool_method == 'attention':
+            self.neighborhood_attention = nn.MultiheadAttention(
+                embed_dim=token_dim,
+                num_heads=4,
+                batch_first=True
+            )
         
     def forward(self, coordinates: Tensor, features: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
         batch_indices = coordinates[:, 0].long()
@@ -111,8 +119,13 @@ class PointCloudTokenizer(nn.Module):
                 # Pool features
                 if self.pool_method == 'max':
                     pooled_features = torch.max(neighborhood_features, dim=1)[0]
-                else: # self.pool_method == 'mean'
+                elif self.pool_method == 'mean':
                     pooled_features = torch.mean(neighborhood_features, dim=1)
+                else: # self.pool_method == 'attention'
+                    attended_features, _ = self.neighborhood_attention(
+                        neighborhood_features, neighborhood_features, neighborhood_features
+                    )
+                    pooled_features = attended_features.mean(dim=1)
                 
                 # Apply aggregation MLP
                 batch_tokens = self.neighborhood_mlp(pooled_features)
@@ -233,7 +246,7 @@ class NeptuneModel(nn.Module):
         dropout: Dropout rate
         output_dim: Dimension of output (task-dependent)
         k_neighbors: Number of neighbors for point aggregation
-        pool_method: Pooling method for neighborhood aggregation ('max' or 'mean')
+        pool_method: Pooling method for neighborhood aggregation ('max', 'mean', or 'attention')
         mlp_layers: List of dimensions for tokenizer MLP layers
     """
     
