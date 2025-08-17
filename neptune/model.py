@@ -118,6 +118,12 @@ class PointCloudTokenizer(nn.Module):
                 batch_tokens = self.neighborhood_mlp(pooled_features)
                 num_valid_tokens = self.max_tokens
             
+            # Sort tokens by time coordinate for meaningful RoPE positioning
+            time_coords = batch_centroids[:num_valid_tokens, 3]  # Extract time dimension for valid tokens
+            time_sort_indices = torch.argsort(time_coords)
+            batch_centroids[:num_valid_tokens] = batch_centroids[:num_valid_tokens][time_sort_indices]
+            batch_tokens[:num_valid_tokens] = batch_tokens[:num_valid_tokens][time_sort_indices]
+            
             # Padding
             if num_valid_tokens < self.max_tokens:
                 num_padding = self.max_tokens - num_valid_tokens

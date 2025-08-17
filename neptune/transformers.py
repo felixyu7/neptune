@@ -107,7 +107,7 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.attn_dropout = dropout
 
-    def forward(self, src, src_mask=None, src_key_padding_mask=None, is_causal=False):
+    def forward(self, src, src_key_padding_mask=None):
         batch_size, seq_len, _ = src.shape
         
         # Self-attention block with pre-norm
@@ -125,9 +125,7 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         k = self.rope(k)
         
         # Prepare attention mask
-        attn_mask = self._prepare_attention_mask(
-            batch_size, seq_len, is_causal, src_key_padding_mask, q.device, src_mask=src_mask
-        )
+        attn_mask = self._prepare_attention_mask(src_key_padding_mask, q.device)
         
         # Apply attention
         attn_output = F.scaled_dot_product_attention(
@@ -152,51 +150,14 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         
         return x
     
-    def _prepare_attention_mask(self, batch_size, seq_len, is_causal, key_padding_mask, device, src_mask=None):
-        """
-        Returns a boolean mask where True values are DISALLOWED (masked).
-        - key_padding_mask: (B, S_k), True where positions are padding to be masked.
-        - src_mask: broadcastable to (S_q, S_k) or (B, S_q, S_k) or (B, 1, S_q, S_k).
-        """
-        attn_mask = None
+    def _prepare_attention_mask(self, key_padding_mask, device):
+        """Convert key padding mask to SDPA format where True = allowed to attend."""
+        if key_padding_mask is None:
+            return None
         
-        # Causal mask: (S_q, S_k)
-        if is_causal:
-            causal_mask = torch.triu(
-                torch.ones(seq_len, seq_len, dtype=torch.bool, device=device), 
-                diagonal=1
-            )
-            attn_mask = causal_mask  # True above diagonal -> masked
-        
-        # src_mask: accept (S_q, S_k) or (B, S_q, S_k)
-        if src_mask is not None:
-            src_mask = src_mask.to(torch.bool).to(device)
-            if src_mask.dim() == 2:           # (S_q, S_k)
-                src_mask = src_mask.unsqueeze(0).unsqueeze(0)  # (1,1,S_q,S_k)
-            elif src_mask.dim() == 3:         # (B,S_q,S_k)
-                src_mask = src_mask.unsqueeze(1)               # (B,1,S_q,S_k)
-            elif src_mask.dim() == 4:         # already batched/headed
-                pass
-            else:
-                raise ValueError("src_mask rank must be 2, 3 or 4")
-            attn_mask = src_mask if attn_mask is None else (attn_mask.unsqueeze(0).unsqueeze(0) | src_mask)
-        
-        # Key padding mask: (B, S_k) -> (B,1,1,S_k)
-        if key_padding_mask is not None:
-            # Standard PyTorch: True = padding (to be masked)
-            kpm = ~(key_padding_mask).to(torch.bool).to(device).unsqueeze(1).unsqueeze(2)  # (B,1,1,S_k)
-            if attn_mask is None:
-                attn_mask = kpm
-            else:
-                # Ensure attn_mask is broadcastable to (B,1,S_q,S_k)
-                if attn_mask.dim() == 2:  # (S_q,S_k)
-                    attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # (1,1,S_q,S_k)
-                elif attn_mask.dim() == 4 and attn_mask.size(0) == 1:
-                    pass  # already (1,1,S_q,S_k)
-                # Combine (broadcast over heads)
-                attn_mask = (attn_mask.expand(batch_size, 1, seq_len, -1) | kpm.expand(batch_size, 1, seq_len, -1))
-        
-        return attn_mask  # broadcastable to (B, nhead, S_q, S_k)
+        # Convert MHA semantics (True = padding) to SDPA semantics (True = allowed)
+        allow = ~key_padding_mask.to(torch.bool).to(device)  # (B, S_k)
+        return allow.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S_k) for broadcasting
 
 
 class NeptuneTransformerEncoder(nn.Module):
@@ -226,15 +187,13 @@ class NeptuneTransformerEncoder(nn.Module):
             import copy
             return copy.deepcopy(module)
 
-    def forward(self, src, mask=None, src_key_padding_mask=None, is_causal=False):
+    def forward(self, src, src_key_padding_mask=None):
         output = src
         
         for mod in self.layers:
             output = mod(
                 output, 
-                src_mask=mask, 
-                src_key_padding_mask=src_key_padding_mask,
-                is_causal=is_causal
+                src_key_padding_mask=src_key_padding_mask
             )
 
         if self.norm is not None:
