@@ -199,7 +199,7 @@ class Trainer:
         
         return metrics
     
-    def save_checkpoint(self, metrics: Dict[str, float], is_best: bool = False):
+    def save_checkpoint(self, metrics: Dict[str, float], is_best: bool = False, is_final: bool = False):
         checkpoint = {
             'epoch': self.current_epoch,
             'model_state_dict': self.model.state_dict(),
@@ -213,16 +213,25 @@ class Trainer:
             checkpoint['scaler_state_dict'] = self.scaler.state_dict()
         
         # Regular checkpoint
-        if self.current_epoch % self.save_epochs == 0:
-            checkpoint_path = self.checkpoint_dir / f'neptune-epoch-{self.current_epoch:02d}.pt'
+        if self.current_epoch % self.save_epochs == 0 or is_final:
+            if is_final:
+                checkpoint_path = self.checkpoint_dir / 'neptune-final.pt'
+                artifact_suffix = 'final-checkpoint'
+            else:
+                checkpoint_path = self.checkpoint_dir / f'neptune-epoch-{self.current_epoch:02d}.pt'
+                artifact_suffix = 'checkpoint'
+                
             torch.save(checkpoint, checkpoint_path)
             print(f'Checkpoint saved: {checkpoint_path}')
             
             if self.use_wandb:
                 try:
                     import wandb
-                    artifact_name = f"{wandb.run.name or wandb.run.id}-checkpoint"
-                    artifact = wandb.Artifact(artifact_name, type='model', metadata={'epoch': self.current_epoch, **metrics})
+                    artifact_name = f"{wandb.run.name or wandb.run.id}-{artifact_suffix}"
+                    metadata = {'epoch': self.current_epoch, **metrics}
+                    if is_final:
+                        metadata['final'] = True
+                    artifact = wandb.Artifact(artifact_name, type='model', metadata=metadata)
                     artifact.add_file(str(checkpoint_path))
                     wandb.log_artifact(artifact)
                     print(f"Logged wandb artifact: {artifact_name}")
@@ -298,6 +307,10 @@ class Trainer:
                 postfix['Energy Error'] = f'{val_metrics["val_mean_energy_error"]:.4f}'
             
             epoch_pbar.set_postfix(postfix)
+        
+        # Save final checkpoint as wandb artifact
+        final_metrics = {'best_val_loss': self.best_val_loss}
+        self.save_checkpoint(final_metrics, is_final=True)
         
         print(f"Training completed! Best validation loss: {self.best_val_loss:.6f}")
     
