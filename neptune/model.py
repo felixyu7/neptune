@@ -154,12 +154,12 @@ class CentroidEncoder(nn.Module):
         super().__init__()
         layers = []
         last_dim = in_dim
-        # Build MLP with Linear -> GELU -> LayerNorm pattern
+        # Build MLP with Linear -> GELU -> RMSNorm pattern
         for hidden_dim in hidden_dims:
             layers.extend([
                 nn.Linear(last_dim, hidden_dim),
                 nn.GELU(),
-                nn.LayerNorm(hidden_dim)
+                nn.RMSNorm(hidden_dim)
             ])
             last_dim = hidden_dim
         # Final projection layer
@@ -192,7 +192,7 @@ class PointTransformerEncoder(nn.Module):
         self.layers = NeptuneTransformerEncoder(encoder_layer, num_layers=num_layers)
         
         # Output normalization
-        self.ln = nn.LayerNorm(token_dim)
+        self.norm = nn.RMSNorm(token_dim)
     
     def forward(self, tokens, centroids, masks=None):
         """Process tokens through transformer architecture."""
@@ -217,7 +217,7 @@ class PointTransformerEncoder(nn.Module):
             global_features = tokens.mean(dim=1)
         
         # Apply final normalization
-        return self.ln(global_features)
+        return self.norm(global_features)
 
 
 class NeptuneModel(nn.Module):

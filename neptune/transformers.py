@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn import RMSNorm  # Assume availability (PyTorch >= 2.1)
 
 class RoPE(nn.Module):
     def __init__(self, dim, max_seq_len=512, base=10000):
@@ -12,20 +13,33 @@ class RoPE(nn.Module):
 
         inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
         self.register_buffer("inv_freq", inv_freq)
+        
+        # Pre-compute cos and sin values up to max_seq_len for efficiency
+        self._set_cos_sin_cache(seq_len=self.max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        """Pre-compute and cache cos/sin values for efficient lookup."""
+        self.max_seq_len = seq_len
+        t = torch.arange(self.max_seq_len, device=device, dtype=dtype)
+        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        
+        # Cache cos and sin values with persistent=False to save checkpoint space
+        # (they can be deterministically recreated from inv_freq and max_seq_len)
+        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
+        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
 
     def forward(self, x, seq_len=None):
         if seq_len is None:
             seq_len = x.shape[-2]
-        device = x.device
         original_dtype = x.dtype
         
-        # Generate position indices
-        t = torch.arange(seq_len, dtype=self.inv_freq.dtype, device=device)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
+        # Handle edge case where seq_len > max_seq_len by extending cache
+        if seq_len > self.max_seq_len:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=self.inv_freq.dtype)
         
-        # Create rotation matrices
-        cos_freq = freqs.cos()
-        sin_freq = freqs.sin()
+        # Efficiently slice pre-computed values instead of recomputing
+        cos_freq = self.cos_cached[:seq_len]
+        sin_freq = self.sin_cached[:seq_len]
         
         return self.apply_rotary_pos_emb(x, cos_freq, sin_freq, original_dtype)
     
@@ -62,6 +76,16 @@ class SwiGLU(nn.Module):
         self.w2 = nn.Linear(hidden_dim, dim, bias=bias)
         self.w3 = nn.Linear(dim, hidden_dim, bias=bias)
         self.dropout = nn.Dropout(dropout)
+        
+        # Initialize with Xavier/Glorot for stable training
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        """Initialize SwiGLU weights using Xavier/Glorot initialization."""
+        for module in [self.w1, self.w2, self.w3]:
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
     def forward(self, x):
         # SwiGLU: SiLU(W1 @ x) ⊙ (W3 @ x), then W2
@@ -82,14 +106,12 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=bias)
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
         
-        # Initialize output projection to zero for better training stability
-        nn.init.zeros_(self.out_proj.weight)
-        if bias:
-            nn.init.zeros_(self.out_proj.bias)
-        
-        # Layer normalization
-        self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps)
-        self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps)
+        # Initialize weights using industry-standard practices
+        self._initialize_weights()
+
+        # RMSNorm
+        self.norm1 = RMSNorm(d_model, eps=layer_norm_eps)
+        self.norm2 = RMSNorm(d_model, eps=layer_norm_eps)
         
         # Use SwiGLU instead of regular FFN
         self.ffn = SwiGLU(d_model, dim_feedforward, dropout, bias=bias)
@@ -106,6 +128,18 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(dropout)
         self.attn_dropout = dropout
+
+    def _initialize_weights(self):
+        """Initialize weights using modern industry-standard practices."""
+        # Q, K, V projections: Xavier/Glorot initialization
+        nn.init.xavier_uniform_(self.qkv_proj.weight)
+        if self.qkv_proj.bias is not None:
+            nn.init.zeros_(self.qkv_proj.bias)
+        
+        # Output projection: Xavier/Glorot but may be scaled later for deep networks
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
 
     def forward(self, src, src_key_padding_mask=None):
         batch_size, seq_len, _ = src.shape
@@ -169,6 +203,9 @@ class NeptuneTransformerEncoder(nn.Module):
         ])
         self.num_layers = num_layers
         self.norm = norm
+        
+        # Apply depth-scaled initialization for residual connections
+        self._apply_depth_scaled_init()
 
     def _get_cloned_layer(self, module):
         """Create a new layer with the same parameters"""
@@ -186,6 +223,22 @@ class NeptuneTransformerEncoder(nn.Module):
         else:
             import copy
             return copy.deepcopy(module)
+
+    def _apply_depth_scaled_init(self):
+        """Apply depth-scaled initialization for stable deep network training."""
+        # Scale down residual output projections by 1/sqrt(2*N) for stable training
+        # Factor of 2 accounts for two residual connections per layer (attn + ffn)
+        scale_factor = 1.0 / (2.0 * self.num_layers) ** 0.5
+        
+        for layer in self.layers:
+            if isinstance(layer, NeptuneTransformerEncoderLayer):
+                # Scale attention output projection
+                with torch.no_grad():
+                    layer.out_proj.weight.mul_(scale_factor)
+                
+                # Scale FFN down projection (w2 in SwiGLU)
+                with torch.no_grad():
+                    layer.ffn.w2.weight.mul_(scale_factor)
 
     def forward(self, src, src_key_padding_mask=None):
         output = src
