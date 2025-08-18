@@ -9,6 +9,102 @@ from typing import List, Tuple, Optional
 from .transformers import NeptuneTransformerEncoder, NeptuneTransformerEncoderLayer
 import fpsample
 
+
+class AttentionPooling(nn.Module):
+    """Efficient attention pooling for neighborhood feature aggregation."""
+    
+    def __init__(self, token_dim: int, use_position: bool = True):
+        super().__init__()
+        self.token_dim = token_dim
+        self.use_position = use_position
+        
+        # Learnable query for pooling
+        self.query = nn.Parameter(torch.randn(1, token_dim) * 0.02)
+        
+        # Linear projections for keys and values
+        self.key_proj = nn.Linear(token_dim, token_dim)
+        self.value_proj = nn.Linear(token_dim, token_dim)
+        
+        # Optional positional encoding for spatial-temporal relationships
+        if use_position:
+            self.pos_encoding = nn.Linear(4, token_dim)  # 4D: x, y, z, time
+        
+        self.scale = token_dim ** -0.5
+        
+    def forward(self, input_features: Tensor, positions: Optional[Tensor] = None, mask: Optional[Tensor] = None) -> Tensor:
+        """
+        Apply attention pooling to input features.
+        
+        Args:
+            input_features: [batch_size, seq_len, token_dim] or [num_tokens, k_neighbors, token_dim]
+            positions: [batch_size, seq_len, 4] or [num_tokens, k_neighbors, 4] - spatial-temporal coordinates
+            mask: [batch_size, seq_len] - mask for valid tokens (for global pooling)
+            
+        Returns:
+            pooled_features: [batch_size, token_dim] or [num_tokens, token_dim]
+        """
+        if input_features.dim() == 3 and mask is not None:
+            # Global pooling mode: [batch_size, seq_len, token_dim]
+            batch_size, _, token_dim = input_features.shape
+            
+            # Single learnable query for global pooling
+            query = self.query.expand(batch_size, 1, token_dim)  # [batch_size, 1, token_dim]
+            
+            # Project input features to keys and values
+            keys = self.key_proj(input_features)    # [batch_size, seq_len, token_dim]
+            values = self.value_proj(input_features) # [batch_size, seq_len, token_dim]
+            
+            # Add positional encoding to keys if available
+            if self.use_position and positions is not None:
+                pos_embed = self.pos_encoding(positions)  # [batch_size, seq_len, token_dim]
+                keys = keys + pos_embed
+                
+            # Compute attention scores: query @ keys^T
+            scores = torch.matmul(query, keys.transpose(-2, -1)) * self.scale  # [batch_size, 1, seq_len]
+            
+            # Apply mask to prevent attention to padding tokens
+            if mask is not None:
+                # mask: True = valid, False = padding
+                # Need to mask out positions where mask is False (padding tokens)
+                attention_mask = mask.unsqueeze(1)  # [batch_size, 1, seq_len]
+                scores = scores.masked_fill(~attention_mask, float('-inf'))
+            
+            # Apply softmax to get attention weights
+            weights = F.softmax(scores, dim=-1)  # [batch_size, 1, seq_len]
+            
+            # Apply weights to values for pooled output
+            pooled = torch.matmul(weights, values)  # [batch_size, 1, token_dim]
+            
+            return pooled.squeeze(1)  # [batch_size, token_dim]
+            
+        else:
+            # Neighborhood pooling mode: [num_tokens, k_neighbors, token_dim]
+            num_tokens, _, token_dim = input_features.shape
+            
+            # Expand learnable query for all tokens
+            query = self.query.expand(num_tokens, 1, token_dim)  # [num_tokens, 1, token_dim]
+            
+            # Project neighborhood features to keys and values
+            keys = self.key_proj(input_features)    # [num_tokens, k_neighbors, token_dim]
+            values = self.value_proj(input_features) # [num_tokens, k_neighbors, token_dim]
+            
+            # Add positional encoding to keys if available (relative positions)
+            if self.use_position and positions is not None:
+                pos_embed = self.pos_encoding(positions)  # [num_tokens, k_neighbors, token_dim]
+                keys = keys + pos_embed
+                
+            # Compute attention scores: query @ keys^T
+            scores = torch.matmul(query, keys.transpose(-2, -1)) * self.scale  # [num_tokens, 1, k_neighbors]
+            
+            # Apply softmax to get attention weights
+            weights = F.softmax(scores, dim=-1)  # [num_tokens, 1, k_neighbors]
+            
+            # Apply weights to values for pooled output
+            pooled = torch.matmul(weights, values)  # [num_tokens, 1, token_dim]
+            
+            return pooled.squeeze(1)  # [num_tokens, token_dim]
+
+
 class PointCloudTokenizer(nn.Module):
     """Converts point cloud data into tokens for transformer processing."""
     
@@ -49,10 +145,9 @@ class PointCloudTokenizer(nn.Module):
         
         # Attention pooling for neighborhood aggregation
         if pool_method == 'attention':
-            self.neighborhood_attention = nn.MultiheadAttention(
-                embed_dim=token_dim,
-                num_heads=4,
-                batch_first=True
+            self.neighborhood_attention = AttentionPooling(
+                token_dim=token_dim,
+                use_position=True
             )
         
     def forward(self, coordinates: Tensor, features: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
@@ -122,10 +217,15 @@ class PointCloudTokenizer(nn.Module):
                 elif self.pool_method == 'mean':
                     pooled_features = torch.mean(neighborhood_features, dim=1)
                 else: # self.pool_method == 'attention'
-                    attended_features, _ = self.neighborhood_attention(
-                        neighborhood_features, neighborhood_features, neighborhood_features
+                    # Compute relative positions for attention pooling
+                    neighbor_positions = points_for_sampling[knn_indices]  # [max_tokens, k, 4]
+                    centroid_positions = batch_centroids.unsqueeze(1)      # [max_tokens, 1, 4]
+                    relative_positions = neighbor_positions - centroid_positions  # [max_tokens, k, 4]
+                    
+                    # Apply attention pooling with positional information
+                    pooled_features = self.neighborhood_attention(
+                        neighborhood_features, relative_positions
                     )
-                    pooled_features = attended_features.mean(dim=1)
                 
                 # Apply aggregation MLP
                 batch_tokens = self.neighborhood_mlp(pooled_features)
@@ -204,6 +304,12 @@ class PointTransformerEncoder(nn.Module):
         )
         self.layers = NeptuneTransformerEncoder(encoder_layer, num_layers=num_layers)
         
+        # Global attention pooling
+        self.global_pooling = AttentionPooling(
+            token_dim=token_dim,
+            use_position=True
+        )
+        
         # Output normalization
         self.norm = nn.RMSNorm(token_dim)
     
@@ -220,14 +326,8 @@ class PointTransformerEncoder(nn.Module):
         else:
             tokens = self.layers(tokens)
         
-        # Global average pooling
-        if masks is not None:
-            valid_tokens = tokens * masks.unsqueeze(-1)
-            token_sum = valid_tokens.sum(dim=1)
-            valid_count = masks.sum(dim=1, keepdim=True).clamp(min=1)
-            global_features = token_sum / valid_count
-        else:
-            global_features = tokens.mean(dim=1)
+        # Global attention pooling
+        global_features = self.global_pooling(tokens, centroids, masks)
         
         # Apply final normalization
         return self.norm(global_features)
