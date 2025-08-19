@@ -64,7 +64,6 @@ def main():
         dropout=model_options['dropout'],
         output_dim=output_dim,
         k_neighbors=model_options['k_neighbors'],
-        pool_method=model_options['pool_method'],
         mlp_layers=model_options.get('mlp_layers', [256, 512, 768])
     ).to(device)
     
