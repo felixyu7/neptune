@@ -6,7 +6,7 @@ from pathlib import Path
 
 from neptune import NeptuneModel
 from trainer import Trainer
-from prometheus_data import create_dataloaders
+from dataloaders import create_prometheus_dataloaders, create_icecube_dataloaders
 
 
 def parse_args():
@@ -38,10 +38,12 @@ def main():
     print(f"Using device: {device}")
     
     # Create dataloaders
-    if cfg['dataloader'] != 'prometheus':
-        raise ValueError(f"Only 'prometheus' dataloader supported, got {cfg['dataloader']}")
-    
-    train_loader, val_loader = create_dataloaders(cfg)
+    if cfg['dataloader'] == 'prometheus':
+        train_loader, val_loader = create_prometheus_dataloaders(cfg)
+    elif cfg['dataloader'] == 'icecube':
+        train_loader, val_loader = create_icecube_dataloaders(cfg)
+    else:
+        raise ValueError(f"Unsupported dataloader: {cfg['dataloader']}. Supported options: 'prometheus', 'icecube'")
     
     # Initialize model
     model_options = cfg['model_options']

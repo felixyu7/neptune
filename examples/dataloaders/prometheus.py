@@ -1,109 +1,20 @@
+"""
+Prometheus dataset implementation for Neptune training.
+
+Handles Prometheus neutrino simulation data with nested photon information
+and processes it using summary statistics for efficient training.
+"""
+
 import os
-import glob
 import torch
 import numpy as np
 import awkward as ak
 import pyarrow.parquet as pq
-import random
 import nt_summary_stats
-from torch import Tensor
-from torch.utils.data import Sampler, Dataset, DataLoader
-from typing import List, Tuple, Optional, Union
+from torch.utils.data import DataLoader
+from typing import List, Tuple, Optional
 
-
-def get_file_names(data_dirs: List[str], 
-                   ranges: List[List[int]], 
-                   shuffle_files: bool = False) -> List[str]:
-    """Get file names from directories within specified ranges."""
-    filtered_files = []
-    for i, directory in enumerate(data_dirs):
-        all_files = sorted(glob.glob(os.path.join(directory, '*.parquet')))
-        if shuffle_files:
-            random.shuffle(all_files)
-        file_range = ranges[i]
-        filtered_files.extend(
-            all_files[file_range[0]:file_range[1]]
-        )
-    return sorted(filtered_files)
-
-
-class ParquetFileSampler(Sampler):
-    """Custom sampler for parquet files that respects file boundaries during batching."""
-    
-    def __init__(self, 
-                 data_source: Dataset, 
-                 cumulative_lengths: np.ndarray, 
-                 batch_size: int):
-       super().__init__(data_source)
-       self.data_source = data_source
-       self.cumulative_lengths = cumulative_lengths
-       self.batch_size = batch_size
-
-    def __iter__(self):
-        """
-        Iterate through files in random order, but keep all events from a file
-        together (randomly permuted within the file) before moving to the next.
-        This preserves file-level locality and avoids thrashing the parquet
-        reader cache while still providing per-epoch randomness.
-        """
-        n_files = len(self.cumulative_lengths) - 1
-        file_order = np.random.permutation(n_files)
-        for file_index in file_order:
-            start_idx = self.cumulative_lengths[file_index]
-            end_idx = self.cumulative_lengths[file_index + 1]
-            # Random permutation of indices within this file
-            indices = np.random.permutation(np.arange(start_idx, end_idx))
-            # Yield indices sequentially (DataLoader will batch them)
-            for idx in indices:
-                yield idx
-
-    def __len__(self) -> int:
-       return len(self.data_source)
-
-
-def batched_coordinates(list_of_coords: List[Tensor]) -> Tensor:
-    """
-    Convert list of coordinate tensors to a single batched tensor.
-    Adds batch index as first column.
-    """
-    batched_coords = []
-    for batch_idx, coords in enumerate(list_of_coords):
-        # Ensure coords is a tensor
-        if not torch.is_tensor(coords):
-            coords = torch.as_tensor(coords, dtype=torch.float32)
-        
-        # Add batch index as first column
-        batch_indices = torch.full((coords.shape[0], 1), batch_idx, dtype=coords.dtype, device=coords.device)
-        batched_coord = torch.cat([batch_indices, coords], dim=1)
-        batched_coords.append(batched_coord)
-    
-    return torch.cat(batched_coords, dim=0)
-
-
-class IrregularDataCollator(object):
-    """Collator for irregular point cloud data."""
-    
-    def __call__(self, batch: List[Tuple[Tensor, Tensor, Tensor]]) -> Tuple[Tensor, Tensor, Tensor]:
-        pos, feats, labels = list(zip(*batch))
-        
-        # Convert to tensors if needed
-        pos_tensors = [torch.as_tensor(p, dtype=torch.float32) if not torch.is_tensor(p) else p for p in pos]
-        
-        # Create batched coordinates
-        bcoords = batched_coordinates(pos_tensors)
-        
-        # Concatenate features and labels
-        if isinstance(feats[0], torch.Tensor):
-            feats_batch = torch.cat(feats, dim=0).float()
-        else:
-            feats_batch = torch.from_numpy(np.concatenate(feats, axis=0)).float()
-
-        if isinstance(labels[0], torch.Tensor):
-            labels_batch = torch.stack(labels, dim=0).float()
-        else:
-            labels_batch = torch.from_numpy(np.stack(labels, axis=0)).float()
-
-        return bcoords, feats_batch, labels_batch
+from .data_utils import get_file_names, ParquetFileSampler, IrregularDataCollator
 
 
 class PrometheusDataset(torch.utils.data.Dataset):
@@ -184,8 +95,8 @@ class PrometheusDataset(torch.utils.data.Dataset):
         return pos, feats, labels
 
 
-def create_dataloaders(cfg):
-    """Create train and validation dataloaders from config."""
+def create_prometheus_dataloaders(cfg):
+    """Create train and validation dataloaders for Prometheus data from config."""
     
     # Create datasets
     train_files = get_file_names(
@@ -225,14 +136,18 @@ def create_dataloaders(cfg):
     # Create dataloaders
     collate_fn = IrregularDataCollator()
     
+    # Handle persistent_workers setting based on num_workers
+    num_workers = cfg['training_options']['num_workers']
+    persistent_workers = num_workers > 0
+    
     train_loader = DataLoader(
         train_dataset, 
         batch_size=cfg['training_options']['batch_size'], 
         sampler=train_sampler,
         collate_fn=collate_fn,
         pin_memory=True,
-        persistent_workers=True,
-        num_workers=cfg['training_options']['num_workers']
+        persistent_workers=persistent_workers,
+        num_workers=num_workers
     )
     
     val_loader = DataLoader(
@@ -241,8 +156,8 @@ def create_dataloaders(cfg):
         sampler=val_sampler,
         collate_fn=collate_fn,
         pin_memory=True,
-        persistent_workers=True,
-        num_workers=cfg['training_options']['num_workers']
+        persistent_workers=persistent_workers,
+        num_workers=num_workers
     )
     
     return train_loader, val_loader
