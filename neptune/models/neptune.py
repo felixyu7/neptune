@@ -4,11 +4,13 @@ import torch.nn.functional as F
 import numpy as np
 import lightning.pytorch as pl
 from torch import Tensor
+from torchmetrics.classification import BinaryAccuracy
 # from torch.nn import TransformerEncoder, TransformerEncoderLayer
 from typing import List, Tuple, Dict, Any, Optional
 import os
 import fpsample
 import time
+import wandb
 
 # Local imports
 from neptune.utils import (
@@ -298,15 +300,20 @@ class Neptune(pl.LightningModule):
         self.test_step_outputs = []
         self.validation_step_outputs = []
         
+        if self.hparams.downstream_task == 'background_classification':
+            self.accuracy = BinaryAccuracy(threshold=0.5)
+        
     def _set_output_dim(self):
         task = self.hparams.downstream_task
         loss_choice = self.hparams.loss_fn
         if task == 'angular_reco': 
             self.output_dim = 3
-        elif task == 'energy_reco' or task == 'deposited_energy_reco': 
+        elif task == 'energy_reco' or task == 'visible_energy_reco': 
             self.output_dim = 2 if loss_choice == 'gaussian_nll' else 1
         elif task == 'morphology_classification':
             self.output_dim = 6
+        elif task == 'simple_morphology_classification':
+            self.output_dim = 4
         elif task == 'bundleness_classification':
             self.output_dim = 3
         elif task == 'background_classification':
@@ -320,8 +327,9 @@ class Neptune(pl.LightningModule):
         valid = {
             'angular_reco': ['angular_distance', 'vmf', 'combined_angular_vmf'],
             'energy_reco': ['log_cosh', 'gaussian_nll'],
-            'deposited_energy_reco': ['log_cosh', 'gaussian_nll'],
+            'visible_energy_reco': ['log_cosh', 'gaussian_nll'],
             'morphology_classification': ['cross_entropy'],
+            'simple_morphology_classification': ['cross_entropy'],
             'bundleness_classification': ['cross_entropy'],
             'background_classification': ['binary_cross_entropy'],
         }
@@ -357,7 +365,7 @@ class Neptune(pl.LightningModule):
             if loss_choice == 'gaussian_nll': 
                 return lambda preds, labels: GaussianNLLLoss(preds[:, 0], preds[:, 1], get_labels(labels))
         
-        elif task == 'deposited_energy_reco':
+        elif task == 'visible_energy_reco':
             get_labels = lambda labels: labels[:, 7]
             if loss_choice == 'log_cosh': 
                 return lambda preds, labels: LogCoshLoss(preds.squeeze(-1) if preds.dim() > 1 else preds, get_labels(labels))
@@ -373,6 +381,17 @@ class Neptune(pl.LightningModule):
             # 5 = bundle/multiple events
             num_classes = 6
             get_labels = lambda labels: labels[:, 4]
+            return lambda preds, labels: CrossEntropyLoss(preds, get_labels(labels).long())
+        
+        elif task == 'simple_morphology_classification':
+            # 0 = cascade
+            # 1 = thru track
+            # 2 = starting track
+            # 3 = passing track
+            num_classes = 4
+            def get_labels(labels):
+                morph = labels[:, 4]
+                morph[morph==4] = 3
             return lambda preds, labels: CrossEntropyLoss(preds, get_labels(labels).long())
 
         elif task == 'bundleness_classification':
@@ -402,8 +421,13 @@ class Neptune(pl.LightningModule):
         return loss, preds, labels
         
     def training_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Tensor:
-        loss, _, _ = self.step(batch)
+        loss, preds, labels = self.step(batch)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
+        probs = torch.sigmoid(preds).detach().cpu().float().numpy()
+        self.logger.experiment.log(
+            {"train/p_positive_hist": wandb.Histogram(probs)},
+            commit=False
+        )
         return loss
         
     def validation_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Dict[str, Tensor]:
@@ -449,6 +473,10 @@ class Neptune(pl.LightningModule):
         if self.hparams.downstream_task == 'energy_reco':
             energy_errors = torch.abs(all_preds[:, 0] - all_labels[:, 0])
             self.log(f'{stage}_mean_energy_error', energy_errors.mean())
+        if self.hparams.downstream_task == 'background_classification':
+            true_label = all_labels[:, 6]
+            probs = torch.sigmoid(all_preds.view(-1))     # P(y=1)
+            preds = (probs >= 0.5).long()
             
     def on_validation_epoch_end(self):
         outputs = self.validation_step_outputs

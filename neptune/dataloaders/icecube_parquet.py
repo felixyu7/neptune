@@ -74,6 +74,7 @@ class ICParquetDataModule(pl.LightningDataModule):
                                                  collate_fn=collate_fn,
                                                  pin_memory=True,
                                                  persistent_workers=True,
+                                                 prefetch_factor=4,
                                                 #  shuffle=True,
                                                  num_workers=self.training_options['num_workers'])
         return dataloader
@@ -88,6 +89,7 @@ class ICParquetDataModule(pl.LightningDataModule):
                                            collate_fn=collate_fn,
                                            pin_memory=True,
                                            persistent_workers=True,
+                                           prefetch_factor=4,
                                            num_workers=self.training_options['num_workers'])
 
     def test_dataloader(self):
@@ -100,6 +102,7 @@ class ICParquetDataModule(pl.LightningDataModule):
                                            collate_fn=collate_fn,
                                            pin_memory=True,
                                            persistent_workers=True,
+                                           prefetch_factor=4,
                                            num_workers=self.training_options['num_workers'])
         
 class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
@@ -117,11 +120,31 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
         self.use_pulse_series = use_pulse_series
         self.use_latent_representation = use_latent_representation
         
+        self.columns = [
+            "primary_direction", "primary_energy", "morphology", "bundleness",
+            "background", "visible_energy",
+            "pulses.sensor_pos_x", "pulses.sensor_pos_y", "pulses.sensor_pos_z",
+            "pulses.summary_stats", "pulses.pulse_times", "pulses.pulse_charges",
+            # choose ONE of these branches depending on your mode:
+            # "pulses.pulse_times", "pulses.pulse_charges", "pulses.aux",
+            # or "pulses.latents",
+            # or "pulses.summary_stats",
+        ]
+
         # Count number of events in each file
         num_events = []
+        self.rg_cumlens = []
         for file in self.files:
-            data = pq.ParquetFile(file)
-            num_events.append(data.metadata.num_rows)
+            pf = pq.ParquetFile(file)
+            num_events.append(pf.metadata.num_rows)
+
+            sizes = [pf.metadata.row_group(i).num_rows for i in range(pf.metadata.num_row_groups)]
+            self.rg_cumlens.append(np.concatenate(([0], np.cumsum(np.array(sizes, dtype=np.int64)))))
+        
+        self._cur_file_idx = None
+        self._cur_rg_idx = None
+        self._cur_rg_data = None
+
         num_events = np.array(num_events)
         self.cumulative_lengths = np.concatenate(([0], np.cumsum(num_events)))
         self.dataset_size = self.cumulative_lengths[-1]
@@ -133,6 +156,13 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
         
         self.current_file = ''
         self.current_data = None
+
+    def _load_row_group(self, file_idx, rg_idx):
+        if self._cur_file_idx == file_idx and self._cur_rg_idx == rg_idx:
+            return
+        path = self.files[file_idx]
+        self._cur_rg_data = ak.from_parquet(path, columns=self.columns, row_groups={rg_idx})
+        self._cur_file_idx, self._cur_rg_idx = file_idx, rg_idx
         
     def __len__(self):
         return self.dataset_size
@@ -151,23 +181,33 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
         """
         if i < 0 or i >= self.dataset_size:
             raise IndexError("Index out of range")
+        
         file_index = np.searchsorted(self.cumulative_lengths, i+1) - 1
+        """
         true_idx = i - self.cumulative_lengths[file_index]
-                
         # Load file if it's not already loaded
         if self.current_file != self.files[file_index]:
             self.current_file = self.files[file_index]
             self.current_data = ak.from_parquet(self.files[file_index])
         
         event = self.current_data[true_idx]
-        
+        """
+        idx_in_file = i - self.cumulative_lengths[file_index]
+        rg_cum = self.rg_cumlens[file_index]
+        rg_idx = np.searchsorted(rg_cum, idx_in_file+1) - 1
+        idx_in_rg = idx_in_file - rg_cum[rg_idx]
+
+        self._load_row_group(file_index, rg_idx)
+        event = self._cur_rg_data[idx_in_rg]
+
         # Extract MC truth information
         direction = event.primary_direction.to_numpy()
         energy = event.primary_energy
         morphology = event.morphology
         bundleness = event.bundleness
         background = event.background
-        deposited_energy = event.deposited_energy
+        visible_energy = event.visible_energy
+        if visible_energy is None: visible_energy = 1e-9
         
         label = [np.log10(energy),
                  direction[0],
@@ -176,7 +216,7 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
                  morphology,
                  bundleness,
                  background,
-                 np.log10(deposited_energy+1.0)]
+                 np.log10(visible_energy+1.0)]
         
         # Extract position information
         pos = np.array([event.pulses.sensor_pos_x.to_numpy(),
@@ -215,10 +255,13 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
                 feats = np.log(feats + 1)
                 
             # Get first hit time on each sensor
+            """
             first_hit_time = []
             for times in event.pulses.pulse_times:
                 first_hit_time.append(min(times))
             first_hit_time = np.array(first_hit_time)
+            """
+            first_hit_time = ak.to_numpy(ak.min(event.pulses.pulse_times, axis=1))
         
             # Combine position and time
             pos_t = np.asarray(np.column_stack([pos, first_hit_time])) / 100.0  # Scale down
