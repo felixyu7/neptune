@@ -102,9 +102,24 @@ class Trainer:
                 pass
         else:
             if self.csv_writer is None:
+                # Initialize with comprehensive field names for both training and validation metrics
+                base_fields = ['epoch', 'step', 'loss']
+                if self.downstream_task == 'angular_reco':
+                    task_fields = ['mean_angular_error_deg', 'median_angular_error_deg']
+                elif self.downstream_task == 'energy_reco':
+                    task_fields = ['mean_energy_error']
+                else:
+                    task_fields = []
+                
+                # Include both training and validation versions
+                all_fields = base_fields.copy()
+                for field in task_fields:
+                    all_fields.extend([field, f'val_{field}'])
+                all_fields.append('val_loss')
+                
                 self.csv_file.parent.mkdir(parents=True, exist_ok=True)
                 csv_file = open(self.csv_file, 'w', newline='')
-                self.csv_writer = csv.DictWriter(csv_file, fieldnames=['epoch', 'step'] + list(metrics.keys()))
+                self.csv_writer = csv.DictWriter(csv_file, fieldnames=all_fields, extrasaction='ignore')
                 self.csv_writer.writeheader()
             
             row = {'epoch': self.current_epoch, 'step': step or 0}

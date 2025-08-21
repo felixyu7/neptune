@@ -14,15 +14,15 @@ import nt_summary_stats
 from torch.utils.data import DataLoader
 from typing import List, Tuple, Optional
 
-from .data_utils import get_file_names, ParquetFileSampler, IrregularDataCollator
+from .data_utils import get_file_names, ParquetFileSampler, IrregularDataCollator, group_hits_by_window
 
 
 class PrometheusDataset(torch.utils.data.Dataset):
     """Dataset class for Prometheus data."""
     
-    def __init__(self, files, use_latent_representation=False, geo_dict_path=None):
+    def __init__(self, files, use_summary_stats=True):
         self.files = files
-        self.use_latent_representation = use_latent_representation
+        self.use_summary_stats = use_summary_stats
         
         # Count number of events in each file
         num_events = []
@@ -62,21 +62,68 @@ class PrometheusDataset(torch.utils.data.Dataset):
         photons = event_data['photons']
         mc_truth = event_data['mc_truth']
         
-        # Use nt-summary-stats to process the event and get sensor-level features
-        sensor_positions, sensor_stats = nt_summary_stats.process_prometheus_event(photons)
+        if self.use_summary_stats:
+            # Summary stats mode: Use nt-summary-stats to process the event and get sensor-level features
+            sensor_positions, sensor_stats = nt_summary_stats.process_prometheus_event(photons)
 
-        # Create 4D coordinates: x, y, z, t (using time_mean for t)
-        pos = np.column_stack([
-            sensor_positions[:, 0],  # x
-            sensor_positions[:, 1],  # y
-            sensor_positions[:, 2],  # z
-            sensor_stats[:, 3]       # first hit time
-        ]).astype(np.float32)
-        pos = pos / 1000. # convert to km / microseconds
-        
-        # Use all 9 summary statistics as features
-        feats = sensor_stats.astype(np.float32)
-        feats = np.log(feats + 1)
+            # Create 4D coordinates: x, y, z, t (using time_mean for t)
+            pos = np.column_stack([
+                sensor_positions[:, 0],  # x
+                sensor_positions[:, 1],  # y
+                sensor_positions[:, 2],  # z
+                sensor_stats[:, 3]       # first hit time
+            ]).astype(np.float32)
+            pos = pos / 1000. # convert to km / microseconds
+            
+            # Use all 9 summary statistics as features
+            feats = sensor_stats.astype(np.float32)
+            feats = np.log(feats + 1)
+        else:
+            # Pulse mode: Group hits by window and create pulses
+            pulse_positions = []
+            pulse_features = []
+            
+            # Extract photon data arrays
+            sensor_ids = photons['sensor_id']
+            times = photons['t']
+            sensor_pos_x = photons['sensor_pos_x']
+            sensor_pos_y = photons['sensor_pos_y'] 
+            sensor_pos_z = photons['sensor_pos_z']
+            
+            # Group photons by sensor
+            sensors = {}
+            for i in range(len(sensor_ids)):
+                sensor_id = sensor_ids[i]
+                if sensor_id not in sensors:
+                    sensors[sensor_id] = {
+                        'times': [], 
+                        'charges': [],  # Use constant charge of 1.0 for each hit
+                        'position': [sensor_pos_x[i], sensor_pos_y[i], sensor_pos_z[i]]
+                    }
+                sensors[sensor_id]['times'].append(times[i])
+                sensors[sensor_id]['charges'].append(1.0)  # Each photon hit has charge 1.0
+            
+            # Process each sensor to create pulses
+            for sensor_id, sensor_data in sensors.items():
+                hit_times = np.array(sensor_data['times'])
+                hit_charges = np.array(sensor_data['charges'])
+
+                # Group hits by 3ns window
+                pulse_times, pulse_charges = group_hits_by_window(hit_times, hit_charges, window_ns=3.0)
+                
+                # Create position for each pulse (x, y, z, pulse_time)
+                sensor_pos = sensor_data['position']
+                for p_time, p_charge in zip(pulse_times, pulse_charges):
+                    pulse_positions.append([sensor_pos[0], sensor_pos[1], sensor_pos[2], p_time])
+                    pulse_features.append([p_time, p_charge])
+            
+            # Convert to numpy arrays
+            pos = np.array(pulse_positions, dtype=np.float32)
+            pos = pos / 1000. # convert to km / microseconds
+            
+            # Features are just [time, charge] for each pulse
+            feats = np.array(pulse_features, dtype=np.float32)
+            feats = np.log(feats + 1)
         
         # Extract labels from mc_truth (keep raw zenith/azimuth; log-transform energy)
         initial_zenith = mc_truth['initial_state_zenith']
@@ -106,8 +153,7 @@ def create_prometheus_dataloaders(cfg):
     )
     train_dataset = PrometheusDataset(
         train_files,
-        cfg['data_options'].get('use_latent_representation', False),
-        cfg['data_options'].get('geo_dict_path', None)
+        cfg['data_options'].get('use_summary_stats', True)
     )
     
     valid_files = get_file_names(
@@ -117,8 +163,7 @@ def create_prometheus_dataloaders(cfg):
     )
     valid_dataset = PrometheusDataset(
         valid_files,
-        cfg['data_options'].get('use_latent_representation', False),
-        cfg['data_options'].get('geo_dict_path', None)
+        cfg['data_options'].get('use_summary_stats', True)
     )
     
     # Create samplers

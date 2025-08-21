@@ -189,3 +189,50 @@ class RandomChunkSampler(Sampler[int]):
 
     def __len__(self) -> int:
         return self.num_samples
+    
+def group_hits_by_window(times: np.ndarray, charges: np.ndarray, 
+                         window_ns: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Compress arrays by grouping values that lie within `window_ns` of the first element of each group.
+    
+    This matches the optimized grouping logic used in Mercury and the training dataloader.
+    
+    Parameters
+    ----------
+    times : array_like
+        Input hit times (any order, any numeric dtype).
+    charges : array_like  
+        Input hit charges corresponding to times.
+    window_ns : float
+        Width of the inclusion window (inclusive on the right).
+        
+    Returns
+    -------
+    grouped_times : ndarray
+        Representative values (the first element in each group).
+    grouped_charges : ndarray
+        Sum of charges in each group.
+    """
+    if len(times) == 0:
+        return np.array([]), np.array([])
+    
+    # Sort both arrays by time
+    sort_idx = np.argsort(times)
+    sorted_times = times[sort_idx]
+    sorted_charges = charges[sort_idx]
+    
+    # endpoints[i] == first index where value > sorted_times[i] + window_ns
+    endpoints = np.searchsorted(sorted_times,
+                               sorted_times + window_ns,
+                               side='right')
+
+    reps, charge_sums = [], []
+    i = 0
+    n = sorted_times.size
+    while i < n:
+        reps.append(sorted_times[i])
+        j = endpoints[i]       # jump to the start of the next group
+        charge_sums.append(np.sum(sorted_charges[i:j]))
+        i = j
+
+    return np.asarray(reps), np.asarray(charge_sums)
