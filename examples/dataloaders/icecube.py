@@ -1,8 +1,8 @@
 """
 IceCube dataset implementation for Neptune training.
 
-Handles IceCube neutrino detection data with pulse-level information
-for direct training without summary statistics compression.
+Handles IceCube neutrino detection data with either pulse-level information
+or sensor-level summary statistics computed using nt_summary_stats.
 """
 
 import os
@@ -18,6 +18,11 @@ from typing import List, Tuple, Optional, Dict
 from pathlib import Path
 from collections import OrderedDict
 from bisect import bisect_right
+
+try:
+    import nt_summary_stats
+except ImportError:
+    nt_summary_stats = None
 
 from .data_utils import IrregularDataCollator, RandomChunkSampler
 
@@ -52,16 +57,27 @@ class IceCubeDataset(torch.utils.data.Dataset):
     
     Based on the notebook approach: uses OrderedDict for efficient caching of
     batch files and works with RandomChunkSampler for optimal performance.
+    
+    Supports two modes:
+    - Pulse-level (use_summary_stats=False): Uses raw pulse data as in original implementation
+    - Summary stats (use_summary_stats=True): Groups pulses by sensor and computes summary statistics
     """
     
     def __init__(self, 
                  meta_file: str,
                  batch_files: List[str], 
                  sensor_geometry: np.ndarray,
-                 cache_size: int = 2):
+                 cache_size: int = 2,
+                 use_summary_stats: bool = False):
         self.batch_files = batch_files
         self.sensor_geometry = sensor_geometry
         self.cache_size = cache_size
+        self.use_summary_stats = use_summary_stats
+        
+        # Check if nt_summary_stats is available when needed
+        if use_summary_stats and nt_summary_stats is None:
+            raise ImportError("nt_summary_stats is required when use_summary_stats=True. "
+                            "Install with: pip install nt_summary_stats")
         
         # Initialize caches using OrderedDict for LRU behavior
         self.batch_cache = None  # Will be OrderedDict[str, pl.DataFrame]
@@ -188,28 +204,64 @@ class IceCubeDataset(torch.utils.data.Dataset):
         charges = event_row['charge'][0].to_numpy()
         auxiliary = event_row['auxiliary'][0].to_numpy()
 
-        # Get sensor positions
-        sensor_positions = self.sensor_geometry[sensor_ids]
-        
-        # Apply preprocessing exactly like the notebook
-        times_norm = (times - 1e4) / 3e4
-        charges_norm = np.log10(charges) / 3.0
-        auxiliary_norm = auxiliary.astype(np.float32) - 0.5
-        
-        # Build 4D space-time coordinates: [x, y, z, t]
-        pos = np.column_stack([
-            sensor_positions[:, 0] / 500.0,  # x (notebook uses /500)
-            sensor_positions[:, 1] / 500.0,  # y
-            sensor_positions[:, 2] / 500.0,  # z
-            times_norm,                      # normalized time
-        ]).astype(np.float32)
-        
-        # Build 3D features: [time, charge, auxiliary]
-        feats = np.column_stack([
-            times_norm,                      # normalized time
-            charges_norm,                    # normalized charge
-            auxiliary_norm                   # normalized auxiliary
-        ]).astype(np.float32)
+        if self.use_summary_stats:
+            # Summary stats mode: Group pulses by unique sensors and compute summary statistics
+            unique_sensors = np.unique(sensor_ids)
+            sensor_positions_list = []
+            sensor_stats_list = []
+            
+            for sensor_id in unique_sensors:
+                # Get all pulses for this sensor
+                sensor_mask = sensor_ids == sensor_id
+                sensor_times = times[sensor_mask]
+                sensor_charges = charges[sensor_mask]
+                
+                # Compute summary stats using nt_summary_stats
+                stats = nt_summary_stats.compute_summary_stats(sensor_times, sensor_charges)
+                sensor_stats_list.append(stats)
+                
+                # Get sensor position
+                sensor_pos = self.sensor_geometry[sensor_id]
+                sensor_positions_list.append(sensor_pos)
+            
+            # Convert to numpy arrays
+            sensor_positions = np.array(sensor_positions_list, dtype=np.float32)
+            sensor_stats = np.array(sensor_stats_list, dtype=np.float32)
+            
+            # Create 4D coordinates: x, y, z, t (using first_pulse_time for t)
+            pos = np.column_stack([
+                sensor_positions[:, 0] / 500.0,  # x (normalized like original)
+                sensor_positions[:, 1] / 500.0,  # y
+                sensor_positions[:, 2] / 500.0,  # z
+                (sensor_stats[:, 3] - 1e4) / 3e4  # first_pulse_time, normalized like original
+            ]).astype(np.float32)
+            
+            # Use all 9 summary statistics as features (log transform like Prometheus)
+            feats = np.log(sensor_stats + 1).astype(np.float32)
+        else:
+            # Pulse-level mode: Use original pulse-level processing
+            # Get sensor positions
+            sensor_positions = self.sensor_geometry[sensor_ids]
+            
+            # Apply preprocessing exactly like the notebook
+            times_norm = (times - 1e4) / 3e4
+            charges_norm = np.log10(charges) / 3.0
+            auxiliary_norm = auxiliary.astype(np.float32) - 0.5
+            
+            # Build 4D space-time coordinates: [x, y, z, t]
+            pos = np.column_stack([
+                sensor_positions[:, 0] / 500.0,  # x (notebook uses /500)
+                sensor_positions[:, 1] / 500.0,  # y
+                sensor_positions[:, 2] / 500.0,  # z
+                times_norm,                      # normalized time
+            ]).astype(np.float32)
+            
+            # Build 3D features: [time, charge, auxiliary]
+            feats = np.column_stack([
+                times_norm,                      # normalized time
+                charges_norm,                    # normalized charge
+                auxiliary_norm                   # normalized auxiliary
+            ]).astype(np.float32)
         
         # Build labels: convert spherical to Cartesian direction
         log_energy = 0.0  # Dummy energy value (IceCube doesn't provide energy)
@@ -241,7 +293,8 @@ def create_icecube_dataloaders(cfg):
         cfg['data_options']['train_meta_file'],
         train_batch_files,
         sensor_geometry,
-        cache_size=2  # Cache up to 2 batch files per worker
+        cache_size=2,  # Cache up to 2 batch files per worker
+        use_summary_stats=cfg['data_options'].get('use_summary_stats', False)
     )
 
     # Create validation dataset
@@ -254,7 +307,8 @@ def create_icecube_dataloaders(cfg):
         cfg['data_options']['valid_meta_file'],
         valid_batch_files,
         sensor_geometry,
-        cache_size=2  # Cache up to 2 batch files per worker
+        cache_size=2,  # Cache up to 2 batch files per worker
+        use_summary_stats=cfg['data_options'].get('use_summary_stats', False)
     )
     
     # Create chunk-aware samplers for efficient caching
