@@ -64,7 +64,7 @@ class IceCubeDataset(torch.utils.data.Dataset):
     """
     
     def __init__(self, 
-                 meta_file: str,
+                 meta_dir: str,
                  batch_files: List[str], 
                  sensor_geometry: np.ndarray,
                  cache_size: int = 2,
@@ -88,17 +88,19 @@ class IceCubeDataset(torch.utils.data.Dataset):
         self.batch_file_names = []
         self.chunks = []  # Number of events in each batch file
         
-        # Load metadata once to get event counts per batch
-        meta_table = pq.read_table(meta_file)
-        full_meta_df = meta_table.to_pandas()
-        
+        # Load metadata files to get event counts per batch
         for batch_file in batch_files:
             batch_num = int(Path(batch_file).stem.split('_')[1])
             self.batch_file_names.append(Path(batch_file).name)
             
-            # Count events in this batch file from metadata
-            batch_events = full_meta_df[full_meta_df['batch_id'] == batch_num]
-            self.chunks.append(len(batch_events))
+            # Load corresponding metadata batch file
+            meta_batch_file = os.path.join(meta_dir, f"train_meta_{batch_num}.parquet")
+            if os.path.exists(meta_batch_file):
+                meta_table = pq.read_table(meta_batch_file)
+                batch_meta_df = meta_table.to_pandas()
+                self.chunks.append(len(batch_meta_df))
+            else:
+                raise FileNotFoundError(f"Metadata file not found: {meta_batch_file}")
         
         # Compute cumulative chunk sizes for indexing
         self.chunk_cumsum = np.cumsum(self.chunks)
@@ -107,8 +109,8 @@ class IceCubeDataset(torch.utils.data.Dataset):
         print(f"Dataset: {self.total_events} events across {len(self.chunks)} batch files")
         print(f"Chunk sizes: {self.chunks}")
         
-        # Store metadata file path for lazy loading
-        self.meta_file = meta_file
+        # Store metadata directory path for lazy loading
+        self.meta_dir = meta_dir
         
         # Create mapping from batch file name to full path  
         self.batch_name_to_path = {}
@@ -156,10 +158,13 @@ class IceCubeDataset(torch.utils.data.Dataset):
             # Extract batch number from filename
             batch_num = int(batch_filename.split('.')[0].split('_')[1])
             
-            # Load full metadata and filter for this batch
-            meta_table = pq.read_table(self.meta_file)
-            full_meta_df = meta_table.to_pandas()
-            batch_meta = full_meta_df[full_meta_df['batch_id'] == batch_num].copy()
+            # Load corresponding metadata batch file directly
+            meta_batch_file = os.path.join(self.meta_dir, f"train_meta_{batch_num}.parquet")
+            if not os.path.exists(meta_batch_file):
+                raise FileNotFoundError(f"Metadata file not found: {meta_batch_file}")
+            
+            meta_table = pq.read_table(meta_batch_file)
+            batch_meta = meta_table.to_pandas()
             batch_meta = batch_meta.sort_values('event_id').reset_index(drop=True)
             
             # Store in cache
@@ -250,10 +255,10 @@ class IceCubeDataset(torch.utils.data.Dataset):
             
             # Build 4D space-time coordinates: [x, y, z, t]
             pos = np.column_stack([
-                sensor_positions[:, 0] / 500.0,  # x (notebook uses /500)
-                sensor_positions[:, 1] / 500.0,  # y
-                sensor_positions[:, 2] / 500.0,  # z
-                times_norm,                      # normalized time
+                sensor_positions[:, 0] / 1000.0,  # x (notebook uses /500)
+                sensor_positions[:, 1] / 1000.0,  # y
+                sensor_positions[:, 2] / 1000.0,  # z
+                times / 1000.0,                   # normalized time
             ]).astype(np.float32)
             
             # Build 3D features: [time, charge, auxiliary]
@@ -290,7 +295,7 @@ def create_icecube_dataloaders(cfg):
         cfg['data_options']['shuffle_files']
     )
     train_dataset = IceCubeDataset(
-        cfg['data_options']['train_meta_file'],
+        cfg['data_options']['train_meta_dir'],
         train_batch_files,
         sensor_geometry,
         cache_size=2,  # Cache up to 2 batch files per worker
@@ -304,7 +309,7 @@ def create_icecube_dataloaders(cfg):
         cfg['data_options']['shuffle_files']
     )
     valid_dataset = IceCubeDataset(
-        cfg['data_options']['valid_meta_file'],
+        cfg['data_options']['valid_meta_dir'],
         valid_batch_files,
         sensor_geometry,
         cache_size=2,  # Cache up to 2 batch files per worker
