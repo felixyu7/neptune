@@ -10,6 +10,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from loss_functions import AngularDistanceLoss, VonMisesFisherLoss, GaussianNLLLoss
+from neptune.tokenizer import GumbelScheduler, compute_gumbel_regularization_loss
 
 
 class Trainer:
@@ -64,6 +65,9 @@ class Trainer:
         # Training state
         self.current_epoch = 0
         self.best_val_loss = float('inf')
+        
+        # Gumbel scheduler will be initialized after we know the data loader size
+        self.gumbel_scheduler = None
         
     def get_loss_function(self):
         if self.downstream_task == 'angular_reco':
@@ -129,7 +133,7 @@ class Trainer:
     
     def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
         self.model.train()
-        total_loss = 0.0
+        running_loss = 0.0
         num_batches = len(train_loader)
         loss_fn = self.get_loss_function()
         
@@ -148,24 +152,41 @@ class Trainer:
             if self.use_amp:
                 with torch.cuda.amp.autocast():
                     preds = self.model(coords, features)
-                    loss = loss_fn(preds, labels)
+                    main_loss = loss_fn(preds, labels)
+                    
+                    # Add regularization losses
+                    reg_losses = compute_gumbel_regularization_loss(self.model)
+                    reg_loss_sum = sum(reg_losses.values())
+                    total_loss = main_loss + reg_loss_sum
                 
-                self.scaler.scale(loss).backward()
+                self.scaler.scale(total_loss).backward()
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
                 preds = self.model(coords, features)
-                loss = loss_fn(preds, labels)
-                loss.backward()
+                main_loss = loss_fn(preds, labels)
+                
+                # Add regularization losses
+                reg_losses = compute_gumbel_regularization_loss(self.model)
+                reg_loss_sum = sum(reg_losses.values())
+                total_loss = main_loss + reg_loss_sum
+                
+                total_loss.backward()
                 self.optimizer.step()
             
-            total_loss += loss.item()
+            # Step Gumbel scheduler
+            self.gumbel_scheduler.step()
+                
+            # Use main loss for display (total loss can be confusing)
+            loss = main_loss
+            
+            running_loss += loss.item()
             
             # Update progress bar with current loss and learning rate
             pbar.set_postfix({
                 'Loss': f'{loss.item():.6f}',
                 'LR': f'{self.scheduler.get_last_lr()[0]:.2e}',
-                'Avg Loss': f'{total_loss/(batch_idx+1):.6f}'
+                'Avg Loss': f'{running_loss/(batch_idx+1):.6f}'
             })
             
             # Log every 50 steps
@@ -175,9 +196,17 @@ class Trainer:
                     'train_loss': loss.item(),
                     'learning_rate': self.scheduler.get_last_lr()[0]
                 }
+                
+                # Add Gumbel-specific metrics
+                metrics['temperature'] = self.gumbel_scheduler.get_temperature()
+                metrics['hard_sampling'] = self.model.tokenizer.hard_sampling
+                # Add regularization loss components
+                for key, value in reg_losses.items():
+                    metrics[f'reg_{key}'] = value.item() if hasattr(value, 'item') else value
+                
                 self.log_metrics(metrics, step)
         
-        return {'train_loss': total_loss / num_batches}
+        return {'train_loss': running_loss / num_batches}
     
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
         self.model.eval()
@@ -276,8 +305,19 @@ class Trainer:
     def fit(self, train_loader: DataLoader, val_loader: DataLoader):
         print(f"Starting training for {self.epochs} epochs...")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        print()
         
+        # Initialize Gumbel scheduler now that we have the data loader
+        steps_per_epoch = len(train_loader)
+        total_steps = self.epochs * steps_per_epoch
+        self.gumbel_scheduler = GumbelScheduler(
+            model=self.model,
+            total_steps=total_steps,
+            warmup_steps=self.cfg['training_options'].get('warmup_steps', 1000),
+            hard_sampling_after=self.cfg['training_options'].get('hard_sampling_after', 0.7)
+        )
+        print(f"Gumbel scheduler initialized: {steps_per_epoch} steps/epoch, {total_steps} total steps")
+        
+        print()
         start_time = time.time()
         
         # Create overall progress bar for epochs
