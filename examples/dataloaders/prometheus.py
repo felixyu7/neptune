@@ -79,51 +79,61 @@ class PrometheusDataset(torch.utils.data.Dataset):
             feats = sensor_stats.astype(np.float32)
             feats = np.log(feats + 1)
         else:
-            # Pulse mode: Group hits by window and create pulses
-            pulse_positions = []
-            pulse_features = []
+            pos = np.array([photons['sensor_pos_x'],
+                            photons['sensor_pos_y'],
+                            photons['sensor_pos_z'],
+                            photons['t']]).T
+            pos = np.trunc(pos)
+            pos, feats = np.unique(pos, return_counts=True, axis=0)
             
-            # Extract photon data arrays
-            sensor_ids = photons['sensor_id']
-            times = photons['t']
-            sensor_pos_x = photons['sensor_pos_x']
-            sensor_pos_y = photons['sensor_pos_y'] 
-            sensor_pos_z = photons['sensor_pos_z']
-            
-            # Group photons by sensor
-            sensors = {}
-            for i in range(len(sensor_ids)):
-                sensor_id = sensor_ids[i]
-                if sensor_id not in sensors:
-                    sensors[sensor_id] = {
-                        'times': [], 
-                        'charges': [],  # Use constant charge of 1.0 for each hit
-                        'position': [sensor_pos_x[i], sensor_pos_y[i], sensor_pos_z[i]]
-                    }
-                sensors[sensor_id]['times'].append(times[i])
-                sensors[sensor_id]['charges'].append(1.0)  # Each photon hit has charge 1.0
-            
-            # Process each sensor to create pulses
-            for sensor_id, sensor_data in sensors.items():
-                hit_times = np.array(sensor_data['times'])
-                hit_charges = np.array(sensor_data['charges'])
+            pos = pos / 1000.
+            feats = np.log(feats + 1).reshape(-1, 1)
 
-                # Group hits by 3ns window
-                pulse_times, pulse_charges = group_hits_by_window(hit_times, hit_charges, window_ns=3.0)
+            # # Pulse mode: Group hits by window and create pulses
+            # pulse_positions = []
+            # pulse_features = []
+            
+            # # Extract photon data arrays
+            # sensor_ids = photons['sensor_id']
+            # times = photons['t']
+            # sensor_pos_x = photons['sensor_pos_x']
+            # sensor_pos_y = photons['sensor_pos_y'] 
+            # sensor_pos_z = photons['sensor_pos_z']
+            
+            # # Group photons by sensor
+            # sensors = {}
+            # for i in range(len(sensor_ids)):
+            #     sensor_id = sensor_ids[i]
+            #     if sensor_id not in sensors:
+            #         sensors[sensor_id] = {
+            #             'times': [], 
+            #             'charges': [],  # Use constant charge of 1.0 for each hit
+            #             'position': [sensor_pos_x[i], sensor_pos_y[i], sensor_pos_z[i]]
+            #         }
+            #     sensors[sensor_id]['times'].append(times[i])
+            #     sensors[sensor_id]['charges'].append(1.0)  # Each photon hit has charge 1.0
+            
+            # # Process each sensor to create pulses
+            # for sensor_id, sensor_data in sensors.items():
+            #     hit_times = np.array(sensor_data['times'])
+            #     hit_charges = np.array(sensor_data['charges'])
+
+            #     # Group hits by 3ns window
+            #     pulse_times, pulse_charges = group_hits_by_window(hit_times, hit_charges, window_ns=3.0)
                 
-                # Create position for each pulse (x, y, z, pulse_time)
-                sensor_pos = sensor_data['position']
-                for p_time, p_charge in zip(pulse_times, pulse_charges):
-                    pulse_positions.append([sensor_pos[0], sensor_pos[1], sensor_pos[2], p_time])
-                    pulse_features.append([p_time, p_charge])
+            #     # Create position for each pulse (x, y, z, pulse_time)
+            #     sensor_pos = sensor_data['position']
+            #     for p_time, p_charge in zip(pulse_times, pulse_charges):
+            #         pulse_positions.append([sensor_pos[0], sensor_pos[1], sensor_pos[2], p_time])
+            #         pulse_features.append([p_time, p_charge])
             
-            # Convert to numpy arrays
-            pos = np.array(pulse_positions, dtype=np.float32)
-            pos = pos / 1000. # convert to km / microseconds
+            # # Convert to numpy arrays
+            # pos = np.array(pulse_positions, dtype=np.float32)
+            # pos = pos / 1000. # convert to km / microseconds
             
-            # Features are just [time, charge] for each pulse
-            feats = np.array(pulse_features, dtype=np.float32)
-            feats = np.log(feats + 1)
+            # # Features are just [time, charge] for each pulse
+            # feats = np.array(pulse_features, dtype=np.float32)
+            # feats = np.log(feats + 1)
         
         # Extract labels from mc_truth (keep raw zenith/azimuth; log-transform energy)
         initial_zenith = mc_truth['initial_state_zenith']

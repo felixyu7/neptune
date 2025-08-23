@@ -66,8 +66,7 @@ def main():
         dropout=model_options['dropout'],
         output_dim=output_dim,
         k_neighbors=model_options['k_neighbors'],
-        mlp_layers=model_options.get('mlp_layers', [256, 512, 768]),
-        importance_hidden_dim=model_options.get('importance_hidden_dim', 256)
+        mlp_layers=model_options.get('mlp_layers', [256, 512, 768])
     ).to(device)
     
     # Setup logging

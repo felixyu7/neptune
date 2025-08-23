@@ -188,7 +188,7 @@ class Trainer:
         
         return {'train_loss': running_loss / num_batches}
     
-    def validate(self, val_loader: DataLoader) -> Dict[str, float]:
+    def validate(self, val_loader: DataLoader, save_predictions: bool = False) -> Dict[str, float]:
         self.model.eval()
         total_loss = 0.0
         all_preds = []
@@ -216,6 +216,14 @@ class Trainer:
         # Compute overall metrics
         all_preds = torch.cat(all_preds, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
+        
+        # Save predictions and labels if requested
+        if save_predictions:
+            predictions_file = self.save_dir / 'results.npz'
+            
+            np.savez(predictions_file, predictions=all_preds.numpy(), labels=all_labels.numpy())
+            
+            print(f"Saved predictions and labels to: {predictions_file}")
         
         metrics = {'val_loss': total_loss / len(val_loader)}
         task_metrics = self.compute_metrics(all_preds, all_labels)
@@ -341,7 +349,7 @@ class Trainer:
     
     def test(self, test_loader: DataLoader):
         print("Running test evaluation...")
-        test_metrics = self.validate(test_loader)
+        test_metrics = self.validate(test_loader, save_predictions=True)
         
         print("Test Results:")
         for key, value in test_metrics.items():

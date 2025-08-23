@@ -41,79 +41,123 @@ def GaussianNLLLoss(mu: Tensor, var: Tensor, target: Tensor) -> Tensor:
     # Return average over batch
     return torch.mean(nll)
 
-
 class LogCMK(torch.autograd.Function):
-    """
-    Log normalization constant for von Mises-Fisher distribution.
-    From: https://github.com/mryab/vmf_loss/blob/master/losses.py
+    """MIT License.
+
+    Copyright (c) 2019 Max Ryabinin
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in
+    all copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+    _____________________
+
+    From [https://github.com/mryab/vmf_loss/blob/master/losses.py] Modified to
+    use modified Bessel function instead of exponentially scaled ditto
+    (i.e. `.ive` -> `.iv`) as indicated in [1812.04616] in spite of suggestion
+    in Sec. 8.2 of this paper. The change has been validated through comparison
+    with exact calculations for `m=2` and `m=3` and found to yield the correct
+    results.
     """
 
     @staticmethod
-    def forward(ctx: Any, m: int, kappa: Tensor) -> Tensor:
+    def forward(
+        ctx: Any, m: int, kappa: Tensor
+    ) -> Tensor:  # pylint: disable=invalid-name,arguments-differ
+        """Forward pass."""
         dtype = kappa.dtype
         ctx.save_for_backward(kappa)
         ctx.m = m
         ctx.dtype = dtype
         kappa = kappa.double()
-        
-        # Use Bessel function iv
         iv = torch.from_numpy(
             scipy.special.iv(m / 2.0 - 1, kappa.cpu().numpy())
         ).to(kappa.device)
-        
-        # Prevent log(0) issues
-        iv = torch.clamp(iv, min=1e-30)
         return (
-            (m / 2.0 - 1) * torch.log(kappa.clamp(min=1e-6))
-            - torch.log(iv) 
+            (m / 2.0 - 1) * torch.log(kappa)
+            - torch.log(iv)
             - (m / 2) * np.log(2 * np.pi)
         ).type(dtype)
 
     @staticmethod
-    def backward(ctx: Any, grad_output: Tensor) -> Tuple[None, Tensor]:
+    def backward(
+        ctx: Any, grad_output: Tensor
+    ) -> Tensor:  # pylint: disable=invalid-name,arguments-differ
+        """Backward pass."""
         kappa = ctx.saved_tensors[0]
         m = ctx.m
         dtype = ctx.dtype
-        kappa_cpu = kappa.double().cpu().numpy()
-        
-        # Calculate ratio of Bessel functions
-        ratio = (scipy.special.iv(m / 2.0, kappa_cpu)) / (scipy.special.iv(m / 2.0 - 1, kappa_cpu))
-        ratio = np.nan_to_num(ratio, nan=0.0, posinf=0.0, neginf=0.0)
-        grads = -torch.from_numpy(ratio).to(grad_output.device).type(dtype)
-        
-        return None, grad_output * grads
-
+        kappa = kappa.double().cpu().numpy()
+        grads = -(
+            (scipy.special.iv(m / 2.0, kappa))
+            / (scipy.special.iv(m / 2.0 - 1, kappa))
+        )
+        return (
+            None,
+            grad_output
+            * torch.from_numpy(grads).to(grad_output.device).type(dtype),
+        )
 
 def log_cmk_exact(m: int, kappa: Tensor) -> Tensor:
+    """Calculate $log C_{m}(k)$ term in von Mises-Fisher loss exactly."""
     return LogCMK.apply(m, kappa)
 
 def log_cmk_approx(m: int, kappa: Tensor) -> Tensor:
+    """Calculate $log C_{m}(k)$ term in von Mises-Fisher loss approx.
+
+    [https://arxiv.org/abs/1812.04616] Sec. 8.2 with additional minus sign.
+    """
     v = m / 2.0 - 0.5
     a = torch.sqrt((v + 1) ** 2 + kappa**2)
     b = v - 1
-    log_term = torch.log(b + a).clamp(max=85)
-    return -a + b * log_term
+    return -a + b * torch.log(b + a)
 
-def VonMisesFisherLoss(pred: Tensor, truth: Tensor, kappa_switch: float = 100., reg_factor: float = 0.0, eps: float = 1e-6) -> Tensor:
+def log_cmk(m: int, kappa: Tensor, kappa_switch: float = 100.0) -> Tensor:
+    """Calculate $log C_{m}(k)$ term in von Mises-Fisher loss.
+
+    Since `log_cmk_exact` is diverges for `kappa` >~ 700 (using float64
+    precision), and since `log_cmk_approx` is unaccurate for small `kappa`,
+    this method automatically switches between the two at `kappa_switch`,
+    ensuring continuity at this point.
+    """
+    kappa_switch = torch.tensor([kappa_switch]).to(kappa.device)
+    mask_exact = kappa < kappa_switch
+
+    # Ensure continuity at `kappa_switch`
+    offset = log_cmk_approx(m, kappa_switch) - log_cmk_exact(
+        m, kappa_switch
+    )
+    ret = log_cmk_approx(m, kappa) - offset
+    ret[mask_exact] = log_cmk_exact(m, kappa[mask_exact])
+    return ret
+
+def VonMisesFisherLoss(prediction: Tensor, target: Tensor) -> Tensor:
     """
     Stable Von Mises-Fisher negative log-likelihood (matches reference implementation).
     Loss = -log C_m(kappa) - kappa * <mu_hat, x> + reg_factor * kappa.
     """
-    m = truth.size(1)
-    kappa = torch.norm(pred, dim=1).clamp(min=eps)
-    dotprod = torch.sum(F.normalize(pred, dim=1) * truth, dim=1)
+    # Check(s)
+    assert prediction.dim() == 2
+    assert target.dim() == 2
+    assert prediction.size() == target.size()
 
-    kappa_switch_tensor = torch.tensor([kappa_switch], device=kappa.device, dtype=kappa.dtype)
-    mask_exact = kappa < kappa_switch_tensor
-    mask_approx = ~mask_exact
-    log_cmk_val = torch.zeros_like(kappa)
+    # Computing loss
+    m = target.size()[1]
+    k = torch.norm(prediction, dim=1)
+    dotprod = torch.sum(prediction * target, dim=1)
+    elements = -log_cmk(m, k) - dotprod
 
-    if mask_exact.any():
-        log_cmk_val[mask_exact] = log_cmk_exact(m, kappa[mask_exact])
-
-    if mask_approx.any():
-        offset = log_cmk_approx(m, kappa_switch_tensor) - log_cmk_exact(m, kappa_switch_tensor)
-        log_cmk_val[mask_approx] = log_cmk_approx(m, kappa[mask_approx]) - offset
-
-    elements = -log_cmk_val - (kappa * dotprod) + (reg_factor * kappa)
     return elements.mean()
