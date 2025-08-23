@@ -112,8 +112,6 @@ class NeptuneModel(nn.Module):
         output_dim: int = 3,
         k_neighbors: int = 16,
         mlp_layers: List[int] = [256, 512, 768],
-        temperature: float = 5.0,
-        temperature_min: float = 0.1,
         importance_hidden_dim: int = 256
     ):
         super().__init__()
@@ -125,9 +123,6 @@ class NeptuneModel(nn.Module):
             token_dim=token_dim,
             mlp_layers=mlp_layers,
             k_neighbors=k_neighbors,
-            temperature=temperature,
-            temperature_min=temperature_min,
-            hard_sampling=False,
             importance_hidden_dim=importance_hidden_dim
         )
         
