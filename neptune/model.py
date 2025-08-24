@@ -7,6 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import List, Tuple, Optional
 from .transformers import NeptuneTransformerEncoder, NeptuneTransformerEncoderLayer
+from .tokenizer import GumbelSoftmaxTokenizer
 import fpsample
 
 class PointCloudTokenizer(nn.Module):
@@ -69,16 +70,6 @@ class PointCloudTokenizer(nn.Module):
             batch_time = time[batch_mask_indices]  # [M, 1]
             num_points = batch_xyz.shape[0]
             
-            if num_points == 0:
-                # Handle empty point clouds within the batch
-                batch_tokens = torch.zeros(self.max_tokens, self.token_dim, device=coordinates.device, dtype=features.dtype)
-                batch_centroids = torch.zeros(self.max_tokens, 4, device=coordinates.device, dtype=coordinates.dtype)
-                batch_mask_valid = torch.zeros(self.max_tokens, dtype=torch.bool, device=coordinates.device)
-                all_tokens.append(batch_tokens)
-                all_centroids.append(batch_centroids)
-                all_masks.append(batch_mask_valid.unsqueeze(0))
-                continue
-
             # Combine spatial coordinates and time for FPS and neighborhood search: [M, 4]
             points_for_sampling = torch.cat([batch_xyz, batch_time], dim=-1)
             
@@ -230,6 +221,8 @@ class NeptuneModel(nn.Module):
         output_dim: Dimension of output (task-dependent)
         k_neighbors: Number of neighbors for point aggregation
         mlp_layers: List of dimensions for tokenizer MLP layers
+        tokenizer_type: Type of tokenizer ('point_cloud' or 'gumbel_softmax')
+        importance_hidden_dim: Hidden dimension for GumbelSoftmax importance network
     """
     
     def __init__(
@@ -243,18 +236,32 @@ class NeptuneModel(nn.Module):
         dropout: float = 0.1,
         output_dim: int = 3,
         k_neighbors: int = 16,
-        mlp_layers: List[int] = [256, 512, 768]
+        mlp_layers: List[int] = [256, 512, 768],
+        tokenizer_type: str = "point_cloud",
+        importance_hidden_dim: int = 256
     ):
         super().__init__()
         
-        # Model Components
-        self.tokenizer = PointCloudTokenizer(
-            feature_dim=in_channels,
-            max_tokens=num_patches,
-            token_dim=token_dim,
-            mlp_layers=mlp_layers,
-            k_neighbors=k_neighbors
-        )
+        # Model Components - choose tokenizer type
+        if tokenizer_type == "gumbel_softmax":
+            self.tokenizer = GumbelSoftmaxTokenizer(
+                feature_dim=in_channels,
+                max_tokens=num_patches,
+                token_dim=token_dim,
+                mlp_layers=mlp_layers,
+                k_neighbors=k_neighbors,
+                importance_hidden_dim=importance_hidden_dim
+            )
+        elif tokenizer_type == "point_cloud":
+            self.tokenizer = PointCloudTokenizer(
+                feature_dim=in_channels,
+                max_tokens=num_patches,
+                token_dim=token_dim,
+                mlp_layers=mlp_layers,
+                k_neighbors=k_neighbors
+            )
+        else:
+            raise ValueError(f"Unknown tokenizer type: {tokenizer_type}. Supported: 'point_cloud', 'gumbel_softmax'")
         
         self.encoder = PointTransformerEncoder(
             token_dim=token_dim,

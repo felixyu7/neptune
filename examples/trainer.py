@@ -180,10 +180,6 @@ class Trainer:
                     'learning_rate': self.scheduler.get_last_lr()[0]
                 }
                 
-                # Add Gumbel-specific metrics
-                temp = F.softplus(self.model.tokenizer.temperature) + 0.1
-                metrics['temperature'] = temp.item()
-                
                 self.log_metrics(metrics, step)
         
         return {'train_loss': running_loss / num_batches}
