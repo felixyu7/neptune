@@ -7,7 +7,7 @@ import torch.nn.functional as F
 from torch import Tensor
 from typing import List, Tuple, Optional
 from .transformers import NeptuneTransformerEncoder, NeptuneTransformerEncoderLayer
-from .tokenizer import GumbelSoftmaxTokenizer
+from .tokenizer import GumbelSoftmaxTokenizer, LightweightPointSelector
 import fpsample
 
 class PointCloudTokenizer(nn.Module):
@@ -221,8 +221,7 @@ class NeptuneModel(nn.Module):
         output_dim: Dimension of output (task-dependent)
         k_neighbors: Number of neighbors for point aggregation
         mlp_layers: List of dimensions for tokenizer MLP layers
-        tokenizer_type: Type of tokenizer ('point_cloud' or 'gumbel_softmax')
-        importance_hidden_dim: Hidden dimension for GumbelSoftmax importance network
+        tokenizer_type: Type of tokenizer ('point_cloud', 'gumbel_softmax', or 'lightweight')
     """
     
     def __init__(
@@ -237,8 +236,7 @@ class NeptuneModel(nn.Module):
         output_dim: int = 3,
         k_neighbors: int = 16,
         mlp_layers: List[int] = [256, 512, 768],
-        tokenizer_type: str = "point_cloud",
-        importance_hidden_dim: int = 256
+        tokenizer_type: str = "point_cloud"
     ):
         super().__init__()
         
@@ -249,8 +247,14 @@ class NeptuneModel(nn.Module):
                 max_tokens=num_patches,
                 token_dim=token_dim,
                 mlp_layers=mlp_layers,
-                k_neighbors=k_neighbors,
-                importance_hidden_dim=importance_hidden_dim
+                k_neighbors=k_neighbors
+            )
+        elif tokenizer_type == "lightweight":
+            self.tokenizer = LightweightPointSelector(
+                feature_dim=in_channels,
+                max_tokens=num_patches,
+                token_dim=token_dim,
+                mlp_layers=mlp_layers
             )
         elif tokenizer_type == "point_cloud":
             self.tokenizer = PointCloudTokenizer(
@@ -261,7 +265,7 @@ class NeptuneModel(nn.Module):
                 k_neighbors=k_neighbors
             )
         else:
-            raise ValueError(f"Unknown tokenizer type: {tokenizer_type}. Supported: 'point_cloud', 'gumbel_softmax'")
+            raise ValueError(f"Unknown tokenizer type: {tokenizer_type}. Supported: 'point_cloud', 'gumbel_softmax', 'lightweight'")
         
         self.encoder = PointTransformerEncoder(
             token_dim=token_dim,
