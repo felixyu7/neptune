@@ -4,6 +4,7 @@ Dataloaders package for Neptune training examples.
 Contains dataset implementations for different neutrino detection experiments:
 - Prometheus: Simulated data with summary statistics
 - IceCube: Real detector data with pulse-level information
+- IceCube Transformer: IceCube data formatted as sequences for transformer models
 """
 
 from .data_utils import (

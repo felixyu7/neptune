@@ -38,11 +38,6 @@ class LightweightPointSelector(nn.Module):
             nn.ReLU(inplace=True),
             nn.Linear(token_dim // 2, 1)
         )
-        # Initialize with smaller weights to prevent extreme scores
-        for layer in self.importance_head:
-            if isinstance(layer, nn.Linear):
-                nn.init.normal_(layer.weight, mean=0.0, std=0.02)
-                nn.init.zeros_(layer.bias)
 
     def forward(self, coordinates: torch.Tensor, features: torch.Tensor):
         """
@@ -105,10 +100,33 @@ class LightweightPointSelector(nn.Module):
                 selected_coords = pts_coords   # [M, 4]
                 num_valid = M
             else:
-                # Select top-k most important points
-                _, topk_indices = torch.topk(batch_scores, self.max_tokens, largest=True)
-                selected_feats = pts_features[topk_indices]  # [max_tokens, token_dim]
-                selected_coords = pts_coords[topk_indices]   # [max_tokens, 4]
+                # Differentiable selection using straight-through estimator
+                if self.training:
+                    # Training: straight-through estimator for differentiable top-k
+                    
+                    # 1. Hard selection (forward pass - discrete)
+                    _, topk_indices = torch.topk(batch_scores, self.max_tokens, largest=True)
+                    selected_feats_hard = pts_features[topk_indices]  # [max_tokens, token_dim]
+                    selected_coords_hard = pts_coords[topk_indices]   # [max_tokens, 4]
+                    
+                    # 2. Soft selection (backward pass - differentiable)
+                    soft_weights = torch.softmax(batch_scores / self.tau, dim=0)  # [M]
+                    selected_feats_soft = torch.matmul(soft_weights.unsqueeze(0), pts_features).squeeze(0)  # [token_dim]
+                    selected_coords_soft = torch.matmul(soft_weights.unsqueeze(0), pts_coords).squeeze(0)   # [4]
+                    
+                    # Expand to match hard selection shape
+                    selected_feats_soft = selected_feats_soft.unsqueeze(0).expand(self.max_tokens, -1)
+                    selected_coords_soft = selected_coords_soft.unsqueeze(0).expand(self.max_tokens, -1)
+                    
+                    # 3. Combine using straight-through trick
+                    # Note: detach() only affects the soft part, preserving gradients through soft_weights
+                    selected_feats = selected_feats_hard + selected_feats_soft - selected_feats_soft.detach()
+                    selected_coords = selected_coords_hard + selected_coords_soft - selected_coords_soft.detach()
+                else:
+                    # Inference: use standard top-k for efficiency
+                    _, topk_indices = torch.topk(batch_scores, self.max_tokens, largest=True)
+                    selected_feats = pts_features[topk_indices]  # [max_tokens, token_dim]
+                    selected_coords = pts_coords[topk_indices]   # [max_tokens, 4]
                 num_valid = self.max_tokens
 
             # Sort selected tokens by time
