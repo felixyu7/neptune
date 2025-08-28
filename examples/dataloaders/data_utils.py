@@ -2,9 +2,10 @@
 Shared data utilities for all dataloaders.
 
 Contains common components used by different dataset implementations:
-- Sampling strategies for parquet files
+- Sampling strategies for parquet files (IceCube)
 - Collation functions for irregular data
 - Coordinate batching utilities
+- Hit grouping utilities
 """
 
 import os

@@ -1,70 +1,114 @@
 """
 Prometheus dataset implementation for Neptune training.
 
-Handles Prometheus neutrino simulation data with nested photon information
-and processes it using summary statistics for efficient training.
+Handles Prometheus neutrino simulation data with memory-mapped files
+for fast data loading and processes it using summary statistics for efficient training.
 """
 
 import os
+import pickle
+import struct
 import torch
 import numpy as np
-import awkward as ak
-import pyarrow.parquet as pq
 import nt_summary_stats
-from torch.utils.data import DataLoader
-from typing import List, Tuple, Optional
+from torch.utils.data import DataLoader, RandomSampler
+from typing import Tuple
 
-from .data_utils import get_file_names, ParquetFileSampler, IrregularDataCollator, group_hits_by_window
+from .data_utils import IrregularDataCollator
+
+
+def load_ntmmap(input_path: str) -> Tuple[np.memmap, np.memmap, np.dtype]:
+    """
+    Load memory-mapped files with automatic dtype detection (format with headers).
+    
+    Args:
+        input_path: Base path for input files (without extension)
+        
+    Returns:
+        Tuple of (index_mmap, data_mmap, photon_dtype)
+    """
+    idx_path = f"{input_path}.idx"
+    dat_path = f"{input_path}.dat"
+    
+    if not os.path.exists(idx_path) or not os.path.exists(dat_path):
+        raise FileNotFoundError(f"Memory-mapped files not found: {input_path}")
+    
+    # Load index file with header
+    with open(idx_path, 'rb') as f:
+        dtype_size = struct.unpack('<I', f.read(4))[0]
+        event_dtype = pickle.loads(f.read(dtype_size))
+        data_start = f.tell()
+    
+    index_mmap = np.memmap(idx_path, dtype=event_dtype, mode='r', offset=data_start)
+    
+    # Load data file with header
+    with open(dat_path, 'rb') as f:
+        dtype_size = struct.unpack('<I', f.read(4))[0]
+        photon_dtype = pickle.loads(f.read(dtype_size))
+        data_start = f.tell()
+    
+    # Memory map photons as structured array (not raw bytes)
+    photons_array = np.memmap(dat_path, dtype=photon_dtype, mode='r', offset=data_start)
+    
+    return index_mmap, photons_array, photon_dtype
+
+
+def get_event_photons(photons_array: np.memmap, event_record: np.ndarray) -> np.ndarray:
+    """
+    Extract photons for a specific event using photon indices.
+    
+    Args:
+        photons_array: Memory-mapped photon array (structured)
+        event_record: Single EventRecord
+        
+    Returns:
+        Array of PhotonHit records
+    """
+    start_idx = int(event_record['photon_start_idx'])
+    end_idx = int(event_record['photon_end_idx'])
+    
+    if start_idx >= end_idx:
+        # Return empty array with correct dtype
+        return np.array([], dtype=photons_array.dtype)
+    
+    # Direct array slicing
+    return photons_array[start_idx:end_idx]
 
 
 class PrometheusDataset(torch.utils.data.Dataset):
-    """Dataset class for Prometheus data."""
+    """Memory-mapped dataset class for Prometheus data."""
     
-    def __init__(self, files, use_summary_stats=True):
-        self.files = files
+    def __init__(self, mmap_path, use_summary_stats=True):
+        self.mmap_path = mmap_path
         self.use_summary_stats = use_summary_stats
         
-        # Count number of events in each file
-        num_events = []
-        for file in self.files:
-            data = pq.ParquetFile(file)
-            num_events.append(data.metadata.num_rows)
-        
-        # Create cumulative lengths for sampling
-        self.cumulative_lengths = np.concatenate([[0], np.cumsum(num_events)])
-        self.total_events = sum(num_events)
-        
-        # Cache for the currently loaded file
-        self._cached_file_idx = None
-        self._cached_table = None
+        # Load memory-mapped files
+        self.events, self.photons_array, self.photon_dtype = load_ntmmap(mmap_path)
+        self.total_events = len(self.events)
         
     def __len__(self):
         return self.total_events
     
     def __getitem__(self, idx):
-        # Determine which file this index belongs to
-        file_idx = np.searchsorted(self.cumulative_lengths[1:], idx, side='right')
-        local_idx = idx - self.cumulative_lengths[file_idx]
-        
-        # Load data from the appropriate file (with caching)
-        if self._cached_file_idx != file_idx:
-            data = pq.ParquetFile(self.files[file_idx])
-            row_group = data.read_row_group(0)  # Assume single row group for simplicity
-            self._cached_table = row_group.to_pandas()
-            self._cached_file_idx = file_idx
-        
-        table = self._cached_table
-        
-        # Extract event data
-        event_data = table.iloc[local_idx]
-        
-        # Extract photon hit data from the nested structure
-        photons = event_data['photons']
-        mc_truth = event_data['mc_truth']
+        # Get event record and photons directly from memory-mapped arrays
+        event_record = self.events[idx]
+        photons = get_event_photons(self.photons_array, event_record)
         
         if self.use_summary_stats:
+            # Convert structured photon array to dictionary format for nt-summary-stats
+            photons_dict = {
+                'sensor_pos_x': photons['x'],
+                'sensor_pos_y': photons['y'],
+                'sensor_pos_z': photons['z'],
+                't': photons['t'],
+                'charge': photons['charge'], 
+                'string_id': photons['string_id'],
+                'sensor_id': photons['sensor_id'],
+                'id_idx': photons['id_idx']
+            }
+            
             # Summary stats mode: Use nt-summary-stats to process the event and get sensor-level features
-            sensor_positions, sensor_stats = nt_summary_stats.process_prometheus_event(photons)
+            sensor_positions, sensor_stats = nt_summary_stats.process_prometheus_event(photons_dict)
 
             # Create 4D coordinates: x, y, z, t (using time_mean for t)
             pos = np.column_stack([
@@ -79,66 +123,17 @@ class PrometheusDataset(torch.utils.data.Dataset):
             feats = sensor_stats.astype(np.float32)
             feats = np.log(feats + 1)
         else:
-            pos = np.array([photons['sensor_pos_x'],
-                            photons['sensor_pos_y'],
-                            photons['sensor_pos_z'],
-                            photons['t']]).T
+            pos = np.column_stack([photons['x'], photons['y'], photons['z'], photons['t']])
             pos = np.trunc(pos)
             pos, feats = np.unique(pos, return_counts=True, axis=0)
             
             pos = pos / 1000.
             feats = np.log(feats + 1).reshape(-1, 1)
-
-            # # Pulse mode: Group hits by window and create pulses
-            # pulse_positions = []
-            # pulse_features = []
-            
-            # # Extract photon data arrays
-            # sensor_ids = photons['sensor_id']
-            # times = photons['t']
-            # sensor_pos_x = photons['sensor_pos_x']
-            # sensor_pos_y = photons['sensor_pos_y'] 
-            # sensor_pos_z = photons['sensor_pos_z']
-            
-            # # Group photons by sensor
-            # sensors = {}
-            # for i in range(len(sensor_ids)):
-            #     sensor_id = sensor_ids[i]
-            #     if sensor_id not in sensors:
-            #         sensors[sensor_id] = {
-            #             'times': [], 
-            #             'charges': [],  # Use constant charge of 1.0 for each hit
-            #             'position': [sensor_pos_x[i], sensor_pos_y[i], sensor_pos_z[i]]
-            #         }
-            #     sensors[sensor_id]['times'].append(times[i])
-            #     sensors[sensor_id]['charges'].append(1.0)  # Each photon hit has charge 1.0
-            
-            # # Process each sensor to create pulses
-            # for sensor_id, sensor_data in sensors.items():
-            #     hit_times = np.array(sensor_data['times'])
-            #     hit_charges = np.array(sensor_data['charges'])
-
-            #     # Group hits by 3ns window
-            #     pulse_times, pulse_charges = group_hits_by_window(hit_times, hit_charges, window_ns=3.0)
-                
-            #     # Create position for each pulse (x, y, z, pulse_time)
-            #     sensor_pos = sensor_data['position']
-            #     for p_time, p_charge in zip(pulse_times, pulse_charges):
-            #         pulse_positions.append([sensor_pos[0], sensor_pos[1], sensor_pos[2], p_time])
-            #         pulse_features.append([p_time, p_charge])
-            
-            # # Convert to numpy arrays
-            # pos = np.array(pulse_positions, dtype=np.float32)
-            # pos = pos / 1000. # convert to km / microseconds
-            
-            # # Features are just [time, charge] for each pulse
-            # feats = np.array(pulse_features, dtype=np.float32)
-            # feats = np.log(feats + 1)
         
-        # Extract labels from mc_truth (keep raw zenith/azimuth; log-transform energy)
-        initial_zenith = mc_truth['initial_state_zenith']
-        initial_azimuth = mc_truth['initial_state_azimuth']
-        initial_energy = mc_truth.get('initial_state_energy', 0.0)
+        # Extract labels from event record (keep raw zenith/azimuth; log-transform energy)
+        initial_zenith = event_record['initial_zenith']
+        initial_azimuth = event_record['initial_azimuth']
+        initial_energy = event_record['initial_energy']
         log_energy = np.log10(max(initial_energy, 1e-6))
         
         # Convert spherical to Cartesian direction using raw angles
@@ -155,38 +150,20 @@ class PrometheusDataset(torch.utils.data.Dataset):
 def create_prometheus_dataloaders(cfg):
     """Create train and validation dataloaders for Prometheus data from config."""
     
-    # Create datasets
-    train_files = get_file_names(
-        cfg['data_options']['train_data_files'], 
-        cfg['data_options']['train_data_file_ranges'],
-        cfg['data_options']['shuffle_files']
-    )
+    # Create datasets with memory-mapped files
     train_dataset = PrometheusDataset(
-        train_files,
+        cfg['data_options']['train_data_path'],
         cfg['data_options'].get('use_summary_stats', True)
     )
     
-    valid_files = get_file_names(
-        cfg['data_options']['valid_data_files'], 
-        cfg['data_options']['valid_data_file_ranges'],
-        cfg['data_options']['shuffle_files']
-    )
     valid_dataset = PrometheusDataset(
-        valid_files,
+        cfg['data_options']['valid_data_path'],
         cfg['data_options'].get('use_summary_stats', True)
     )
     
-    # Create samplers
-    train_sampler = ParquetFileSampler(
-        train_dataset, 
-        train_dataset.cumulative_lengths, 
-        cfg['training_options']['batch_size']
-    )
-    val_sampler = ParquetFileSampler(
-        valid_dataset, 
-        valid_dataset.cumulative_lengths, 
-        cfg['training_options']['batch_size']
-    )
+    # Create samplers - use standard RandomSampler since memory-mapped data doesn't need file-aware batching
+    train_sampler = RandomSampler(train_dataset)
+    val_sampler = None  # Use sequential sampling for validation
     
     # Create dataloaders
     collate_fn = IrregularDataCollator()

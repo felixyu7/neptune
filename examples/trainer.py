@@ -5,11 +5,41 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from pathlib import Path
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List, Tuple
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from loss_functions import AngularDistanceLoss, VonMisesFisherLoss, GaussianNLLLoss
+
+
+class OverfitDataLoader:
+    """Wrapper that limits dataloader to first N batches for overfitting experiments."""
+    
+    def __init__(self, dataloader: DataLoader, num_batches: int):
+        self.dataloader = dataloader
+        self.num_batches = num_batches
+        self._batches_cache = []
+        self._cache_loaded = False
+    
+    def _load_cache(self):
+        """Load and cache the first num_batches for consistent overfitting."""
+        if self._cache_loaded:
+            return
+        
+        self._batches_cache = []
+        for i, batch in enumerate(self.dataloader):
+            if i >= self.num_batches:
+                break
+            self._batches_cache.append(batch)
+        self._cache_loaded = True
+        print(f"Cached {len(self._batches_cache)} batches for overfitting")
+    
+    def __iter__(self):
+        self._load_cache()
+        return iter(self._batches_cache)
+    
+    def __len__(self):
+        return min(self.num_batches, len(self.dataloader))
 
 
 class Trainer:
@@ -64,6 +94,9 @@ class Trainer:
         # Training state
         self.current_epoch = 0
         self.best_val_loss = float('inf')
+        
+        # Overfit settings
+        self.overfit_batches = training_opts.get('overfit_batches', None)
         
         
     def get_loss_function(self):
@@ -179,7 +212,6 @@ class Trainer:
                     'train_loss': loss.item(),
                     'learning_rate': self.scheduler.get_last_lr()[0]
                 }
-                
                 self.log_metrics(metrics, step)
         
         return {'train_loss': running_loss / num_batches}
@@ -228,6 +260,10 @@ class Trainer:
         return metrics
     
     def save_checkpoint(self, metrics: Dict[str, float], is_best: bool = False, is_final: bool = False):
+        # Skip checkpoint saving in overfit mode
+        if self.overfit_batches is not None:
+            return
+            
         checkpoint = {
             'epoch': self.current_epoch,
             'model_state_dict': self.model.state_dict(),
@@ -286,10 +322,28 @@ class Trainer:
             if self.scaler is not None and 'scaler_state_dict' in checkpoint:
                 self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
     
+    def prepare_overfit_dataloaders(self, train_loader: DataLoader, val_loader: DataLoader) -> Tuple[DataLoader, DataLoader]:
+        """Prepare dataloaders for overfitting experiments by limiting to specified number of batches."""
+        if self.overfit_batches is None:
+            return train_loader, val_loader
+        
+        print(f"Setting up overfit mode with {self.overfit_batches} batches")
+        
+        # Create overfit dataloaders that use the same batches for train and val
+        overfit_train_loader = OverfitDataLoader(train_loader, self.overfit_batches)
+        overfit_val_loader = overfit_train_loader  # Use same batches for validation
+        
+        return overfit_train_loader, overfit_val_loader
+    
     def fit(self, train_loader: DataLoader, val_loader: DataLoader):
+        # Prepare dataloaders for overfit mode if specified
+        train_loader, val_loader = self.prepare_overfit_dataloaders(train_loader, val_loader)
+        
         print(f"Starting training for {self.epochs} epochs...")
         print(f"Model parameters: {sum(p.numel() for p in self.model.parameters()):,}")
-        
+        if self.overfit_batches:
+            print(f"OVERFIT MODE: Using {self.overfit_batches} batches (train and val are identical)")
+            print("OVERFIT MODE: Checkpoint saving disabled")
         
         print()
         start_time = time.time()

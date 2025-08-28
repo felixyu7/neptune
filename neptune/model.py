@@ -176,7 +176,6 @@ class PointTransformerEncoder(nn.Module):
         )
         self.layers = NeptuneTransformerEncoder(encoder_layer, num_layers=num_layers)
         
-        
         # Output normalization
         self.norm = nn.RMSNorm(token_dim)
     
