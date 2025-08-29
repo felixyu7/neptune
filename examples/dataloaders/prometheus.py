@@ -12,7 +12,7 @@ import torch
 import numpy as np
 import nt_summary_stats
 from torch.utils.data import DataLoader, RandomSampler
-from typing import Tuple
+from typing import Tuple, List, Union
 
 from .data_utils import IrregularDataCollator
 
@@ -76,23 +76,46 @@ def get_event_photons(photons_array: np.memmap, event_record: np.ndarray) -> np.
 
 
 class PrometheusDataset(torch.utils.data.Dataset):
-    """Memory-mapped dataset class for Prometheus data."""
+    """Memory-mapped dataset class for Prometheus data supporting multiple file sets."""
     
-    def __init__(self, mmap_path, use_summary_stats=True):
-        self.mmap_path = mmap_path
+    def __init__(self, mmap_paths: Union[str, List[str]], use_summary_stats=True):
         self.use_summary_stats = use_summary_stats
         
-        # Load memory-mapped files
-        self.events, self.photons_array, self.photon_dtype = load_ntmmap(mmap_path)
-        self.total_events = len(self.events)
+        # Handle both single path (backward compatibility) and multiple paths
+        if isinstance(mmap_paths, str):
+            mmap_paths = [mmap_paths]
+        
+        self.datasets = []
+        self.cumulative_lengths = []
+        total_length = 0
+        
+        # Load all memory-mapped file sets
+        for path in mmap_paths:
+            events, photons_array, photon_dtype = load_ntmmap(path)
+            self.datasets.append((events, photons_array))
+            total_length += len(events)
+            self.cumulative_lengths.append(total_length)
+        
+        self.total_events = total_length
+        self.photon_dtype = photon_dtype  # All datasets should have same dtype
         
     def __len__(self):
         return self.total_events
     
     def __getitem__(self, idx):
-        # Get event record and photons directly from memory-mapped arrays
-        event_record = self.events[idx]
-        photons = get_event_photons(self.photons_array, event_record)
+        # Find which dataset contains this global index
+        dataset_idx = np.searchsorted(self.cumulative_lengths, idx + 1)
+        
+        # Calculate local index within the dataset
+        if dataset_idx == 0:
+            local_idx = idx
+        else:
+            local_idx = idx - self.cumulative_lengths[dataset_idx - 1]
+        
+        # Get data from the appropriate dataset
+        events, photons_array = self.datasets[dataset_idx]
+        event_record = events[local_idx]
+        photons = get_event_photons(photons_array, event_record)
         
         if self.use_summary_stats:
             # Convert structured photon array to dictionary format for nt-summary-stats
@@ -141,16 +164,24 @@ class PrometheusDataset(torch.utils.data.Dataset):
         dir_y = np.sin(initial_zenith) * np.sin(initial_azimuth)
         dir_z = np.cos(initial_zenith)
         
+        # get the particle id
+        pid = event_record['final_type'][0]
+        
         # Labels: [log_energy, dir_x, dir_y, dir_z]
-        labels = np.array([log_energy, dir_x, dir_y, dir_z], dtype=np.float32)
+        labels = np.array([log_energy, dir_x, dir_y, dir_z, pid], dtype=np.float32)
         
         return pos, feats, labels
 
 
 def create_prometheus_dataloaders(cfg):
-    """Create train and validation dataloaders for Prometheus data from config."""
+    """Create train and validation dataloaders for Prometheus data from config.
     
-    # Create datasets with memory-mapped files
+    Config supports both single paths (backward compatibility) and lists of paths:
+    - train_data_path: str or List[str] - path(s) to training mmap files
+    - valid_data_path: str or List[str] - path(s) to validation mmap files
+    """
+    
+    # Create datasets with memory-mapped files (supports both single and multiple paths)
     train_dataset = PrometheusDataset(
         cfg['data_options']['train_data_path'],
         cfg['data_options'].get('use_summary_stats', True)
