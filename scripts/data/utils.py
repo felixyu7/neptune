@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from torch.utils.data import RandomSampler
 from torch.utils.data.sampler import Sampler
-from typing import Tuple, List, Dict, Any, Optional, Iterator, Sized
+from typing import Tuple, List, Dict, Any, Optional, Iterator, Sized, Union
 
 
 def load_ntmmap(input_path: str) -> Tuple[np.memmap, np.memmap, np.dtype]:
@@ -59,48 +59,77 @@ class IrregularDataCollator:
     def __init__(self, max_points_per_event: int = 5000):
         self.max_points_per_event = max_points_per_event
     
-    def __call__(self, batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
+    def __call__(self, batch: List[Union[Tuple[Any, Any, Any], Dict[str, Any]]]) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Collate batch of events into tensors.
+        Collate a batch of variable-length events into concatenated tensors suitable for point-cloud models.
         
-        Args:
-            batch: List of dicts with 'coords', 'features', 'targets', etc.
-            
-        Returns:
-            Dictionary with batched tensors including batch indices
+        Input sample format (supported):
+        - Tuple: (coords [N,4], features [N,F], labels [L])
+        - Dict: keys 'coords', 'features', and one of 'labels' | 'targets' | 'target'
+        
+        Output:
+        - coords_b: [sum_i N_i, 1+4] where column 0 is batch index, then x,y,z,t
+        - features_b: [sum_i N_i, F]
+        - labels_b: [B, L]
         """
-        batch_coords = []
-        batch_features = []
-        batch_targets = []
+        batch_coords: List[np.ndarray] = []
+        batch_features: List[np.ndarray] = []
+        batch_labels: List[np.ndarray] = []
         
         for batch_idx, event in enumerate(batch):
-            coords = event['coords']  # [N, 4] -> [x, y, z, t]
-            features = event['features']  # [N, F]
+            if isinstance(event, dict):
+                coords = event.get('coords')
+                features = event.get('features')
+                labels = event.get('labels', None)
+                if labels is None:
+                    labels = event.get('targets', None)
+                if labels is None:
+                    labels = event.get('target', None)
+                if coords is None or features is None or labels is None:
+                    raise KeyError("Each dict sample must include 'coords', 'features', and 'labels'/'targets'/'target'")
+            else:
+                try:
+                    coords, features, labels = event
+                except Exception as e:
+                    raise TypeError(f"Each sample must be a tuple (coords, features, labels) or a dict. Got: {type(event)}") from e
+            
+            coords = np.asarray(coords, dtype=np.float32)
+            features = np.asarray(features, dtype=np.float32)
+            labels = np.asarray(labels, dtype=np.float32)
             
             # Subsample if too many points
-            if len(coords) > self.max_points_per_event:
-                indices = np.random.choice(len(coords), self.max_points_per_event, replace=False)
+            if coords.shape[0] > self.max_points_per_event:
+                indices = np.random.choice(coords.shape[0], self.max_points_per_event, replace=False)
                 coords = coords[indices]
                 features = features[indices]
             
-            # Add batch index as first column
-            batch_indices = np.full((len(coords), 1), batch_idx, dtype=np.float32)
-            coords_with_batch = np.concatenate([batch_indices, coords], axis=1)
+            # Add batch index as first column to coords
+            batch_indices = np.full((coords.shape[0], 1), batch_idx, dtype=np.float32)
+            coords_with_batch = np.concatenate([batch_indices, coords], axis=1)  # [N, 1+4]
             
             batch_coords.append(coords_with_batch)
             batch_features.append(features)
-            batch_targets.append(event['target'])
+            batch_labels.append(labels)
         
-        # Concatenate all events
-        all_coords = np.vstack(batch_coords) if batch_coords else np.empty((0, 5))
-        all_features = np.vstack(batch_features) if batch_features else np.empty((0, features.shape[-1]))
-        all_targets = np.array(batch_targets) if batch_targets else np.empty((0,))
+        # Concatenate along point dimension; stack labels per event
+        if not batch_coords:
+            # Should not happen with DataLoader, but keep safe defaults
+            coords_b = torch.empty((0, 5), dtype=torch.float32)
+            features_b = torch.empty((0, 0), dtype=torch.float32)
+            labels_b = torch.empty((0,), dtype=torch.float32)
+        else:
+            coords_b = torch.from_numpy(np.vstack(batch_coords)).float()
+            features_b = torch.from_numpy(np.vstack(batch_features)).float()
+            # Ensure labels shape [B, L]
+            try:
+                labels_np = np.stack(batch_labels, axis=0).astype(np.float32)
+            except ValueError:
+                # Fallback if labels already arrays with consistent shapes but np.stack failed due to object dtype
+                labels_np = np.array(batch_labels, dtype=np.float32)
+            labels_b = torch.from_numpy(labels_np).float()
         
-        return {
-            'coords': torch.from_numpy(all_coords).float(),
-            'features': torch.from_numpy(all_features).float(),
-            'targets': torch.from_numpy(all_targets).float()
-        }
+        # Return tuple to match trainer expectations
+        return coords_b, features_b, labels_b
 
 
 def batched_coordinates(coords: np.ndarray, batch_size: int) -> np.ndarray:

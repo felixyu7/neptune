@@ -79,7 +79,7 @@ class Trainer:
         
         # Setup mixed precision
         self.use_amp = self.precision in ['16-mixed', 'bf16-mixed'] and device.type == 'cuda'
-        self.scaler = torch.cuda.amp.GradScaler() if self.use_amp else None
+        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
         
         # Setup logging
         self.save_dir = Path(cfg['project_save_dir'])
@@ -180,7 +180,7 @@ class Trainer:
             
             # Forward pass with mixed precision
             if self.use_amp:
-                with torch.cuda.amp.autocast():
+                with torch.amp.autocast('cuda'):
                     preds = self.model(coords, features)
                     loss = loss_fn(preds, labels)
                 

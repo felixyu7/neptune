@@ -183,7 +183,6 @@ class MmapDataset(torch.utils.data.Dataset):
             pid = event_record['initial_type']
             labels = np.array([log_energy, dir_x, dir_y, dir_z, pid], dtype=np.float32)
         else:
-            interaction_type = event_record['interaction']
-            labels = np.array([log_energy, dir_x, dir_y, dir_z, interaction_type], dtype=np.float32)
+            labels = np.array([log_energy, dir_x, dir_y, dir_z], dtype=np.float32)
 
         return pos, feats, labels
