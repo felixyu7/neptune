@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+import time
+from contextlib import nullcontext
 
 from loss_functions import AngularDistanceLoss, VonMisesFisherLoss, GaussianNLLLoss
 
@@ -55,8 +57,11 @@ class Trainer:
         self.lr = training_opts['lr']
         self.weight_decay = training_opts['weight_decay']
         self.batch_size = training_opts['batch_size']
-        self.precision = training_opts.get('precision', 'fp32')
+        # Precision options
+        self.precision = training_opts.get('precision', 'fp32').lower()
+        self.test_precision = training_opts.get('test_precision', self.precision).lower()
         self.save_epochs = training_opts.get('save_epochs', 5)
+        self.grad_clip = training_opts.get('grad_clip', 1.0)
         
         # Model options
         model_opts = cfg['model_options']
@@ -77,9 +82,32 @@ class Trainer:
             eta_min=1e-7
         )
         
-        # Setup mixed precision
-        self.use_amp = self.precision in ['16-mixed', 'bf16-mixed'] and device.type == 'cuda'
-        self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
+        # Setup mixed precision (fp16 or bf16)
+        def _precision_to_dtype(p: str) -> Optional[torch.dtype]:
+            if 'bf16' in p:
+                return torch.bfloat16
+            if p.startswith('16'):
+                return torch.float16
+            return None
+
+        self.amp_device = 'cuda' if device.type == 'cuda' else ('cpu' if device.type == 'cpu' else None)
+        self.amp_dtype = _precision_to_dtype(self.precision)
+
+        # Fallback if CUDA bf16 not supported
+        if self.amp_device == 'cuda' and self.amp_dtype is torch.bfloat16:
+            if not torch.cuda.is_bf16_supported():
+                print('Warning: CUDA bf16 is not supported on this device. Falling back to fp16 mixed precision.')
+                self.amp_dtype = torch.float16
+
+        self.use_amp = (self.amp_device is not None) and (self.amp_dtype is not None)
+        # GradScaler only for fp16 on CUDA
+        if self.use_amp:
+            self.scaler = torch.amp.GradScaler(
+                self.amp_device,
+                enabled=(self.amp_device == 'cuda' and self.amp_dtype is torch.float16)
+            )
+        else:
+            self.scaler = None
         
         # Setup logging
         self.save_dir = Path(cfg['project_save_dir'])
@@ -90,6 +118,7 @@ class Trainer:
         if not use_wandb:
             self.csv_file = self.save_dir / 'metrics.csv'
             self.csv_writer = None
+            self.csv_file_handle = None
             
         # Training state
         self.current_epoch = 0
@@ -152,14 +181,14 @@ class Trainer:
                 all_fields.append('val_loss')
                 
                 self.csv_file.parent.mkdir(parents=True, exist_ok=True)
-                csv_file = open(self.csv_file, 'w', newline='')
-                self.csv_writer = csv.DictWriter(csv_file, fieldnames=all_fields, extrasaction='ignore')
+                self.csv_file_handle = open(self.csv_file, 'w', newline='')
+                self.csv_writer = csv.DictWriter(self.csv_file_handle, fieldnames=all_fields, extrasaction='ignore')
                 self.csv_writer.writeheader()
             
             row = {'epoch': self.current_epoch, 'step': step or 0}
             row.update(metrics)
             self.csv_writer.writerow(row)
-            self.csv_file.parent.joinpath(self.csv_file.name).open('a').flush()
+            self.csv_file_handle.flush()
     
     def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
         self.model.train()
@@ -179,19 +208,30 @@ class Trainer:
             self.optimizer.zero_grad()
             
             # Forward pass with mixed precision
-            if self.use_amp:
-                with torch.amp.autocast('cuda'):
-                    preds = self.model(coords, features)
-                    loss = loss_fn(preds, labels)
-                
+            amp_ctx = torch.amp.autocast(self.amp_device, dtype=self.amp_dtype) if self.use_amp else nullcontext()
+            with amp_ctx:
+                preds = self.model(coords, features)
+                extras = None
+                if isinstance(preds, tuple):
+                    preds, extras = preds
+                loss = loss_fn(preds, labels)
+                # Add feature-transform regularizer if present
+                if extras and 'feat_reg' in extras:
+                    lam = self.cfg.get('model_options', {}).get('feat_reg_weight', 0.001)
+                    loss = loss + lam * extras['feat_reg']
+
+            # Backward + step (scale only if enabled)
+            if self.scaler is not None and self.scaler.is_enabled():
                 self.scaler.scale(loss).backward()
+                if self.grad_clip > 0:
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.scaler.step(self.optimizer)
                 self.scaler.update()
             else:
-                preds = self.model(coords, features)
-                loss = loss_fn(preds, labels)
-                
                 loss.backward()
+                if self.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
                 self.optimizer.step()
             
                 
@@ -216,32 +256,72 @@ class Trainer:
         
         return {'train_loss': running_loss / num_batches}
     
-    def validate(self, val_loader: DataLoader, save_predictions: bool = False) -> Dict[str, float]:
+    def validate(self, val_loader: DataLoader, save_predictions: bool = False, profile: bool = False) -> Dict[str, float]:
         self.model.eval()
         total_loss = 0.0
-        all_preds = []
-        all_labels = []
+        all_preds, all_labels = [], []
         loss_fn = self.get_loss_function()
+        
+        forward_pass_times = []
+        if profile and self.device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats(self.device)
+        
+        total_start_time = time.time()
         
         with torch.no_grad():
             # Create progress bar for validation
             val_pbar = tqdm(val_loader, desc='Validation', leave=False, dynamic_ncols=True)
             for coords, features, labels in val_pbar:
-                coords = coords.to(self.device)
-                features = features.to(self.device)
-                labels = labels.to(self.device)
+                coords, features, labels = coords.to(self.device), features.to(self.device), labels.to(self.device)
                 
-                preds = self.model(coords, features)
+                eval_precision = self.test_precision
+                def _precision_to_dtype_eval(p: str) -> Optional[torch.dtype]:
+                    return {'bf16': torch.bfloat16, '16': torch.float16}.get(p)
+                
+                eval_amp_device = 'cuda' if self.device.type == 'cuda' else 'cpu'
+                eval_amp_dtype = _precision_to_dtype_eval(eval_precision)
+                if eval_amp_device == 'cuda' and eval_amp_dtype is torch.bfloat16 and not torch.cuda.is_bf16_supported():
+                    eval_amp_dtype = torch.float16
+                
+                eval_use_amp = eval_amp_dtype is not None
+                eval_ctx = torch.amp.autocast(eval_amp_device, dtype=eval_amp_dtype) if eval_use_amp else nullcontext()
+
+                with eval_ctx:
+                    forward_start_time = time.time()
+                    preds = self.model(coords, features)
+                    if self.device.type == 'cuda': torch.cuda.synchronize()
+                    forward_end_time = time.time()
+                    if profile:
+                        forward_pass_times.append(forward_end_time - forward_start_time)
+
+                extras = None
+                if isinstance(preds, tuple): preds, extras = preds
+                
                 loss = loss_fn(preds, labels)
+                if extras and 'feat_reg' in extras:
+                    loss += self.cfg.get('model_options', {}).get('feat_reg_weight', 0.001) * extras['feat_reg']
                 
                 total_loss += loss.item()
                 all_preds.append(preds.cpu())
                 all_labels.append(labels.cpu())
-                
-                # Update validation progress bar
                 val_pbar.set_postfix({'Val Loss': f'{loss.item():.6f}'})
         
-        # Compute overall metrics
+        total_end_time = time.time()
+
+        if profile:
+            total_runtime = total_end_time - total_start_time
+            total_forward_time = sum(forward_pass_times)
+            avg_forward_time = total_forward_time / len(forward_pass_times) if forward_pass_times else 0
+            
+            print("\n--- Inference Profiling Report ---")
+            print(f"Total inference runtime (incl. I/O): {total_runtime:.4f} seconds")
+            print(f"Total forward pass runtime:             {total_forward_time:.4f} seconds")
+            print(f"Average forward pass runtime per batch: {avg_forward_time * 1000:.4f} ms")
+            if self.device.type == 'cuda':
+                peak_mem_gb = torch.cuda.max_memory_allocated(self.device) / (1024**3)
+                print(f"Peak CUDA memory usage:                 {peak_mem_gb:.4f} GB")
+            print("----------------------------------\n")
+
         all_preds = torch.cat(all_preds, dim=0)
         all_labels = torch.cat(all_labels, dim=0)
         
@@ -249,7 +329,7 @@ class Trainer:
         if save_predictions:
             predictions_file = self.save_dir / 'results.npz'
             
-            np.savez(predictions_file, predictions=all_preds.numpy(), labels=all_labels.numpy())
+            np.savez(predictions_file, predictions=all_preds.float().numpy(), labels=all_labels.float().numpy())
             
             print(f"Saved predictions and labels to: {predictions_file}")
         
@@ -279,10 +359,10 @@ class Trainer:
         # Regular checkpoint
         if self.current_epoch % self.save_epochs == 0 or is_final:
             if is_final:
-                checkpoint_path = self.checkpoint_dir / 'neptune-final.pt'
+                checkpoint_path = self.checkpoint_dir / f'final-checkpoint-{time.strftime("%Y%m%d-%H%M%S")}.pt'
                 artifact_suffix = 'final-checkpoint'
             else:
-                checkpoint_path = self.checkpoint_dir / f'neptune-epoch-{self.current_epoch:02d}.pt'
+                checkpoint_path = self.checkpoint_dir / f'epoch-{self.current_epoch:02d}-checkpoint-{time.strftime("%Y%m%d-%H%M%S")}.pt'
                 artifact_suffix = 'checkpoint'
                 
             torch.save(checkpoint, checkpoint_path)
@@ -306,7 +386,7 @@ class Trainer:
         
         # Best model checkpoint
         if is_best:
-            best_path = self.checkpoint_dir / 'neptune-best.pt'
+            best_path = self.checkpoint_dir / 'best-checkpoint.pt'
             torch.save(checkpoint, best_path)
             print(f'Best model saved: {best_path}')
     
@@ -399,7 +479,7 @@ class Trainer:
     
     def test(self, test_loader: DataLoader):
         print("Running test evaluation...")
-        test_metrics = self.validate(test_loader, save_predictions=True)
+        test_metrics = self.validate(test_loader, save_predictions=True, profile=True)
         
         print("Test Results:")
         for key, value in test_metrics.items():

@@ -162,10 +162,12 @@ class MmapDataset(torch.utils.data.Dataset):
             feats = sensor_stats.astype(np.float32)
             feats = np.log(feats + 1)
         else:
-            # pulse-level
+            # pulse-level: always use time and charge as features
             pos = np.column_stack([photons['x'], photons['y'], photons['z'], photons['t']])
             pos = pos / 1000.
-            feats = np.log(photons['charge'] + 1).reshape(-1, 1)
+            charge_feat = np.log(photons['charge'] + 1).reshape(-1, 1).astype(np.float32)
+            time_feat = pos[:, 3:4].astype(np.float32)
+            feats = np.concatenate([time_feat, charge_feat], axis=1)
 
         # Extract labels
         initial_zenith = event_record['initial_zenith']
