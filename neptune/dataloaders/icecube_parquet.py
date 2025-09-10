@@ -26,7 +26,11 @@ class ICParquetDataModule(pl.LightningDataModule):
         
         self.use_pulse_series = self.data_options['use_pulse_series']
         self.use_latent_representation = self.data_options['use_latent_representation']
-        
+
+        self.use_morphology_hack = False
+        if 'use_morphology_hack' in self.data_options.keys() and self.data_options['use_morphology_hack']:
+            self.use_morphology_hack = True
+
         if 'geo_inverse_dict_path' in self.data_options.keys():
             self.geo_inverse_dict_path = self.data_options['geo_inverse_dict_path']
         else:
@@ -52,7 +56,8 @@ class ICParquetDataModule(pl.LightningDataModule):
             self.train_dataset = IceCube_Parquet_Dataset(train_files,
                                                          self.use_pulse_series,
                                                          self.use_latent_representation,
-                                                         self.geo_inverse_dict_path)
+                                                         self.geo_inverse_dict_path,
+                                                         use_morphology_hack=self.use_morphology_hack)
             
         valid_files = get_file_names(
             self.data_options['valid_data_files'], 
@@ -62,7 +67,8 @@ class ICParquetDataModule(pl.LightningDataModule):
         self.valid_dataset = IceCube_Parquet_Dataset(valid_files,
                                                      self.use_pulse_series,
                                                      self.use_latent_representation,
-                                                     self.geo_inverse_dict_path)
+                                                     self.geo_inverse_dict_path,
+                                                     use_morphology_hack=self.use_morphology_hack)
             
     def train_dataloader(self):
         """Returns the training dataloader."""
@@ -115,7 +121,8 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
                  files,
                  use_pulse_series=False, 
                  use_latent_representation=False, 
-                 geo_inverse_dict_path=None):
+                 geo_inverse_dict_path=None,
+                 use_morphology_hack=True):
         self.files = files
         self.use_pulse_series = use_pulse_series
         self.use_latent_representation = use_latent_representation
@@ -131,6 +138,11 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
             # or "pulses.summary_stats",
         ]
 
+        self.morphology_map = None
+        if use_morphology_hack:
+            self.morphology_map = {
+                0: 0, 1: 1, 2: 2, 3: 1, 4: 3, 5: 4,
+            }
         # Count number of events in each file
         num_events = []
         self.rg_cumlens = []
@@ -204,6 +216,9 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
         direction = event.primary_direction.to_numpy()
         energy = event.primary_energy
         morphology = event.morphology
+        if self.morphology_map is not None:
+            morphology = self.morphology_map[morphology]
+
         bundleness = event.bundleness
         background = event.background
         visible_energy = event.visible_energy

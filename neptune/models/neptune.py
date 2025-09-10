@@ -10,7 +10,9 @@ from typing import List, Tuple, Dict, Any, Optional
 import os
 import fpsample
 import time
+
 import wandb
+from sklearn.metrics import confusion_matrix
 
 # Local imports
 from neptune.utils import (
@@ -311,9 +313,9 @@ class Neptune(pl.LightningModule):
         elif task == 'energy_reco' or task == 'visible_energy_reco': 
             self.output_dim = 2 if loss_choice == 'gaussian_nll' else 1
         elif task == 'morphology_classification':
-            self.output_dim = 6
+            self.output_dim = 5
         elif task == 'simple_morphology_classification':
-            self.output_dim = 4
+            self.output_dim = 5
         elif task == 'bundleness_classification':
             self.output_dim = 3
         elif task == 'background_classification':
@@ -423,11 +425,24 @@ class Neptune(pl.LightningModule):
     def training_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Tensor:
         loss, preds, labels = self.step(batch)
         self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True, batch_size=self.hparams.batch_size)
-        probs = torch.sigmoid(preds).detach().cpu().float().numpy()
-        self.logger.experiment.log(
-            {"train/p_positive_hist": wandb.Histogram(probs)},
-            commit=False
-        )
+        if self.hparams.downstream_task == 'background_classification':
+            probs = torch.sigmoid(preds).detach().cpu().float().numpy()
+            self.logger.experiment.log(
+                {"train/p_positive_hist": wandb.Histogram(probs)},
+                commit=False
+            )
+        elif self.hparams.downstream_task == 'morphology_classification':
+
+            if batch_idx % 100:
+                probs = torch.exp(preds).detach().cpu().float().numpy()
+
+                self.logger.experiment.log(
+                    {"train/confusion_matrix": wandb.plot.confusion_matrix(
+                        probs=probs, y_true=labels[:,4].detach().cpu().int().numpy(),
+                        class_names=["Cascade", "Thru", "Start", "Passing", "Bundle"]
+                    )}
+                )
+        
         return loss
         
     def validation_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Dict[str, Tensor]:
