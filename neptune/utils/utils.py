@@ -6,6 +6,10 @@ from torch import Tensor
 from typing import Optional, List, Union, Any, Tuple
 import scipy.special
 
+def MeanAbsoluteError(pred: Tensor, truth: Tensor) -> Tensor:
+    x = pred - truth
+    return torch.abs(x).mean()
+
 def LogCoshLoss(pred: Tensor, truth: Tensor) -> Tensor:
     """LogCosh loss function. approximated for easier to compute gradients"""
     x = pred - truth

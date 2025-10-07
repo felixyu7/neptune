@@ -8,7 +8,8 @@ from neptune.utils.utils import (
     angle_between,
     farthest_point_sampling,
     CrossEntropyLoss,
-    BinaryCrossEntropyLoss
+    BinaryCrossEntropyLoss,
+    MeanAbsoluteError
 )
 
 __all__ = [
@@ -21,5 +22,6 @@ __all__ = [
     'angle_between',
     'farthest_point_sampling',
     'CrossEntropyLoss',
-    'BinaryCrossEntropyLoss'
+    'BinaryCrossEntropyLoss',
+    'MeanAbsoluteError'
 ] 

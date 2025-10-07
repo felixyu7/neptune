@@ -129,7 +129,7 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
         
         self.columns = [
             "primary_direction", "primary_energy", "morphology", "bundleness",
-            "background", "visible_energy",
+            "background", "visible_energy", "starting", "visible_inelasticity",
             "pulses.sensor_pos_x", "pulses.sensor_pos_y", "pulses.sensor_pos_z",
             "pulses.summary_stats", "pulses.pulse_times", "pulses.pulse_charges",
             # choose ONE of these branches depending on your mode:
@@ -221,7 +221,9 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
 
         bundleness = event.bundleness
         background = event.background
+        starting = event.starting
         visible_energy = event.visible_energy
+        visible_inelasticity = event.visible_inelasticity
         if visible_energy is None: visible_energy = 1e-9
         
         label = [np.log10(energy),
@@ -231,7 +233,9 @@ class IceCube_Parquet_Dataset(torch.utils.data.Dataset):
                  morphology,
                  bundleness,
                  background,
-                 np.log10(visible_energy+1.0)]
+                 np.log10(visible_energy+1.0),
+                 starting,
+                 visible_inelasticity]
         
         # Extract position information
         pos = np.array([event.pulses.sensor_pos_x.to_numpy(),

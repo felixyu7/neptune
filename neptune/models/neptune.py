@@ -23,7 +23,8 @@ from neptune.utils import (
     GaussianNLLLoss,
     CombinedAngularVMFDistanceLoss,
     CrossEntropyLoss,
-    BinaryCrossEntropyLoss
+    BinaryCrossEntropyLoss,
+    MeanAbsoluteError,
 )
 from neptune.models.transformer_layers import (
     RelativePosTransformerEncoderLayer,
@@ -320,6 +321,10 @@ class Neptune(pl.LightningModule):
             self.output_dim = 3
         elif task == 'background_classification':
             self.output_dim = 1  # binary
+        elif task == 'starting_classification':
+            self.output_dim = 1
+        elif task == 'inelasticity_reco':
+            self.output_dim = 1
         
         else: raise ValueError(f"Unknown task: {task}")
 
@@ -334,6 +339,8 @@ class Neptune(pl.LightningModule):
             'simple_morphology_classification': ['cross_entropy'],
             'bundleness_classification': ['cross_entropy'],
             'background_classification': ['binary_cross_entropy'],
+            'starting_classification': ['binary_cross_entropy'],
+            'inelasticity_reco': ['mae'],
         }
         if task not in valid or loss_choice not in valid[task]:
             raise ValueError(f"Invalid task/loss combo: {task}/{loss_choice}")
@@ -412,7 +419,17 @@ class Neptune(pl.LightningModule):
             get_labels = lambda labels: labels[:, 6]
             return lambda preds, labels: BinaryCrossEntropyLoss(preds.squeeze(-1), get_labels(labels))
 
+        elif task == 'starting_classification':
+            # 0 = not starting, 1 = starting
+            num_classes = 2
+            get_labels = lambda labels: labels[:, 8]
+            return lambda preds, labels: BinaryCrossEntropyLoss(preds.squeeze(-1), get_labels(labels))
         
+        elif task == 'inelasticity_reco':
+            get_labels = lambda labels: labels[:, 9]
+            if loss_choice == 'mae':
+                return lambda preds, labels: MeanAbsoluteError(0.5 * (torch.tanh(4.0 * preds) + 1.0).squeeze(-1) if preds.dim() > 1 else 0.5 * (torch.tanh(4.0 * preds) + 1.0), get_labels(labels))
+
         raise ValueError(f"Unhandled task/loss: {task}/{loss_choice}") 
 
     def step(self, batch: Tuple[Tensor, Tensor, Tensor]) -> Tuple[Tensor, Tensor, Tensor]:
@@ -442,7 +459,20 @@ class Neptune(pl.LightningModule):
                         class_names=["Cascade", "Thru", "Start", "Passing", "Bundle"]
                     )}
                 )
-        
+        elif self.hparams.downstream_task == 'starting_classification':
+            probs = torch.sigmoid(preds).detach().cpu().float().numpy()
+            self.logger.experiment.log(
+                {"train/p_positive_hist": wandb.Histogram(probs)},
+                commit=False
+            )
+        elif self.hparams.downstream_task == 'inelasticity_reco':
+            if batch_idx % 100:
+                preds = 0.5 * (torch.tanh(4.0 * preds).detach().cpu().float().numpy() + 1.0)
+                self.logger.experiment.log(
+                    {"train/inelasticity_reco_hist": wandb.Histogram(preds)},
+                    commit=False
+                )
+
         return loss
         
     def validation_step(self, batch: Tuple[Tensor, Tensor, Tensor], batch_idx: int) -> Dict[str, Tensor]:
@@ -492,6 +522,16 @@ class Neptune(pl.LightningModule):
             true_label = all_labels[:, 6]
             probs = torch.sigmoid(all_preds.view(-1))     # P(y=1)
             preds = (probs >= 0.5).long()
+        if self.hparams.downstream_task == 'starting_classification':
+            true_label = all_labels[:, 8]
+            probs = torch.sigmoid(all_preds.view(-1))     # P(y=1)
+            preds = (probs >= 0.5).long()
+        elif self.hparams.downstream_task == 'inelasticity_reco':
+            truth = all_labels[:, 9]
+            t = truth.reshape(-1).float()
+            p = all_preds.reshape(-1).float()
+            rmse = torch.sqrt(torch.nn.functional.mse_loss(p, t, reduction="mean"))
+            self.log(f'{stage}_rmse', rmse)
             
     def on_validation_epoch_end(self):
         outputs = self.validation_step_outputs
