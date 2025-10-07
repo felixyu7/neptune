@@ -12,12 +12,12 @@ def AngularDistanceLoss(pred: Tensor, truth: Tensor, eps: float = 1e-7, reductio
     # Normalize pred and truth to unit vectors
     pred = F.normalize(pred, p=2, dim=1)
     truth = F.normalize(truth, p=2, dim=1)
-    
+
     # Clamp prevents invalid input to arccos
     cos_sim = F.cosine_similarity(pred, truth)
     angle = torch.acos(torch.clamp(cos_sim, min=-1.0 + eps, max=1.0 - eps))
     loss = angle / np.pi
-    
+
     if reduction == "mean":
         return loss.mean()
     elif reduction == "sum":
@@ -42,15 +42,35 @@ def GaussianNLLLoss(mu: Tensor, var: Tensor, target: Tensor) -> Tensor:
     """
     # Ensure var is positive and stable
     var = F.softplus(var) + 1e-6
-    
+
     # NLL for each sample
     nll = 0.5 * ((target - mu)**2 / var + torch.log(var))
-    
+
     # Return average over batch
     return torch.mean(nll)
 
+def FocalLoss(inputs: Tensor, targets: Tensor, alpha: float = 0.25, gamma: float = 2.0, reduction: str = "mean") -> Tensor:
+    """ Focal Loss for multi-class classification tasks. """
+    bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    pt = torch.exp(-bce_loss)
+    focal_loss = alpha * (1 - pt) ** gamma * bce_loss
+
+    if reduction == "mean":
+        return focal_loss.mean()
+    elif reduction == "sum":
+        return focal_loss.sum()
+    elif reduction == "none":
+        return focal_loss
+    else:
+        raise ValueError(f"Unknown reduction: {reduction}")
+
+def CrossEntropyLoss(inputs: Tensor, targets: Tensor, reduction: str = "mean") -> Tensor:
+    """ Cross Entropy Loss for multi-class classification tasks. """
+    ce_loss = F.cross_entropy(inputs, targets, reduction=reduction)
+    return ce_loss
+
 def VonMisesFisherLoss(n_pred, n_true, eps = 1e-8):
     """  von Mises-Fisher Loss: n_true is unit vector ! """
-    kappa = torch.norm(n_pred, dim=1)        
+    kappa = torch.norm(n_pred, dim=1)
     logC  = -kappa + torch.log( ( kappa+eps )/( 1-torch.exp(-2*kappa)+2*eps ) )
-    return -( (n_true*n_pred).sum(dim=1) + logC ).mean() 
+    return -( (n_true*n_pred).sum(dim=1) + logC ).mean()

@@ -18,11 +18,11 @@ def parse_args():
 
 def main():
     args = parse_args()
-    
+
     # Load configuration
     with open(args.cfg_file, 'r') as cfg_file:
         cfg = yaml.load(cfg_file, Loader=yaml.FullLoader)
-    
+
     # Set device
     accelerator = cfg['accelerator'].lower()
     if accelerator == 'gpu' and torch.cuda.is_available():
@@ -34,23 +34,25 @@ def main():
         device = torch.device('cpu')
     else:
         device = torch.device('cpu')
-    
+
     print(f"Using device: {device}")
-    
+
     # Create dataloaders (unified interface supports prometheus, icecube, and kaggle)
     train_loader, val_loader = create_dataloaders(cfg)
-    
+
     # Initialize model
     model_options = cfg['model_options']
-    
+
     # Determine output dimension based on task
     if model_options['downstream_task'] == 'angular_reco':
         output_dim = 3
     elif model_options['downstream_task'] == 'energy_reco':
         output_dim = 2 if model_options['loss_fn'] == 'gaussian_nll' else 1
+    elif model_options['downstream_task'] == 'multiclassification':
+        output_dim = 5  # Assuming 5 classes for multiclassification
     else:
         raise ValueError(f"Unknown task: {model_options['downstream_task']}")
-    
+
     model = NeptuneModel(
         in_channels=model_options['in_channels'],
         num_patches=model_options['num_patches'],
@@ -64,7 +66,7 @@ def main():
         mlp_layers=model_options.get('mlp_layers', [256, 512, 768]),
         tokenizer_type=model_options.get('tokenizer_type', 'point_cloud')
     ).to(device)
-    
+
     # Setup logging
     use_wandb = not args.no_wandb
     if use_wandb:
@@ -78,7 +80,7 @@ def main():
         except ImportError:
             print("WandB not available, falling back to CSV logging")
             use_wandb = False
-    
+
     # Create trainer
     trainer = Trainer(
         model=model,
@@ -86,12 +88,12 @@ def main():
         cfg=cfg,
         use_wandb=use_wandb
     )
-    
+
     # Load checkpoint if specified
     if cfg.get('checkpoint', '') and os.path.exists(cfg['checkpoint']):
         print(f"Loading checkpoint: {cfg['checkpoint']}")
         trainer.load_checkpoint(cfg['checkpoint'], resume_training=cfg.get('resume_training', False))
-    
+
     # Train or test
     if cfg['training']:
         trainer.fit(train_loader, val_loader)
