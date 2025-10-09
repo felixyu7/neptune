@@ -16,7 +16,6 @@ Example usage:
 """
 
 from .model import NeptuneModel
-from .tokenizer import GumbelSoftmaxTokenizer
 
 __version__ = "0.1.0"
-__all__ = ["NeptuneModel", "GumbelSoftmaxTokenizer"]
+__all__ = ["NeptuneModel"]

@@ -20,12 +20,13 @@ model = NeptuneModel(
     output_dim = 3          # task output (3D direction, energy, etc.)
 )
 
-# coordinates: [N, 5] -> [batch_idx, x, y, z, t]
+# coordinates: [N, 4] -> [x, y, z, t]
 # features: [N, 6] -> point features
-coords = torch.randn(1000, 5)
+coords = torch.randn(1000, 4)
 features = torch.randn(1000, 6)
+batch_ids = torch.zeros(1000, dtype=torch.long)
 
-out = model(coords, features) # [batch_size, 3]
+out = model(coords, features, batch_ids) # [batch_size, 3]
 
 # train with angular distance loss for 3D directions
 import torch.nn.functional as F
@@ -40,6 +41,12 @@ def angular_distance_loss(pred, truth):
 directions = torch.randn(batch_size, 3)  # true directions
 loss = angular_distance_loss(out, directions)
 loss.backward()
+```
+
+For full training runs, the CLI entry point `scripts/run.py` uses the shared tooling from [`ml_common`](../ml-common) for dataloaders, losses, and the generic trainer:
+
+```bash
+python scripts/run.py -c scripts/configs/prometheus_angular_reco.cfg
 ```
 
 ## How it works

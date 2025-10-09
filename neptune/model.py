@@ -3,134 +3,10 @@ Neptune: A transformer-based point cloud processing model for neutrino event rec
 """
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch import Tensor
-from typing import List, Tuple, Optional
+from typing import List, Optional
 from .transformers import NeptuneTransformerEncoder, NeptuneTransformerEncoderLayer
-from .tokenizer import GumbelSoftmaxTokenizer, LightweightPointSelector
-import fpsample
-
-class PointCloudTokenizer(nn.Module):
-    """Converts point cloud data into tokens for transformer processing."""
-    
-    def __init__(self, 
-                 feature_dim: int, 
-                 max_tokens: int = 128, 
-                 token_dim: int = 768, 
-                 mlp_layers: List[int] = [256, 512, 768],
-                 k_neighbors: int = 16):
-        super().__init__()
-            
-        self.max_tokens = max_tokens
-        self.token_dim = token_dim
-        self.k_neighbors = k_neighbors
-        
-        # Per-Point Feature MLP
-        mlp = []
-        in_dim = feature_dim
-        for out_dim in mlp_layers:
-            mlp.extend([
-                nn.Linear(in_dim, out_dim),
-                nn.ReLU(inplace=True)
-            ])
-            in_dim = out_dim
-        mlp.append(nn.Linear(in_dim, token_dim))
-        self.mlp = nn.Sequential(*mlp)
-        
-        # Neighborhood Aggregation MLP
-        self.neighborhood_mlp = nn.Sequential(
-            nn.Linear(token_dim, token_dim),
-            nn.ReLU(inplace=True),
-            nn.Linear(token_dim, token_dim)
-        )
-        
-        
-    def forward(self, coordinates: Tensor, features: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
-        batch_indices = coordinates[:, 0].long()
-        xyz = coordinates[:, 1:4] 
-        time = coordinates[:, 4:5]
-
-        batch_size = batch_indices.max().item() + 1 if coordinates.numel() > 0 else 0
-        if batch_size == 0:
-            # Handle empty input
-            empty_tokens = torch.zeros((0, self.max_tokens, self.token_dim), device=coordinates.device, dtype=features.dtype)
-            empty_centroids = torch.zeros((0, self.max_tokens, 4), device=coordinates.device, dtype=coordinates.dtype)
-            empty_masks = torch.zeros((0, self.max_tokens), device=coordinates.device, dtype=torch.bool)
-            return empty_tokens, empty_centroids, empty_masks
-
-        all_tokens = []
-        all_centroids = []
-        all_masks = []
-        
-        # Process each point cloud in the batch individually
-        for batch_idx in range(batch_size):
-            batch_mask_indices = batch_indices == batch_idx
-            batch_xyz = xyz[batch_mask_indices]  # [M, 3]
-            batch_features_data = features[batch_mask_indices]  # [M, F]
-            batch_time = time[batch_mask_indices]  # [M, 1]
-            num_points = batch_xyz.shape[0]
-            
-            # Combine spatial coordinates and time for FPS and neighborhood search: [M, 4]
-            points_for_sampling = torch.cat([batch_xyz, batch_time], dim=-1)
-            
-            # Apply Per-Point MLP
-            all_point_features = self.mlp(batch_features_data)
-            
-            if num_points <= self.max_tokens:
-                # Use all points if fewer than max_tokens
-                batch_centroids = points_for_sampling
-                batch_tokens = all_point_features
-                num_valid_tokens = num_points
-            else:
-                # Select centroids using Farthest Point Sampling (bucket_fps_kdline_sampling)
-                fps_indices = fpsample.bucket_fps_kdline_sampling(points_for_sampling.detach().cpu().numpy(), self.max_tokens, h=3)
-                batch_centroids = points_for_sampling[fps_indices]  # [max_tokens, 4]
-                
-                # Find k-Nearest Neighbors for each centroid
-                dist_matrix = torch.cdist(batch_centroids, points_for_sampling)
-                k = min(self.k_neighbors, num_points)
-                _, knn_indices = torch.topk(dist_matrix, k=k, largest=False, dim=1)
-                
-                # Gather features
-                flat_knn_indices = knn_indices.view(-1)
-                gathered_features = all_point_features[flat_knn_indices]
-                neighborhood_features = gathered_features.view(self.max_tokens, k, self.token_dim)
-                                
-                # Pool features using max pooling
-                pooled_features = torch.max(neighborhood_features, dim=1)[0]
-                
-                # Apply aggregation MLP
-                batch_tokens = self.neighborhood_mlp(pooled_features)
-                num_valid_tokens = self.max_tokens
-            
-            # Sort tokens by time coordinate for meaningful RoPE positioning
-            time_coords = batch_centroids[:num_valid_tokens, 3]  # Extract time dimension for valid tokens
-            time_sort_indices = torch.argsort(time_coords)
-            batch_centroids[:num_valid_tokens] = batch_centroids[:num_valid_tokens][time_sort_indices]
-            batch_tokens[:num_valid_tokens] = batch_tokens[:num_valid_tokens][time_sort_indices]
-            
-            # Padding
-            if num_valid_tokens < self.max_tokens:
-                num_padding = self.max_tokens - num_valid_tokens
-                pad_tokens = torch.zeros((num_padding, self.token_dim), device=batch_tokens.device, dtype=batch_tokens.dtype)
-                batch_tokens = torch.cat([batch_tokens, pad_tokens], dim=0)
-                pad_centroids = torch.zeros((num_padding, 4), device=batch_centroids.device, dtype=batch_centroids.dtype)
-                batch_centroids = torch.cat([batch_centroids, pad_centroids], dim=0)
-            
-            # Create boolean mask
-            batch_mask_valid = torch.zeros(self.max_tokens, dtype=torch.bool, device=coordinates.device)
-            batch_mask_valid[:num_valid_tokens] = True
-            
-            all_tokens.append(batch_tokens)
-            all_centroids.append(batch_centroids)
-            all_masks.append(batch_mask_valid.unsqueeze(0))
-        
-        # Stack results
-        tokens = torch.stack(all_tokens, dim=0)
-        centroids = torch.stack(all_centroids, dim=0)
-        masks = torch.cat(all_masks, dim=0)
-        return tokens, centroids, masks
-
+from .tokenizer import PointCloudTokenizerV1, PointCloudTokenizerV2
 
 class CentroidEncoder(nn.Module):
     """MLP for encoding position information into tokens."""
@@ -240,28 +116,20 @@ class NeptuneModel(nn.Module):
         super().__init__()
         
         # Model Components - choose tokenizer type
-        if tokenizer_type == "gumbel_softmax":
-            self.tokenizer = GumbelSoftmaxTokenizer(
+        if tokenizer_type == "v1":
+            self.tokenizer = PointCloudTokenizerV1(
                 feature_dim=in_channels,
                 max_tokens=num_patches,
                 token_dim=token_dim,
-                mlp_layers=mlp_layers,
-                k_neighbors=k_neighbors
+                k_neighbors=k_neighbors,
+                mlp_layers=mlp_layers
             )
-        elif tokenizer_type == "lightweight":
-            self.tokenizer = LightweightPointSelector(
+        elif tokenizer_type == "v2":
+            self.tokenizer = PointCloudTokenizerV2(
                 feature_dim=in_channels,
                 max_tokens=num_patches,
                 token_dim=token_dim,
                 mlp_layers=mlp_layers
-            )
-        elif tokenizer_type == "point_cloud":
-            self.tokenizer = PointCloudTokenizer(
-                feature_dim=in_channels,
-                max_tokens=num_patches,
-                token_dim=token_dim,
-                mlp_layers=mlp_layers,
-                k_neighbors=k_neighbors
             )
         else:
             raise ValueError(f"Unknown tokenizer type: {tokenizer_type}. Supported: 'point_cloud', 'gumbel_softmax', 'lightweight'")
@@ -282,19 +150,37 @@ class NeptuneModel(nn.Module):
             nn.Linear(token_dim, output_dim)
         )
 
-    def forward(self, coords: Tensor, features: Tensor) -> Tensor:
+    def forward(
+        self,
+        coords: Tensor,
+        features: Tensor,
+        batch_ids: Tensor,
+        times: Optional[Tensor] = None,
+    ) -> Tensor:
         """
         Forward pass through the Neptune model.
         
         Args:
-            coords: Point coordinates [N, 5] where columns are [batch_idx, x, y, z, t]
+            coords: Point coordinates [N, 4] with columns [x, y, z, t]
             features: Point features [N, in_channels]
+            batch_ids: Batch indices for each point [N]
+            times: Optional per-point time feature [N, 1]
             
         Returns:
             Output tensor [batch_size, output_dim]
         """
+        spatial_coords = coords[:, :3] if coords.size(1) >= 3 else coords
+
+        if times is None:
+            if coords.size(1) >= 4:
+                times = coords[:, 3:4]
+            elif features is not None and features.size(1) > 0:
+                times = features[:, -1:].clone()
+            else:
+                times = spatial_coords.new_zeros((spatial_coords.size(0), 1))
+
         # 1. Tokenize point cloud
-        tokens, centroids, masks = self.tokenizer(coords, features)
+        tokens, centroids, masks = self.tokenizer(spatial_coords, features, batch_ids, times)
         
         # 2. Encode with transformer
         global_features = self.encoder(tokens, centroids, masks)
