@@ -109,12 +109,6 @@ class PointCloudTokenizerV1(nn.Module):
                 batch_tokens = self.neighborhood_mlp(pooled_features)
                 num_valid_tokens = self.max_tokens
             
-            # Sort tokens by time coordinate for meaningful RoPE positioning
-            time_coords = batch_centroids[:num_valid_tokens, 3]  # Extract time dimension for valid tokens
-            time_sort_indices = torch.argsort(time_coords)
-            batch_centroids[:num_valid_tokens] = batch_centroids[:num_valid_tokens][time_sort_indices]
-            batch_tokens[:num_valid_tokens] = batch_tokens[:num_valid_tokens][time_sort_indices]
-            
             # Padding
             if num_valid_tokens < self.max_tokens:
                 num_padding = self.max_tokens - num_valid_tokens
@@ -138,150 +132,229 @@ class PointCloudTokenizerV1(nn.Module):
         return tokens, centroids, masks
 
 class PointCloudTokenizerV2(nn.Module):
-    def __init__(self, 
-                 feature_dim: int, 
-                 max_tokens: int = 128, 
-                 token_dim: int = 768, 
-                 mlp_layers: list = [256, 512, 768],
-                 tau: float = 2.0):
+    """
+    Vectorized V2 tokenizer:
+      - Processes all points at once (GPU-friendly).
+      - Segmented top-k per batch without Python loops.
+      - Straight-through path so the importance scorer learns end-to-end.
+      - Optional Gumbel-Top-k noise during training.
+
+    Output (unchanged API):
+        tokens   : [B, max_tokens, token_dim]
+        centroids: [B, max_tokens, 4]     (x,y,z,time)
+        mask     : [B, max_tokens] (bool) True for valid tokens
+    """
+    def __init__(
+        self,
+        feature_dim: int,
+        max_tokens: int = 128,
+        token_dim: int = 768,
+        mlp_layers: list = [256, 512, 768],
+        tau: float = 2.0,
+        use_gumbel_topk: bool = True,
+    ):
         super().__init__()
         self.max_tokens = max_tokens
         self.token_dim = token_dim
-        self.tau = nn.Parameter(torch.tensor(tau, dtype=torch.float32))  # Learnable temperature parameter
+        self.tau = nn.Parameter(torch.tensor(float(tau)))  # learnable temperature
+        self.use_gumbel_topk = use_gumbel_topk
 
-        # Coordinate processing
-        self.coord_norm = nn.LayerNorm(4)  # Normalize coordinates
+        # Coordinate processing (keep structure close to original V2)
+        self.coord_norm = nn.LayerNorm(4)
         self.spatial_encoder = nn.Sequential(
-            nn.Linear(4, 64),  # Dedicated network for coordinates
-            nn.ReLU(),
-            nn.Linear(64, 64)
+            nn.Linear(4, 64), nn.ReLU(inplace=True), nn.Linear(64, 64), nn.ReLU(inplace=True)
         )
-        
-        # Per-point feature MLP (maps input features + spatial features to token_dim)
-        layers = []
-        in_dim = feature_dim + 64  # Features + spatial encoding
-        for out_dim in mlp_layers:
-            layers += [nn.Linear(in_dim, out_dim), nn.ReLU(inplace=True)]
-            in_dim = out_dim
-        layers.append(nn.Linear(in_dim, token_dim))
+
+        # Per-point feature MLP: [features || spatial] -> token_dim
+        layers: List[nn.Module] = []
+        in_dim = feature_dim + 64
+        for h in mlp_layers:
+            layers += [nn.Linear(in_dim, h), nn.ReLU(inplace=True)]
+            in_dim = h
+        layers += [nn.Linear(in_dim, token_dim)]
         self.mlp = nn.Sequential(*layers)
-        
-        # Simple importance scorer (no global context)
+
+        # Importance scorer
         self.importance_head = nn.Sequential(
-            nn.Linear(token_dim, token_dim // 2),
+            nn.Linear(token_dim, max(32, token_dim // 2)),
             nn.ReLU(inplace=True),
-            nn.Linear(token_dim // 2, 1)
+            nn.Linear(max(32, token_dim // 2), 1),
         )
+
+    @staticmethod
+    def _segmented_layout(batch_ids: Tensor, N: int):
+        """
+        Create a batched layout (no Python loops):
+            - counts[b]: number of items in batch b
+            - offsets[b]: start position of batch b in the sorted index list
+            - perm: indices that sort items by batch
+            - b_sorted: batch id per perm index
+            - pos_in_b: position within each batch segment for each perm index
+        """
+        device = batch_ids.device
+        B = int(batch_ids.max().item() + 1) if batch_ids.numel() > 0 else 0
+        counts = torch.bincount(batch_ids, minlength=B) if B > 0 else torch.zeros(0, dtype=torch.long, device=device)
+        offsets = torch.zeros(B, dtype=torch.long, device=device)
+        if B > 1:
+            offsets[1:] = torch.cumsum(counts[:-1], dim=0)
+        perm = torch.argsort(batch_ids)  # [N]
+        b_sorted = batch_ids[perm]       # [N]
+        pos_in_b = torch.arange(N, device=device) - offsets[b_sorted]  # [N]
+        max_per_b = int(counts.max().item()) if B > 0 else 0
+        return B, counts, offsets, perm, b_sorted, pos_in_b, max_per_b
+
+    def _segmented_topk(self, scores: Tensor, batch_ids: Tensor, k: int, pad_idx: int):
+        """
+        Vectorized per-batch top-k:
+          scores: [N], batch_ids: [N], returns:
+            sel_idx : [B, k_eff] global indices in [0..N] (pad_idx for invalid)
+            sel_mask: [B, k_eff] True where valid
+            layout  : (B, counts, offsets, perm, b_sorted, pos_in_b, max_per_b)
+        """
+        device = scores.device
+        N = scores.numel()
+        B, counts, offsets, perm, b_sorted, pos_in_b, max_per_b = self._segmented_layout(batch_ids, N)
+
+        if B == 0:
+            sel_idx = torch.full((0, 0), pad_idx, device=device, dtype=torch.long)
+            sel_mask = torch.zeros((0, 0), device=device, dtype=torch.bool)
+            return sel_idx, sel_mask, (B, counts, offsets, perm, b_sorted, pos_in_b, 0)
+
+        # Build dense [B, max_per_b] tables for indices and scores
+        idx_table = torch.full((B, max_per_b), pad_idx, device=device, dtype=torch.long)
+        idx_table[b_sorted, pos_in_b] = perm  # map row/col -> global index
+
+        neg_inf = torch.finfo(scores.dtype).min
+        S = torch.full((B, max_per_b), neg_inf, device=device, dtype=scores.dtype)
+        S[b_sorted, pos_in_b] = scores[perm]
+
+        k_eff = min(k, max_per_b) if max_per_b > 0 else 0
+        if k_eff == 0:
+            sel_idx = torch.full((B, 0), pad_idx, device=device, dtype=torch.long)
+            sel_mask = torch.zeros((B, 0), device=device, dtype=torch.bool)
+            return sel_idx, sel_mask, (B, counts, offsets, perm, b_sorted, pos_in_b, max_per_b)
+
+        top_vals, top_pos = torch.topk(S, k=k_eff, dim=1)        # [B, k_eff]
+        sel_idx = torch.gather(idx_table, dim=1, index=top_pos)  # [B, k_eff]
+        sel_mask = top_pos < counts.unsqueeze(1)                 # invalid rows (no points) -> False
+
+        return sel_idx, sel_mask, (B, counts, offsets, perm, b_sorted, pos_in_b, max_per_b)
+
+    def _segmented_softmax(self, scores: Tensor, layout, tau: Tensor) -> Tensor:
+        """
+        Per-batch softmax over all points (for ST gradient path), vectorized.
+        Returns weights w: [N], with sum_b w_b = 1 for each batch b.
+        """
+        B, counts, offsets, perm, b_sorted, pos_in_b, max_per_b = layout
+        device = scores.device
+        N = scores.numel()
+        if B == 0 or N == 0:
+            return torch.zeros_like(scores)
+
+        neg_inf = torch.finfo(scores.dtype).min
+        S = torch.full((B, max_per_b), neg_inf, device=device, dtype=scores.dtype)
+        S[b_sorted, pos_in_b] = scores[perm]  # [B, max_per_b]
+
+        # Numerical stability and temperature
+        S = S / tau.clamp(min=1e-6)
+        Smax = torch.max(S, dim=1, keepdim=True).values
+        Sexp = torch.exp(S - Smax)
+        # Zero out padded columns (positions >= counts[b])
+        row_pos = torch.arange(max_per_b, device=device).unsqueeze(0).expand(B, -1)
+        valid = row_pos < counts.unsqueeze(1)
+        Sexp = Sexp * valid.to(Sexp.dtype)
+
+        Z = Sexp.sum(dim=1, keepdim=True).clamp(min=1e-12)
+        W = Sexp / Z  # [B, max_per_b]
+        # Map back to flat [N]
+        w = torch.zeros(N, device=device, dtype=scores.dtype)
+        w[perm] = W[b_sorted, pos_in_b].to(scores.dtype)
+        return w
+
+    @staticmethod
+    def _sample_gumbel(shape, device, dtype):
+        # Gumbel(0,1) = -log(-log(U))
+        u = torch.rand(shape, device=device, dtype=dtype)
+        return -torch.log(-torch.log(u.clamp_(1e-6, 1.0 - 1e-6)))
 
     def forward(
         self,
-        coords: torch.Tensor,
-        features: torch.Tensor,
-        batch_ids: torch.Tensor,
-        times: Optional[torch.Tensor] = None,
-    ):
-        """
-        Args:
-            coords: Tensor [N, 3] with spatial coordinates.
-            features: Tensor [N, F] containing per-point features.
-            batch_ids: Tensor [N] with batch indices.
-            times: Optional tensor [N, 1] with per-point time values.
-        Returns:
-            tokens: Tensor [B, max_tokens, token_dim] - selected tokens.
-            centroids: Tensor [B, max_tokens, 4] - [x, y, z, time] for each token.
-            mask: Tensor [B, max_tokens] (bool) - True for valid positions.
-        """
-        if coords.numel() == 0:
-            empty_tokens = torch.zeros((0, self.max_tokens, self.token_dim), device=features.device, dtype=features.dtype)
-            empty_centroids = torch.zeros((0, self.max_tokens, 4), device=features.device, dtype=coords.dtype)
-            empty_mask = torch.zeros((0, self.max_tokens), device=features.device, dtype=torch.bool)
-            return empty_tokens, empty_centroids, empty_mask
+        coords: Tensor,        # [N, 3]
+        features: Tensor,      # [N, F]
+        batch_ids: Tensor,     # [N]
+        times: Optional[Tensor] = None,  # [N, 1]
+    ) -> Tuple[Tensor, Tensor, Tensor]:
 
-        time_column = times
-        if time_column is None:
+        device = features.device
+        dtype = features.dtype
+        N = coords.size(0)
+        if N == 0:
+            B = int(batch_ids.max().item() + 1) if batch_ids.numel() > 0 else 0
+            return (
+                torch.zeros((B, self.max_tokens, self.token_dim), device=device, dtype=dtype),
+                torch.zeros((B, self.max_tokens, 4), device=device, dtype=coords.dtype),
+                torch.zeros((B, self.max_tokens), device=device, dtype=torch.bool),
+            )
+
+        # Compose (x,y,z,t)
+        if times is None:
             if features.size(1) > 0:
-                time_column = features[:, -1:].clone()
+                times = features[:, -1:].clone()
             else:
-                time_column = coords.new_zeros((coords.size(0), 1))
+                times = coords.new_zeros((N, 1))
+        xyzt = torch.cat([coords, times], dim=-1)  # [N,4]
 
-        coords_with_time = torch.cat([coords, time_column], dim=-1)
-        batch_size = int(batch_ids.max().item() + 1) if batch_ids.numel() > 0 else 0
+        # Per-point encoding
+        spatial = self.spatial_encoder(self.coord_norm(xyzt))
+        point_feats = self.mlp(torch.cat([features, spatial], dim=1))   # [N, D]
+        scores = self.importance_head(point_feats).squeeze(-1)          # [N]
 
-        # Normalize and encode coordinates
-        coords_features = self.coord_norm(coords_with_time)  # Normalize coordinates
-        spatial_features = self.spatial_encoder(coords_features)  # [N, 64]
-        combined_input = torch.cat([features, spatial_features], dim=1)  # [N, F+64]
-        
-        # Encode all points at once
-        point_feats = self.mlp(combined_input)  # [N, token_dim]
-        
-        # Compute importance scores directly from point features
-        importance_scores = self.importance_head(point_feats).squeeze(-1)  # [N]
+        # Optional Gumbel-Top-k logits for exploration (training only)
+        logits = scores
+        if self.training and self.use_gumbel_topk:
+            logits = logits + self._sample_gumbel(logits.shape, device, logits.dtype)
 
-        tokens_list: List[torch.Tensor] = []
-        centroids_list: List[torch.Tensor] = []
-        mask_list: List[torch.Tensor] = []
+        # --- Vectorized segmented top-k selection per batch ---
+        pad_idx = N  # sentinel index for padding
+        sel_idx, sel_mask, layout = self._segmented_topk(
+            scores=logits, batch_ids=batch_ids, k=self.max_tokens, pad_idx=pad_idx
+        )  # [B, k_eff], [B, k_eff]
+        B, counts, offsets, perm, b_sorted, pos_in_b, max_per_b = layout
+        k_eff = sel_idx.size(1)  # <= max_tokens
 
-        for b in range(batch_size):
-            idx_mask = batch_ids == b
-            pts_coords = coords_with_time[idx_mask]
-            pts_features = point_feats[idx_mask]
-            batch_scores = importance_scores[idx_mask]
-            num_points = pts_features.shape[0]
+        # Gather hard selections (+ a padded row to index when pad_idx appears)
+        point_feats_pad = torch.cat([point_feats, point_feats.new_zeros(1, self.token_dim)], dim=0)
+        xyzt_pad = torch.cat([xyzt, xyzt.new_zeros(1, 4)], dim=0)
+        sel_tokens_hard = point_feats_pad[sel_idx]  # [B, k_eff, D]
+        sel_xyzt_hard = xyzt_pad[sel_idx]          # [B, k_eff, 4]
 
-            if num_points == 0:
-                tokens = torch.zeros((self.max_tokens, self.token_dim), device=features.device, dtype=point_feats.dtype)
-                cents = torch.zeros((self.max_tokens, 4), device=coords.device, dtype=coords.dtype)
-                mask = torch.zeros((self.max_tokens,), device=features.device, dtype=torch.bool)
-                tokens_list.append(tokens)
-                centroids_list.append(cents)
-                mask_list.append(mask)
-                continue
+        # Pad to [B, max_tokens, ...] if needed
+        if k_eff < self.max_tokens:
+            pad_t = torch.zeros((B, self.max_tokens - k_eff, self.token_dim), device=device, dtype=dtype)
+            pad_c = torch.zeros((B, self.max_tokens - k_eff, 4), device=device, dtype=xyzt.dtype)
+            pad_m = torch.zeros((B, self.max_tokens - k_eff), device=device, dtype=torch.bool)
+            sel_tokens_hard = torch.cat([sel_tokens_hard, pad_t], dim=1)
+            sel_xyzt_hard = torch.cat([sel_xyzt_hard, pad_c], dim=1)
+            sel_mask = torch.cat([sel_mask, pad_m], dim=1)
 
-            if num_points <= self.max_tokens:
-                selected_feats = pts_features
-                selected_coords = pts_coords
-                num_valid = num_points
-            else:
-                if self.training:
-                    _, topk_indices = torch.topk(batch_scores, self.max_tokens, largest=True)
-                    selected_feats_hard = pts_features[topk_indices]
-                    selected_coords_hard = pts_coords[topk_indices]
+        # --- Straight-through soft path for gradient to importance ---
+        # Per-batch softmax over all points (optionally uses same noisy logits)
+        soft_w = self._segmented_softmax(logits, layout, tau=self.tau)  # [N], sum_b w_b = 1
+        # Soft aggregates per batch
+        soft_feat = torch.zeros((B, self.token_dim), device=device, dtype=dtype)
+        soft_cent = torch.zeros((B, 4), device=device, dtype=xyzt.dtype)
+        # index_add_: accumulate w * value by batch
+        soft_feat.index_add_(0, batch_ids, (soft_w.unsqueeze(-1) * point_feats).to(soft_feat.dtype))
+        soft_cent.index_add_(0, batch_ids, (soft_w.unsqueeze(-1) * xyzt).to(soft_cent.dtype))
 
-                    soft_weights = torch.softmax(batch_scores / self.tau, dim=0)
-                    selected_feats_soft = torch.matmul(soft_weights.unsqueeze(0), pts_features).squeeze(0)
-                    selected_coords_soft = torch.matmul(soft_weights.unsqueeze(0), pts_coords).squeeze(0)
+        # Repeat soft aggregates across token dimension and apply ST estimator
+        soft_feat_rep = soft_feat.unsqueeze(1).expand(B, self.max_tokens, self.token_dim)
+        soft_cent_rep = soft_cent.unsqueeze(1).expand(B, self.max_tokens, 4)
 
-                    selected_feats_soft = selected_feats_soft.unsqueeze(0).expand(self.max_tokens, -1)
-                    selected_coords_soft = selected_coords_soft.unsqueeze(0).expand(self.max_tokens, -1)
+        # Straight-through composition: forward uses hard; backward flows through soft
+        valid_counts = sel_mask.sum(dim=1, keepdim=True).clamp(min=1)
+        st_scale = (sel_mask.float() / valid_counts).unsqueeze(-1)
+        tokens = sel_tokens_hard + (soft_feat_rep - soft_feat_rep.detach()) * st_scale.to(dtype)
+        centroids = sel_xyzt_hard + (soft_cent_rep - soft_cent_rep.detach()) * st_scale.to(sel_xyzt_hard.dtype)
 
-                    selected_feats = selected_feats_hard + selected_feats_soft - selected_feats_soft.detach()
-                    selected_coords = selected_coords_hard + selected_coords_soft - selected_coords_soft.detach()
-                else:
-                    _, topk_indices = torch.topk(batch_scores, self.max_tokens, largest=True)
-                    selected_feats = pts_features[topk_indices]
-                    selected_coords = pts_coords[topk_indices]
-                num_valid = self.max_tokens
-
-            sort_idx = torch.argsort(selected_coords[:num_valid, 3])
-            selected_coords[:num_valid] = selected_coords[:num_valid][sort_idx]
-            selected_feats[:num_valid] = selected_feats[:num_valid][sort_idx]
-
-            if num_valid < self.max_tokens:
-                pad_tokens = torch.zeros((self.max_tokens - num_valid, self.token_dim), device=features.device, dtype=point_feats.dtype)
-                pad_coords = torch.zeros((self.max_tokens - num_valid, 4), device=coords.device, dtype=coords.dtype)
-                selected_feats = torch.cat([selected_feats, pad_tokens], dim=0)
-                selected_coords = torch.cat([selected_coords, pad_coords], dim=0)
-
-            mask = torch.zeros((self.max_tokens,), device=features.device, dtype=torch.bool)
-            mask[:num_valid] = True
-
-            tokens_list.append(selected_feats)
-            centroids_list.append(selected_coords)
-            mask_list.append(mask)
-
-        tokens = torch.stack(tokens_list, dim=0)
-        centroids = torch.stack(centroids_list, dim=0)
-        mask = torch.stack(mask_list, dim=0)
-
-        return tokens, centroids, mask
+        return tokens, centroids, sel_mask

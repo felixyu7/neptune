@@ -96,25 +96,43 @@ def build_model(cfg: Dict[str, Any], device: torch.device) -> Tuple[torch.nn.Mod
 
     tokenizer_alias = {
         "point_cloud": "v1",
+        "point_cloud_v1": "v1",
+        "point_cloud_v2": "v2",
         "v1": "v1",
         "v2": "v2",
     }
-    tokenizer_type = tokenizer_alias.get(model_opts.get("tokenizer_type", "v1"))
-    if tokenizer_type is None:
+    tokenizer_key = str(model_opts.get("tokenizer_type", "v2")).lower()
+    tokenizer_type = tokenizer_alias.get(tokenizer_key, tokenizer_key)
+    if tokenizer_type not in {"v1", "v2"}:
         raise ValueError(f"Unknown tokenizer_type '{model_opts.get('tokenizer_type')}'")
+
+    use_spacetime_bias = bool(model_opts.get("use_spacetime_bias", False))
+    spacetime_bias_layers = int(model_opts.get("spacetime_bias_layers", 2))
+    bias_kwargs = model_opts.get("bias_kwargs")
+    k_neighbors = model_opts.get("k_neighbors", 8)
+
+    token_dim = model_opts["token_dim"]
+    num_heads = model_opts["num_heads"]
+    if token_dim % num_heads != 0 or (token_dim // num_heads) % 8 != 0:
+        raise ValueError(
+            f"token_dim ({token_dim}) must be divisible by num_heads ({num_heads}) "
+            "and produce a head_dim divisible by 8 for 4D RoPE."
+        )
 
     model = NeptuneModel(
         in_channels=model_opts["in_channels"],
         num_patches=model_opts["num_patches"],
-        token_dim=model_opts["token_dim"],
+        token_dim=token_dim,
         num_layers=model_opts["num_layers"],
-        num_heads=model_opts["num_heads"],
+        num_heads=num_heads,
         hidden_dim=model_opts["hidden_dim"],
         dropout=model_opts["dropout"],
         output_dim=output_dim,
-        k_neighbors=model_opts["k_neighbors"],
-        mlp_layers=model_opts.get("mlp_layers", [256, 512, 768]),
+        k_neighbors=k_neighbors,
         tokenizer_type=tokenizer_type,
+        use_spacetime_bias=use_spacetime_bias,
+        spacetime_bias_layers=spacetime_bias_layers,
+        bias_kwargs=bias_kwargs,
     ).to(device)
 
     return model, {"task": task, "loss": loss_name}

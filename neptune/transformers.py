@@ -1,72 +1,154 @@
+from typing import List, Optional, Tuple
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import RMSNorm  # Assume availability (PyTorch >= 2.1)
 
-class RoPE(nn.Module):
-    def __init__(self, dim, max_seq_len=512, base=10000):
+
+class FourDimRoPE(nn.Module):
+    """
+    Rotary positional embedding that operates directly on (x, y, z, t) coordinates.
+    Each attention head is split into four equal sub-blocks that are rotated using the
+    corresponding coordinate, preserving RoPE's relative property in continuous space.
+    """
+
+    def __init__(self, dim: int, base: float = 10000.0, learnable_axis_scale: bool = True):
         super().__init__()
-        assert dim % 2 == 0, f"RoPE dim must be even (got dim={dim})"
+        assert dim % 8 == 0, f"RoPE head dim must be divisible by 8 (got dim={dim})"
         self.dim = dim
-        self.max_seq_len = max_seq_len
-        self.base = base
+        self.axis_dim = dim // 4
+        assert self.axis_dim % 2 == 0, f"Each axis chunk must be even (got axis_dim={self.axis_dim})"
 
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
-        self.register_buffer("inv_freq", inv_freq)
-        
-        # Pre-compute cos and sin values up to max_seq_len for efficiency
-        self._set_cos_sin_cache(seq_len=self.max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        inv_freqs = []
+        for _ in range(4):
+            freq_indices = torch.arange(0, self.axis_dim, 2).float()
+            inv_freq = base ** (-freq_indices / self.axis_dim)
+            inv_freqs.append(inv_freq)
+        self.register_buffer("inv_freq", torch.stack(inv_freqs, dim=0))  # [4, axis_dim/2]
 
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        """Pre-compute and cache cos/sin values for efficient lookup."""
-        self.max_seq_len = seq_len
-        t = torch.arange(self.max_seq_len, device=device, dtype=dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        
-        # Cache cos and sin values with persistent=False to save checkpoint space
-        # (they can be deterministically recreated from inv_freq and max_seq_len)
-        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
-        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+        if learnable_axis_scale:
+            self.axis_scale = nn.Parameter(torch.ones(4))
+        else:
+            self.register_buffer("axis_scale", torch.ones(4))
+        self.learnable_axis_scale = learnable_axis_scale
 
-    def forward(self, x, seq_len=None):
-        if seq_len is None:
-            seq_len = x.shape[-2]
+    def forward(self, q: torch.Tensor, k: torch.Tensor, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            q, k: (B, H, S, Dh)
+            positions: (B, S, 4) containing absolute (x, y, z, t)
+        Returns:
+            Rotated q and k tensors with the same shape as inputs.
+        """
+        if positions is None:
+            raise ValueError("positions must be provided for FourDimRoPE")
+
+        cos_cache, sin_cache = self._compute_trig_cache(positions)
+        return self._rotate(q, cos_cache, sin_cache), self._rotate(k, cos_cache, sin_cache)
+
+    def _compute_trig_cache(self, positions: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        pos = positions.float()  # (B, S, 4)
+        cos_per_axis: List[torch.Tensor] = []
+        sin_per_axis: List[torch.Tensor] = []
+        device = pos.device
+        dtype = pos.dtype
+
+        for axis in range(4):
+            coord = pos[..., axis] * self.axis_scale[axis]
+            inv_freq = self.inv_freq[axis].to(device=device, dtype=dtype)
+            angles = coord.unsqueeze(-1) * inv_freq  # (B, S, axis_dim/2)
+            cos = torch.cos(angles).unsqueeze(1)  # (B, 1, S, axis_dim/2)
+            sin = torch.sin(angles).unsqueeze(1)  # (B, 1, S, axis_dim/2)
+            cos_per_axis.append(cos)
+            sin_per_axis.append(sin)
+
+        return cos_per_axis, sin_per_axis
+
+    def _rotate(
+        self,
+        x: torch.Tensor,
+        cos_per_axis: List[torch.Tensor],
+        sin_per_axis: List[torch.Tensor],
+    ) -> torch.Tensor:
         original_dtype = x.dtype
-        
-        # Handle edge case where seq_len > max_seq_len by extending cache
-        if seq_len > self.max_seq_len:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=self.inv_freq.dtype)
-        
-        # Efficiently slice pre-computed values instead of recomputing
-        cos_freq = self.cos_cached[:seq_len]
-        sin_freq = self.sin_cached[:seq_len]
-        
-        return self.apply_rotary_pos_emb(x, cos_freq, sin_freq, original_dtype)
-    
-    def apply_rotary_pos_emb(self, x, cos, sin, original_dtype):
-        # x shape: (..., seq_len, dim)
-        seq_len = x.shape[-2]
-        
-        # Ensure cos and sin have the right shape for broadcasting
-        cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0) if x.ndim == 4 else cos[:seq_len, :]
-        sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0) if x.ndim == 4 else sin[:seq_len, :]
-        
-        # Convert to float for computation
-        x = x.float()
-        
-        # Split into even and odd indices
-        x_even = x[..., 0::2]
-        x_odd = x[..., 1::2]
-        
-        # Apply rotation - CORRECTED FORMULA
-        rotated_even = x_even * cos - x_odd * sin
-        rotated_odd = x_odd * cos + x_even * sin
-        
-        # Interleave back
-        out = torch.stack([rotated_even, rotated_odd], dim=-1)
-        out = out.flatten(-2)
-        
-        return out.to(original_dtype)
+        chunks = x.split(self.axis_dim, dim=-1)
+        rotated_chunks = []
+
+        for axis, chunk in enumerate(chunks):
+            chunk = chunk.float()
+            cos = cos_per_axis[axis].to(chunk.dtype)
+            sin = sin_per_axis[axis].to(chunk.dtype)
+
+            x_even = chunk[..., 0::2]
+            x_odd = chunk[..., 1::2]
+
+            rotated_even = x_even * cos - x_odd * sin
+            rotated_odd = x_odd * cos + x_even * sin
+
+            combined = torch.stack([rotated_even, rotated_odd], dim=-1).flatten(-2)
+            rotated_chunks.append(combined)
+
+        return torch.cat(rotated_chunks, dim=-1).to(original_dtype)
+
+
+class RelativeSpacetimeBias(nn.Module):
+    """
+    Computes a relative attention bias based on the Minkowski line element between tokens.
+    Implements the ds definition from the provided description and projects Fourier features
+    into a scalar bias term.
+    """
+
+    def __init__(
+        self,
+        num_freq: int = 16,
+        light_speed: float = 1.0,
+        clip_value: float = 4.0,
+        scale_divisor: float = 1024.0,
+    ):
+        super().__init__()
+        self.light_speed = light_speed
+        self.clip_value = clip_value
+        self.scale_divisor = scale_divisor
+
+        freqs = torch.logspace(0, num_freq - 1, num_freq, base=2.0)
+        self.register_buffer("freqs", freqs)  # [num_freq]
+        self.proj = nn.Linear(num_freq * 2, 1)
+
+    def forward(self, positions: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
+        """
+        Args:
+            positions: (B, S, 4)
+            valid_mask: optional (B, S) boolean mask where True denotes a valid token.
+        Returns:
+            bias: (B, S, S) additive bias or None if S == 0.
+        """
+        if positions is None or positions.numel() == 0:
+            return None
+
+        pos = positions.float()
+        B, S, _ = pos.shape
+        if S == 0:
+            return None
+
+        diff = pos.unsqueeze(2) - pos.unsqueeze(1)  # (B, S, S, 4)
+        dx, dy, dz, dt = diff.unbind(dim=-1)
+        c_dt = self.light_speed * dt
+        ds2 = c_dt.square() - dx.square() - dy.square() - dz.square()
+
+        ds = torch.sign(ds2) * torch.sqrt(ds2.abs() + 1e-12)
+        ds = ds.clamp(min=-self.clip_value, max=self.clip_value)
+        ds = ds / self.scale_divisor
+
+        angles = ds.unsqueeze(-1) * self.freqs.to(ds.device, ds.dtype)  # (B, S, S, num_freq)
+        features = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
+        bias = self.proj(features).squeeze(-1)  # (B, S, S)
+
+        if valid_mask is not None:
+            valid_pairs = valid_mask.unsqueeze(1) & valid_mask.unsqueeze(2)
+            bias = bias.masked_fill(~valid_pairs, 0.0)
+
+        return bias
 
 
 class SwiGLU(nn.Module):
@@ -93,14 +175,23 @@ class SwiGLU(nn.Module):
 
 
 class NeptuneTransformerEncoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, 
-                 layer_norm_eps=1e-5, bias=False, rope_max_seq_len=512, rope_base=10000):
+    def __init__(
+        self,
+        d_model,
+        nhead,
+        dim_feedforward,
+        dropout=0.1,
+        layer_norm_eps=1e-5,
+        bias=False,
+        rope_base=10000.0,
+        learnable_rope_scale=True,
+    ):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
         self.head_dim = d_model // nhead
         assert d_model % nhead == 0, "d_model must be divisible by nhead"
-        assert self.head_dim % 2 == 0, f"head_dim must be even for RoPE (got {self.head_dim})"
+        assert self.head_dim % 8 == 0, f"head_dim must be divisible by 8 for 4D RoPE (got {self.head_dim})"
         
         # Multi-head attention components - using bias=False for stability
         self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=bias)
@@ -116,14 +207,14 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         # Use SwiGLU instead of regular FFN
         self.ffn = SwiGLU(d_model, dim_feedforward, dropout, bias=bias)
         
-        # RoPE
-        self.rope = RoPE(dim=self.head_dim, max_seq_len=rope_max_seq_len, base=rope_base)
+        # 4D RoPE
+        self.rope = FourDimRoPE(dim=self.head_dim, base=rope_base, learnable_axis_scale=learnable_rope_scale)
         
         # Store hyperparameters for cloning
         self.layer_norm_eps = layer_norm_eps
         self.bias = bias
-        self.rope_max_seq_len = rope_max_seq_len
         self.rope_base = rope_base
+        self.learnable_rope_scale = learnable_rope_scale
         
         # Dropout
         self.dropout = nn.Dropout(dropout)
@@ -141,7 +232,7 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         if self.out_proj.bias is not None:
             nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, src, src_key_padding_mask=None):
+    def forward(self, src, positions, src_key_padding_mask=None, relative_bias=None):
         batch_size, seq_len, _ = src.shape
         
         # Self-attention block with pre-norm
@@ -154,12 +245,14 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, S, D)
         q, k, v = qkv[0], qkv[1], qkv[2]  # Each is (B, H, S, D)
         
-        # Apply RoPE to Q and K
-        q = self.rope(q)
-        k = self.rope(k)
+        # Apply 4D RoPE to Q and K
+        q, k = self.rope(q, k, positions)
         
         # Prepare attention mask
-        attn_mask = self._prepare_attention_mask(src_key_padding_mask, q.device)
+        attn_mask = self._prepare_attention_mask(src_key_padding_mask, q.device, q.dtype)
+        if relative_bias is not None:
+            relative_bias = relative_bias.to(dtype=q.dtype, device=q.device).unsqueeze(1)  # (B, 1, S, S)
+            attn_mask = relative_bias if attn_mask is None else (relative_bias + attn_mask)
         
         # Apply attention
         attn_output = F.scaled_dot_product_attention(
@@ -184,18 +277,37 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         
         return x
     
-    def _prepare_attention_mask(self, key_padding_mask, device):
-        """Convert key padding mask to SDPA format where True = allowed to attend."""
+    def _prepare_attention_mask(self, key_padding_mask, device, dtype):
+        """Convert key padding mask to an additive mask with -inf on padded keys."""
         if key_padding_mask is None:
             return None
         
-        # Convert MHA semantics (True = padding) to SDPA semantics (True = allowed)
-        allow = ~key_padding_mask.to(torch.bool).to(device)  # (B, S_k)
-        return allow.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S_k) for broadcasting
+        padding = key_padding_mask.to(torch.bool).to(device)
+        if padding.ndim != 2:
+            raise ValueError("key_padding_mask must have shape (B, S)")
+        mask = torch.zeros(
+            padding.size(0),
+            1,
+            padding.size(1),
+            padding.size(1),
+            device=device,
+            dtype=dtype,
+        )
+        mask_value = torch.finfo(dtype).min
+        mask = mask.masked_fill(padding.unsqueeze(1).unsqueeze(2), mask_value)
+        return mask
 
 
 class NeptuneTransformerEncoder(nn.Module):
-    def __init__(self, encoder_layer, num_layers, norm=None):
+    def __init__(
+        self,
+        encoder_layer,
+        num_layers,
+        norm=None,
+        use_spacetime_bias: bool = False,
+        spacetime_bias_layers: int = 0,
+        bias_kwargs: Optional[dict] = None,
+    ):
         super().__init__()
         # Create separate instances for each layer to avoid weight sharing
         self.layers = nn.ModuleList([
@@ -203,6 +315,8 @@ class NeptuneTransformerEncoder(nn.Module):
         ])
         self.num_layers = num_layers
         self.norm = norm
+        self.spacetime_bias_layers = min(spacetime_bias_layers, num_layers) if use_spacetime_bias else 0
+        self.relative_bias = RelativeSpacetimeBias(**(bias_kwargs or {})) if use_spacetime_bias else None
         
         # Apply depth-scaled initialization for residual connections
         self._apply_depth_scaled_init()
@@ -217,8 +331,8 @@ class NeptuneTransformerEncoder(nn.Module):
                 dropout=module.dropout.p,
                 layer_norm_eps=module.layer_norm_eps,
                 bias=module.bias,
-                rope_max_seq_len=module.rope_max_seq_len,
                 rope_base=module.rope_base,
+                learnable_rope_scale=module.learnable_rope_scale,
             )
         else:
             import copy
@@ -240,13 +354,19 @@ class NeptuneTransformerEncoder(nn.Module):
                 with torch.no_grad():
                     layer.ffn.w2.weight.mul_(scale_factor)
 
-    def forward(self, src, src_key_padding_mask=None):
+    def forward(self, src, positions, src_key_padding_mask=None, valid_mask=None):
         output = src
+        bias = None
+        if self.relative_bias is not None and positions is not None:
+            bias = self.relative_bias(positions, valid_mask=valid_mask)
         
-        for mod in self.layers:
+        for idx, mod in enumerate(self.layers):
+            layer_bias = bias if (bias is not None and idx < self.spacetime_bias_layers) else None
             output = mod(
-                output, 
-                src_key_padding_mask=src_key_padding_mask
+                output,
+                positions,
+                src_key_padding_mask=src_key_padding_mask,
+                relative_bias=layer_bias,
             )
 
         if self.norm is not None:
