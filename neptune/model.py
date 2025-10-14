@@ -15,23 +15,6 @@ from .transformers import (
 from .tokenizer import PointCloudTokenizerV1, PointCloudTokenizerV2
 
 
-class AttentionPool(nn.Module):
-    """Masked attention pooling for global feature."""
-    def __init__(self, dim: int):
-        super().__init__()
-        self.query = nn.Parameter(torch.randn(dim))
-
-    def forward(self, x: Tensor, mask: Optional[Tensor]) -> Tensor:
-        # x: [B,S,D], mask: [B,S] True=valid
-        B, S, D = x.shape
-        q = self.query.view(1, 1, D)        # [1,1,D]
-        scores = (x * q).sum(-1) / (D ** 0.5)    # [B,S]
-        if mask is not None:
-            scores = scores.masked_fill(~mask, float("-inf"))
-        w = torch.softmax(scores, dim=1).unsqueeze(-1)  # [B,S,1]
-        return (x * w).sum(dim=1)                       # [B,D]
-
-
 class PointTransformerEncoder(nn.Module):
     """Encoder wrapper with centroid-aware 4D RoPE and optional spacetime bias."""
     def __init__(
@@ -63,15 +46,17 @@ class PointTransformerEncoder(nn.Module):
             bias_kwargs=bias_kwargs,
         )
         self.norm = nn.RMSNorm(token_dim)
-        self.pool = AttentionPool(token_dim)
 
     def forward(self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor] = None) -> Tensor:
         # Run encoder with centroid-aware 4D RoPE (optional relative bias enabled via config)
         attn_pad = (~masks) if masks is not None else None
         x = self.layers(tokens, centroids, src_key_padding_mask=attn_pad, valid_mask=masks)
         x = self.norm(x)
-        # Global pooling (attention pooling; masked)
-        return self.pool(x, masks)
+        if masks is None:
+            return x.mean(dim=1)
+        weights = masks.to(dtype=x.dtype).unsqueeze(-1)
+        denom = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
+        return (x * weights).sum(dim=1) / denom.squeeze(1)
 
 
 class NeptuneModel(nn.Module):
@@ -103,7 +88,11 @@ class NeptuneModel(nn.Module):
             )
         elif tokenizer_type == "v2":
             self.tokenizer = PointCloudTokenizerV2(
-                feature_dim=in_channels, max_tokens=num_patches, token_dim=token_dim, mlp_layers=[256,512,768]
+                feature_dim=in_channels,
+                max_tokens=num_patches,
+                token_dim=token_dim,
+                mlp_layers=[256,512,768],
+                k_neighbors=k_neighbors,
             )
         else:
             raise ValueError(f"Unknown tokenizer type: {tokenizer_type}")

@@ -138,9 +138,10 @@ class PointCloudTokenizerV2(nn.Module):
       - Segmented top-k per batch without Python loops.
       - Straight-through path so the importance scorer learns end-to-end.
       - Optional Gumbel-Top-k noise during training.
+      - Fully vectorized k-NN neighborhood aggregation after selection.
 
     Output (unchanged API):
-        tokens   : [B, max_tokens, token_dim]
+        tokens   : [B, max_tokens, token_dim] (neighbor-aggregated)
         centroids: [B, max_tokens, 4]     (x,y,z,time)
         mask     : [B, max_tokens] (bool) True for valid tokens
     """
@@ -152,12 +153,14 @@ class PointCloudTokenizerV2(nn.Module):
         mlp_layers: list = [256, 512, 768],
         tau: float = 2.0,
         use_gumbel_topk: bool = True,
+        k_neighbors: int = 16,
     ):
         super().__init__()
         self.max_tokens = max_tokens
         self.token_dim = token_dim
         self.tau = nn.Parameter(torch.tensor(float(tau)))  # learnable temperature
         self.use_gumbel_topk = use_gumbel_topk
+        self.k_neighbors = int(k_neighbors)
 
         # Coordinate processing (keep structure close to original V2)
         self.coord_norm = nn.LayerNorm(4)
@@ -179,6 +182,13 @@ class PointCloudTokenizerV2(nn.Module):
             nn.Linear(token_dim, max(32, token_dim // 2)),
             nn.ReLU(inplace=True),
             nn.Linear(max(32, token_dim // 2), 1),
+        )
+
+        # Neighborhood Aggregation MLP (vectorized), mirrors V1 but batched
+        self.neighborhood_mlp = nn.Sequential(
+            nn.Linear(token_dim, token_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(token_dim, token_dim),
         )
 
     @staticmethod
@@ -322,11 +332,52 @@ class PointCloudTokenizerV2(nn.Module):
         B, counts, offsets, perm, b_sorted, pos_in_b, max_per_b = layout
         k_eff = sel_idx.size(1)  # <= max_tokens
 
-        # Gather hard selections (+ a padded row to index when pad_idx appears)
-        point_feats_pad = torch.cat([point_feats, point_feats.new_zeros(1, self.token_dim)], dim=0)
+        # Gather selected centroids (+ padded row for pad_idx)
         xyzt_pad = torch.cat([xyzt, xyzt.new_zeros(1, 4)], dim=0)
-        sel_tokens_hard = point_feats_pad[sel_idx]  # [B, k_eff, D]
         sel_xyzt_hard = xyzt_pad[sel_idx]          # [B, k_eff, 4]
+
+        # --- Fully vectorized neighborhood aggregation around selected centroids ---
+        # Build dense [B, max_per_b, *] tables for all points in each batch
+        # Map flat arrays by batch into padded layout
+        if max_per_b > 0 and k_eff > 0 and self.k_neighbors > 0:
+            # Tables for coordinates and point features
+            xyzt_table = xyzt.new_zeros((B, max_per_b, 4))
+            xyzt_table[b_sorted, pos_in_b] = xyzt[perm]
+            feats_table = point_feats.new_zeros((B, max_per_b, self.token_dim))
+            feats_table[b_sorted, pos_in_b] = point_feats[perm]
+
+            # Valid mask for points per batch
+            row_pos = torch.arange(max_per_b, device=device).unsqueeze(0).expand(B, -1)
+            valid_pts = row_pos < counts.unsqueeze(1)  # [B, max_per_b]
+
+            # Distances [B, k_eff, max_per_b] using broadcasted squared L2 in 4D (x,y,z,t)
+            # Use broadcasting to avoid torch.cdist dtype/backends limitations
+            diff = sel_xyzt_hard.unsqueeze(2) - xyzt_table.unsqueeze(1)  # [B, k_eff, max_per_b, 4]
+            dists = (diff * diff).sum(dim=-1)
+            # Mask out invalid points so they aren't selected
+            large = torch.finfo(dists.dtype).max
+            dists = torch.where(valid_pts.unsqueeze(1), dists, dists.new_full((), large))
+
+            # Top-k neighbors per selected centroid (per batch)
+            k_nn = int(min(self.k_neighbors, max_per_b))
+            if k_nn > 0:
+                _, nn_idx = torch.topk(dists, k=k_nn, largest=False, dim=2)  # [B, k_eff, k]
+                # Gather neighbor features: [B, k_eff, k, D]
+                feats_exp = feats_table.unsqueeze(1).expand(B, k_eff, max_per_b, self.token_dim)
+                nn_idx_exp = nn_idx.unsqueeze(-1).expand(B, k_eff, k_nn, self.token_dim)
+                neigh_feats = torch.gather(feats_exp, 2, nn_idx_exp)
+                # Pool (max) over neighbors -> [B, k_eff, D]
+                pooled = neigh_feats.max(dim=2).values
+                # Aggregation MLP
+                sel_tokens_hard = self.neighborhood_mlp(pooled)
+                # Zero-out entries where selection is invalid for a given batch
+                sel_tokens_hard = sel_tokens_hard * sel_mask.to(dtype).unsqueeze(-1)
+            else:
+                sel_tokens_hard = point_feats.new_zeros((B, k_eff, self.token_dim))
+        else:
+            # Fallback to per-point features if no neighbors available
+            point_feats_pad = torch.cat([point_feats, point_feats.new_zeros(1, self.token_dim)], dim=0)
+            sel_tokens_hard = point_feats_pad[sel_idx]  # [B, k_eff, D]
 
         # Pad to [B, max_tokens, ...] if needed
         if k_eff < self.max_tokens:

@@ -17,7 +17,12 @@ if ML_COMMON_ROOT.exists():
     sys.path.append(str(ML_COMMON_ROOT))
 
 from ml_common.dataloaders import create_dataloaders
-from ml_common.losses import angular_distance_loss, gaussian_nll_loss, von_mises_fisher_loss
+from ml_common.losses import (
+    CombinedDirectionalLoss,
+    angular_distance_loss,
+    gaussian_nll_loss,
+    von_mises_fisher_loss,
+)
 from ml_common.training import Trainer
 from neptune import NeptuneModel
 
@@ -31,29 +36,21 @@ def parse_args() -> argparse.Namespace:
 
 def load_config(cfg_path: str) -> Dict[str, Any]:
     with open(cfg_path, "r") as cfg_file:
-        return yaml.load(cfg_file, Loader=yaml.FullLoader)
+        return yaml.safe_load(cfg_file)
 
 
 def normalize_config(cfg: Dict[str, Any]) -> None:
-    dataloader = cfg.get("dataloader", "mmap").lower()
-    dataloader_map = {
-        "prometheus": "mmap",
-        "icecube": "mmap",
-        "mmap": "mmap",
-        "kaggle": "kaggle",
-        "i3": "i3",
-    }
-    cfg["dataloader"] = dataloader_map.get(dataloader, dataloader)
+    dataloader = cfg.get("dataloader")
+    allowed_dataloaders = {"mmap", "kaggle", "i3"}
+    if dataloader not in allowed_dataloaders:
+        raise ValueError(f"dataloader must be one of {sorted(allowed_dataloaders)}, got {dataloader}")
 
     training_opts = cfg.get("training_options", {})
-    precision_map = {
-        "bf16-mixed": "bf16",
-        "fp16-mixed": "fp16",
-        "float32": "fp32",
-    }
-    value = training_opts.get("precision")
-    if isinstance(value, str):
-        training_opts["precision"] = precision_map.get(value.lower(), value.lower())
+    precision = training_opts.get("precision", "fp32")
+    allowed_precisions = {"bf16", "fp16", "fp32"}
+    if precision not in allowed_precisions:
+        raise ValueError(f"precision must be one of {sorted(allowed_precisions)}, got {precision}")
+    training_opts["precision"] = precision
 
     schedule = training_opts.pop("lr_schedule", None)
     if schedule is not None and "T_max" not in training_opts:
@@ -82,8 +79,7 @@ def setup_wandb(cfg: Dict[str, Any]) -> bool:
     return True
 
 
-def build_model(cfg: Dict[str, Any], device: torch.device) -> Tuple[torch.nn.Module, Dict[str, Any]]:
-    model_opts = cfg["model_options"]
+def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Module:
     task = model_opts["downstream_task"]
     loss_name = model_opts["loss_fn"]
 
@@ -94,17 +90,9 @@ def build_model(cfg: Dict[str, Any], device: torch.device) -> Tuple[torch.nn.Mod
     else:
         raise ValueError(f"Unsupported downstream_task '{task}'")
 
-    tokenizer_alias = {
-        "point_cloud": "v1",
-        "point_cloud_v1": "v1",
-        "point_cloud_v2": "v2",
-        "v1": "v1",
-        "v2": "v2",
-    }
-    tokenizer_key = str(model_opts.get("tokenizer_type", "v2")).lower()
-    tokenizer_type = tokenizer_alias.get(tokenizer_key, tokenizer_key)
+    tokenizer_type = model_opts.get("tokenizer_type", "v2")
     if tokenizer_type not in {"v1", "v2"}:
-        raise ValueError(f"Unknown tokenizer_type '{model_opts.get('tokenizer_type')}'")
+        raise ValueError(f"tokenizer_type must be 'v1' or 'v2', got {tokenizer_type}")
 
     use_spacetime_bias = bool(model_opts.get("use_spacetime_bias", False))
     spacetime_bias_layers = int(model_opts.get("spacetime_bias_layers", 2))
@@ -133,24 +121,38 @@ def build_model(cfg: Dict[str, Any], device: torch.device) -> Tuple[torch.nn.Mod
         use_spacetime_bias=use_spacetime_bias,
         spacetime_bias_layers=spacetime_bias_layers,
         bias_kwargs=bias_kwargs,
-    ).to(device)
+    )
+    return model.to(device)
 
-    return model, {"task": task, "loss": loss_name}
 
+def build_loss_function(model_opts: Dict[str, Any]):
+    task = model_opts["downstream_task"]
+    loss_name = model_opts["loss_fn"]
+    loss_kwargs = model_opts.get("loss_kwargs", {})
 
-def build_loss_function(task: str, loss_name: str):
     if task == "angular_reco":
         if loss_name == "angular_distance":
-            return lambda preds, labels: angular_distance_loss(preds, labels[:, 1:4])
+            return lambda preds, labels: angular_distance_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
         if loss_name == "vmf":
             return lambda preds, labels: von_mises_fisher_loss(
                 preds, F.normalize(labels[:, 1:4], p=2, dim=1)
             )
+        if loss_name == "combined_vmf_angular":
+            mixed_loss = CombinedDirectionalLoss(**loss_kwargs)
+
+            def loss_fn(preds, labels):
+                targets = F.normalize(labels[:, 1:4], p=2, dim=1)
+                return mixed_loss(preds, targets)
+
+            loss_fn.set_epoch_progress = mixed_loss.set_epoch_progress  # type: ignore[attr-defined]
+            loss_fn.current_weights = mixed_loss.current_weights  # type: ignore[attr-defined]
+            return loss_fn
+
     if task == "energy_reco":
         if loss_name == "gaussian_nll":
-            return lambda preds, labels: gaussian_nll_loss(
-                preds[:, 0], preds[:, 1], labels[:, 0]
-            )
+            return lambda preds, labels: gaussian_nll_loss(preds[:, 0], preds[:, 1], labels[:, 0])
         if loss_name == "mse":
             return lambda preds, labels: F.mse_loss(preds[:, 0], labels[:, 0])
 
@@ -160,9 +162,10 @@ def build_loss_function(task: str, loss_name: str):
 def build_metric_function(task: str):
     if task == "angular_reco":
         def metric_fn(preds, labels):
-            true_dirs = labels[:, 1:4]
+            target_dirs = F.normalize(labels[:, 1:4], p=2, dim=1)
             preds_norm = F.normalize(preds, p=2, dim=1)
-            errors_rad = angular_distance_loss(preds_norm, true_dirs, reduction="none") * torch.pi
+            errors = angular_distance_loss(preds_norm, target_dirs, reduction="none")
+            errors_rad = errors * torch.pi
             return {
                 "mean_angular_error_deg": torch.rad2deg(errors_rad.mean()).item(),
                 "median_angular_error_deg": torch.rad2deg(torch.median(errors_rad)).item(),
@@ -201,9 +204,10 @@ def main() -> None:
 
     train_loader, val_loader = create_dataloaders(cfg)
 
-    model, meta = build_model(cfg, device)
-    loss_fn = build_loss_function(meta["task"], meta["loss"])
-    metric_fn = build_metric_function(meta["task"])
+    model_opts = cfg["model_options"]
+    model = build_model(model_opts, device)
+    loss_fn = build_loss_function(model_opts)
+    metric_fn = build_metric_function(model_opts["downstream_task"])
 
     use_wandb = False if args.no_wandb else setup_wandb(cfg)
 
