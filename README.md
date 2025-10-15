@@ -1,6 +1,6 @@
 # Neptune: An Efficient Point Transformer for Ultrarelativistic Neutrino Events
 
-Neptune (a**N** **E**fficient **P**oint **T**ransformer for **U**ltrarelativistic **N**eutrino **E**vents) is a transformer-based point cloud processing model for neutrino event reconstruction. (WIP, not yet on PyPI)
+Neptune (a**N** **E**fficient **P**oint **T**ransformer for **U**ltrarelativistic **N**eutrino **E**vents) is a transformer-based point cloud processing model for neutrino event reconstruction, as described in this [paper](https://arxiv.org/abs/2510.01733).
 
 ```bash
 pip install -e .

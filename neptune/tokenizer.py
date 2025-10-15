@@ -216,6 +216,16 @@ class FPSTokenizer(nn.Module):
 
             tokens[valid_batches, valid_slots] = aggregated
 
+        # Sort valid tokens in ascending time order so RoPE indices align with temporal structure.
+        if centroid_mask.any():
+            times = centroids[..., 3]
+            inf = torch.finfo(times.dtype).max
+            padded_times = torch.where(centroid_mask, times, times.new_full((), inf))
+            sort_idx = torch.argsort(padded_times, dim=1)
+            tokens = torch.gather(tokens, 1, sort_idx.unsqueeze(-1).expand_as(tokens))
+            centroids = torch.gather(centroids, 1, sort_idx.unsqueeze(-1).expand_as(centroids))
+            centroid_mask = torch.gather(centroid_mask.long(), 1, sort_idx).bool()
+
         return tokens, centroids, centroid_mask
 
 class LearnedImportanceTokenizer(nn.Module):
@@ -432,5 +442,15 @@ class LearnedImportanceTokenizer(nn.Module):
         st_scale = (sel_mask.float() / valid_counts).unsqueeze(-1)
         tokens = sel_tokens_hard + (soft_feat_rep - soft_feat_rep.detach()) * st_scale.to(dtype)
         centroids = sel_xyzt_hard + (soft_cent_rep - soft_cent_rep.detach()) * st_scale.to(sel_xyzt_hard.dtype)
+
+        # Ensure temporal order matches positional encoding expectations.
+        if sel_mask.any():
+            times = centroids[..., 3]
+            inf = torch.finfo(times.dtype).max
+            padded_times = torch.where(sel_mask, times, times.new_full((), inf))
+            sort_idx = torch.argsort(padded_times, dim=1)
+            tokens = torch.gather(tokens, 1, sort_idx.unsqueeze(-1).expand_as(tokens))
+            centroids = torch.gather(centroids, 1, sort_idx.unsqueeze(-1).expand_as(centroids))
+            sel_mask = torch.gather(sel_mask.long(), 1, sort_idx).bool()
 
         return tokens, centroids, sel_mask
