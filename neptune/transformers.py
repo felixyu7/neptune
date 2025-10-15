@@ -1,177 +1,75 @@
-from typing import List, Optional, Tuple
+from typing import Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import RMSNorm  # Assume availability (PyTorch >= 2.1)
 
 
-class FourDimRoPE(nn.Module):
-    """
-    Rotary positional embedding that operates directly on (x, y, z, t) coordinates.
-    Each attention head is split into four equal sub-blocks that are rotated using the
-    corresponding coordinate, preserving RoPE's relative property in continuous space.
-    """
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., ::2]
+    x2 = x[..., 1::2]
+    return torch.stack((-x2, x1), dim=-1).flatten(-2)
 
-    def __init__(self, dim: int, base: float = 10000.0, learnable_axis_scale: bool = True):
+
+class RotaryEmbedding(nn.Module):
+    """Standard sequence-wise RoPE."""
+
+    def __init__(self, dim: int, base: float = 10000.0):
         super().__init__()
-        assert dim % 8 == 0, f"RoPE head dim must be divisible by 8 (got dim={dim})"
-        self.dim = dim
-        self.axis_dim = dim // 4
-        assert self.axis_dim % 2 == 0, f"Each axis chunk must be even (got axis_dim={self.axis_dim})"
+        if dim % 2 != 0:
+            raise ValueError(f"RoPE head dim must be even (got dim={dim})")
+        inv_freq = base ** (-torch.arange(0, dim, 2).float() / dim)
+        self.register_buffer("inv_freq", inv_freq)
 
-        inv_freqs = []
-        for _ in range(4):
-            freq_indices = torch.arange(0, self.axis_dim, 2).float()
-            inv_freq = base ** (-freq_indices / self.axis_dim)
-            inv_freqs.append(inv_freq)
-        self.register_buffer("inv_freq", torch.stack(inv_freqs, dim=0))  # [4, axis_dim/2]
+    def _cached_cos_sin(
+        self, seq_len: int, device: torch.device, dtype: torch.dtype
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        positions = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
+        freqs = torch.einsum("i,j->ij", positions, self.inv_freq)
+        emb = torch.cat([freqs, freqs], dim=-1)
+        cos = emb.cos().to(dtype=dtype)
+        sin = emb.sin().to(dtype=dtype)
+        return cos, sin
 
-        if learnable_axis_scale:
-            self.axis_scale = nn.Parameter(torch.ones(4))
-        else:
-            self.register_buffer("axis_scale", torch.ones(4))
-        self.learnable_axis_scale = learnable_axis_scale
-
-    def forward(self, q: torch.Tensor, k: torch.Tensor, positions: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Args:
-            q, k: (B, H, S, Dh)
-            positions: (B, S, 4) containing absolute (x, y, z, t)
-        Returns:
-            Rotated q and k tensors with the same shape as inputs.
-        """
-        if positions is None:
-            raise ValueError("positions must be provided for FourDimRoPE")
-
-        cos_cache, sin_cache = self._compute_trig_cache(positions)
-        return self._rotate(q, cos_cache, sin_cache), self._rotate(k, cos_cache, sin_cache)
-
-    def _compute_trig_cache(self, positions: torch.Tensor) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
-        pos = positions.float()  # (B, S, 4)
-        cos_per_axis: List[torch.Tensor] = []
-        sin_per_axis: List[torch.Tensor] = []
-        device = pos.device
-        dtype = pos.dtype
-
-        for axis in range(4):
-            coord = pos[..., axis] * self.axis_scale[axis]
-            inv_freq = self.inv_freq[axis].to(device=device, dtype=dtype)
-            angles = coord.unsqueeze(-1) * inv_freq  # (B, S, axis_dim/2)
-            cos = torch.cos(angles).unsqueeze(1)  # (B, 1, S, axis_dim/2)
-            sin = torch.sin(angles).unsqueeze(1)  # (B, 1, S, axis_dim/2)
-            cos_per_axis.append(cos)
-            sin_per_axis.append(sin)
-
-        return cos_per_axis, sin_per_axis
-
-    def _rotate(
-        self,
-        x: torch.Tensor,
-        cos_per_axis: List[torch.Tensor],
-        sin_per_axis: List[torch.Tensor],
-    ) -> torch.Tensor:
-        original_dtype = x.dtype
-        chunks = x.split(self.axis_dim, dim=-1)
-        rotated_chunks = []
-
-        for axis, chunk in enumerate(chunks):
-            chunk = chunk.float()
-            cos = cos_per_axis[axis].to(chunk.dtype)
-            sin = sin_per_axis[axis].to(chunk.dtype)
-
-            x_even = chunk[..., 0::2]
-            x_odd = chunk[..., 1::2]
-
-            rotated_even = x_even * cos - x_odd * sin
-            rotated_odd = x_odd * cos + x_even * sin
-
-            combined = torch.stack([rotated_even, rotated_odd], dim=-1).flatten(-2)
-            rotated_chunks.append(combined)
-
-        return torch.cat(rotated_chunks, dim=-1).to(original_dtype)
+    def forward(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        seq_len = q.size(-2)
+        cos, sin = self._cached_cos_sin(seq_len, q.device, q.dtype)
+        cos = cos.unsqueeze(0).unsqueeze(0)
+        sin = sin.unsqueeze(0).unsqueeze(0)
+        q_rot = (q * cos) + (rotate_half(q) * sin)
+        k_rot = (k * cos) + (rotate_half(k) * sin)
+        return q_rot, k_rot
 
 
-class RelativeSpacetimeBias(nn.Module):
-    """
-    Computes a relative attention bias based on the Minkowski line element between tokens.
-    Implements the ds definition from the provided description and projects Fourier features
-    into a scalar bias term.
-    """
+class LayerNormNoBias(nn.Module):
+    """LayerNorm variant retaining scale but no bias."""
 
-    def __init__(
-        self,
-        num_freq: int = 16,
-        light_speed: float = 1.0,
-        clip_value: float = 4.0,
-        scale_divisor: float = 1024.0,
-    ):
+    def __init__(self, normalized_shape: int, eps: float = 1e-5):
         super().__init__()
-        self.light_speed = light_speed
-        self.clip_value = clip_value
-        self.scale_divisor = scale_divisor
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.eps = eps
 
-        freqs = torch.logspace(0, num_freq - 1, num_freq, base=2.0)
-        self.register_buffer("freqs", freqs)  # [num_freq]
-        self.proj = nn.Linear(num_freq * 2, 1)
-
-    def forward(self, positions: torch.Tensor, valid_mask: Optional[torch.Tensor] = None) -> Optional[torch.Tensor]:
-        """
-        Args:
-            positions: (B, S, 4)
-            valid_mask: optional (B, S) boolean mask where True denotes a valid token.
-        Returns:
-            bias: (B, S, S) additive bias or None if S == 0.
-        """
-        if positions is None or positions.numel() == 0:
-            return None
-
-        pos = positions.float()
-        B, S, _ = pos.shape
-        if S == 0:
-            return None
-
-        diff = pos.unsqueeze(2) - pos.unsqueeze(1)  # (B, S, S, 4)
-        dx, dy, dz, dt = diff.unbind(dim=-1)
-        c_dt = self.light_speed * dt
-        ds2 = c_dt.square() - dx.square() - dy.square() - dz.square()
-
-        ds = torch.sign(ds2) * torch.sqrt(ds2.abs() + 1e-12)
-        ds = ds.clamp(min=-self.clip_value, max=self.clip_value)
-        ds = ds / self.scale_divisor
-
-        angles = ds.unsqueeze(-1) * self.freqs.to(ds.device, ds.dtype)  # (B, S, S, num_freq)
-        features = torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1)
-        bias = self.proj(features).squeeze(-1)  # (B, S, S)
-
-        if valid_mask is not None:
-            valid_pairs = valid_mask.unsqueeze(1) & valid_mask.unsqueeze(2)
-            bias = bias.masked_fill(~valid_pairs, 0.0)
-
-        return bias
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return F.layer_norm(x, (self.weight.numel(),), weight=self.weight, bias=None, eps=self.eps)
 
 
-class SwiGLU(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.1, bias=False):
+class GeGLU(nn.Module):
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.1):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
-        self.w2 = nn.Linear(hidden_dim, dim, bias=bias)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=bias)
+        self.hidden_dim = hidden_dim
+        self.input_proj = nn.Linear(dim, hidden_dim * 2, bias=False)
+        self.output_proj = nn.Linear(hidden_dim, dim, bias=False)
         self.dropout = nn.Dropout(dropout)
-        
-        # Initialize with Xavier/Glorot for stable training
         self._initialize_weights()
-    
-    def _initialize_weights(self):
-        """Initialize SwiGLU weights using Xavier/Glorot initialization."""
-        for module in [self.w1, self.w2, self.w3]:
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
 
-    def forward(self, x):
-        # SwiGLU: SiLU(W1 @ x) ⊙ (W3 @ x), then W2
-        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+    def _initialize_weights(self):
+        nn.init.xavier_uniform_(self.input_proj.weight)
+        nn.init.xavier_uniform_(self.output_proj.weight)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        up = self.input_proj(x)
+        gate, value = up.chunk(2, dim=-1)
+        return self.dropout(self.output_proj(F.gelu(gate) * value))
 
 
 class NeptuneTransformerEncoderLayer(nn.Module):
@@ -182,40 +80,36 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         dim_feedforward,
         dropout=0.1,
         layer_norm_eps=1e-5,
-        bias=False,
         rope_base=10000.0,
-        learnable_rope_scale=True,
     ):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
         self.head_dim = d_model // nhead
         assert d_model % nhead == 0, "d_model must be divisible by nhead"
-        assert self.head_dim % 8 == 0, f"head_dim must be divisible by 8 for 4D RoPE (got {self.head_dim})"
-        
-        # Multi-head attention components - using bias=False for stability
-        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=bias)
-        self.out_proj = nn.Linear(d_model, d_model, bias=bias)
-        
+        assert self.head_dim % 2 == 0, f"head_dim must be even for RoPE (got {self.head_dim})"
+
+        # Multi-head attention components (biasless)
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+
         # Initialize weights using industry-standard practices
         self._initialize_weights()
 
-        # RMSNorm
-        self.norm1 = RMSNorm(d_model, eps=layer_norm_eps)
-        self.norm2 = RMSNorm(d_model, eps=layer_norm_eps)
-        
-        # Use SwiGLU instead of regular FFN
-        self.ffn = SwiGLU(d_model, dim_feedforward, dropout, bias=bias)
-        
-        # 4D RoPE
-        self.rope = FourDimRoPE(dim=self.head_dim, base=rope_base, learnable_axis_scale=learnable_rope_scale)
-        
+        # LayerNorm without bias
+        self.norm1 = LayerNormNoBias(d_model, eps=layer_norm_eps)
+        self.norm2 = LayerNormNoBias(d_model, eps=layer_norm_eps)
+
+        # Use GeGLU instead of regular FFN
+        self.ffn = GeGLU(d_model, dim_feedforward, dropout)
+
+        # Standard RoPE
+        self.rope = RotaryEmbedding(dim=self.head_dim, base=rope_base)
+
         # Store hyperparameters for cloning
         self.layer_norm_eps = layer_norm_eps
-        self.bias = bias
         self.rope_base = rope_base
-        self.learnable_rope_scale = learnable_rope_scale
-        
+
         # Dropout
         self.dropout = nn.Dropout(dropout)
         self.attn_dropout = dropout
@@ -224,36 +118,29 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         """Initialize weights using modern industry-standard practices."""
         # Q, K, V projections: Xavier/Glorot initialization
         nn.init.xavier_uniform_(self.qkv_proj.weight)
-        if self.qkv_proj.bias is not None:
-            nn.init.zeros_(self.qkv_proj.bias)
-        
+
         # Output projection: Xavier/Glorot but may be scaled later for deep networks
         nn.init.xavier_uniform_(self.out_proj.weight)
-        if self.out_proj.bias is not None:
-            nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, src, positions, src_key_padding_mask=None, relative_bias=None):
+    def forward(self, src, src_key_padding_mask=None):
         batch_size, seq_len, _ = src.shape
-        
+
         # Self-attention block with pre-norm
         x = src
         x_norm = self.norm1(x)
-        
+
         # Compute Q, K, V
         qkv = self.qkv_proj(x_norm)
         qkv = qkv.reshape(batch_size, seq_len, 3, self.nhead, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, S, D)
         q, k, v = qkv[0], qkv[1], qkv[2]  # Each is (B, H, S, D)
-        
-        # Apply 4D RoPE to Q and K
-        q, k = self.rope(q, k, positions)
-        
+
+        # Apply standard RoPE to Q and K
+        q, k = self.rope(q, k)
+
         # Prepare attention mask
         attn_mask = self._prepare_attention_mask(src_key_padding_mask, q.device, q.dtype)
-        if relative_bias is not None:
-            relative_bias = relative_bias.to(dtype=q.dtype, device=q.device).unsqueeze(1)  # (B, 1, S, S)
-            attn_mask = relative_bias if attn_mask is None else (relative_bias + attn_mask)
-        
+
         # Apply attention
         attn_output = F.scaled_dot_product_attention(
             q, k, v,
@@ -261,20 +148,20 @@ class NeptuneTransformerEncoderLayer(nn.Module):
             dropout_p=self.attn_dropout if self.training else 0.0,
             is_causal=False  # We handle causality manually
         )
-        
+
         # Reshape and project output
         attn_output = attn_output.transpose(1, 2)  # (B, S, H, D)
         attn_output = attn_output.contiguous().view(batch_size, seq_len, self.d_model)
         attn_output = self.out_proj(attn_output)
-        
+
         # Residual connection
         x = x + self.dropout(attn_output)
-        
+
         # FFN block with pre-norm
         x_norm = self.norm2(x)
         ff_output = self.ffn(x_norm)
-        x = x + ff_output  # Dropout already applied in SwiGLU
-        
+        x = x + ff_output  # Dropout already applied in GeGLU
+
         return x
     
     def _prepare_attention_mask(self, key_padding_mask, device, dtype):
@@ -303,10 +190,6 @@ class NeptuneTransformerEncoder(nn.Module):
         self,
         encoder_layer,
         num_layers,
-        norm=None,
-        use_spacetime_bias: bool = False,
-        spacetime_bias_layers: int = 0,
-        bias_kwargs: Optional[dict] = None,
     ):
         super().__init__()
         # Create separate instances for each layer to avoid weight sharing
@@ -314,10 +197,7 @@ class NeptuneTransformerEncoder(nn.Module):
             self._get_cloned_layer(encoder_layer) for _ in range(num_layers)
         ])
         self.num_layers = num_layers
-        self.norm = norm
-        self.spacetime_bias_layers = min(spacetime_bias_layers, num_layers) if use_spacetime_bias else 0
-        self.relative_bias = RelativeSpacetimeBias(**(bias_kwargs or {})) if use_spacetime_bias else None
-        
+
         # Apply depth-scaled initialization for residual connections
         self._apply_depth_scaled_init()
 
@@ -327,12 +207,10 @@ class NeptuneTransformerEncoder(nn.Module):
             return NeptuneTransformerEncoderLayer(
                 d_model=module.d_model,
                 nhead=module.nhead,
-                dim_feedforward=module.ffn.w1.out_features,
+                dim_feedforward=module.ffn.hidden_dim,
                 dropout=module.dropout.p,
                 layer_norm_eps=module.layer_norm_eps,
-                bias=module.bias,
                 rope_base=module.rope_base,
-                learnable_rope_scale=module.learnable_rope_scale,
             )
         else:
             import copy
@@ -350,26 +228,15 @@ class NeptuneTransformerEncoder(nn.Module):
                 with torch.no_grad():
                     layer.out_proj.weight.mul_(scale_factor)
                 
-                # Scale FFN down projection (w2 in SwiGLU)
+                # Scale FFN down projection
                 with torch.no_grad():
-                    layer.ffn.w2.weight.mul_(scale_factor)
+                    layer.ffn.output_proj.weight.mul_(scale_factor)
 
-    def forward(self, src, positions, src_key_padding_mask=None, valid_mask=None):
+    def forward(self, src, src_key_padding_mask=None):
         output = src
-        bias = None
-        if self.relative_bias is not None and positions is not None:
-            bias = self.relative_bias(positions, valid_mask=valid_mask)
-        
-        for idx, mod in enumerate(self.layers):
-            layer_bias = bias if (bias is not None and idx < self.spacetime_bias_layers) else None
+        for mod in self.layers:
             output = mod(
                 output,
-                positions,
                 src_key_padding_mask=src_key_padding_mask,
-                relative_bias=layer_bias,
             )
-
-        if self.norm is not None:
-            output = self.norm(output)
-
         return output

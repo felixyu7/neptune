@@ -25,10 +25,8 @@ classifiers = [
 ]
 requires-python = ">=3.8"
 dependencies = [
-    "torch>=1.12.0",
-    "numpy>=1.20.0",
-    "fpsample>=0.2.0",
-    "ml-common>=0.1.0",
+    "torch>=2.0",
+    "numpy>=1.20.0"
 ]
 
 [project.optional-dependencies]

@@ -90,14 +90,12 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     else:
         raise ValueError(f"Unsupported downstream_task '{task}'")
 
-    tokenizer_type = model_opts.get("tokenizer_type", "v2")
-    if tokenizer_type not in {"v1", "v2"}:
-        raise ValueError(f"tokenizer_type must be 'v1' or 'v2', got {tokenizer_type}")
+    tokenizer_type = model_opts.get("tokenizer_type", "learned_importance")
+    if tokenizer_type not in {"fps", "learned_importance"}:
+        raise ValueError(f"tokenizer_type must be 'fps' or 'learned_importance', got {tokenizer_type}")
 
-    use_spacetime_bias = bool(model_opts.get("use_spacetime_bias", False))
-    spacetime_bias_layers = int(model_opts.get("spacetime_bias_layers", 2))
-    bias_kwargs = model_opts.get("bias_kwargs")
     k_neighbors = model_opts.get("k_neighbors", 8)
+    tokenizer_kwargs = model_opts.get("tokenizer_kwargs")
 
     token_dim = model_opts["token_dim"]
     num_heads = model_opts["num_heads"]
@@ -118,9 +116,7 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         output_dim=output_dim,
         k_neighbors=k_neighbors,
         tokenizer_type=tokenizer_type,
-        use_spacetime_bias=use_spacetime_bias,
-        spacetime_bias_layers=spacetime_bias_layers,
-        bias_kwargs=bias_kwargs,
+        tokenizer_kwargs=tokenizer_kwargs,
     )
     return model.to(device)
 

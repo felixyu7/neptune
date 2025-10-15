@@ -1,22 +1,22 @@
 # model.py
 """
-Neptune (next-gen): transformer for point-cloud neutrino event reconstruction.
+Neptune neutrino event reconstruction.
 """
 import torch
 import torch.nn as nn
 from torch import Tensor
-from typing import Optional
+from typing import Optional, Dict, Any
 
 from .transformers import (
-    SwiGLU,                  # from your file
+    LayerNormNoBias,
     NeptuneTransformerEncoder,
     NeptuneTransformerEncoderLayer,
 )
-from .tokenizer import PointCloudTokenizerV1, PointCloudTokenizerV2
+from .tokenizer import FPSTokenizer, LearnedImportanceTokenizer
 
 
 class PointTransformerEncoder(nn.Module):
-    """Encoder wrapper with centroid-aware 4D RoPE and optional spacetime bias."""
+    """Encoder wrapper with centroid-aware inputs."""
     def __init__(
         self,
         token_dim=768,
@@ -24,9 +24,6 @@ class PointTransformerEncoder(nn.Module):
         num_heads=12,
         hidden_dim=3072,
         dropout=0.1,
-        use_spacetime_bias: bool = True,
-        spacetime_bias_layers: int = 2,
-        bias_kwargs: Optional[dict] = None,
     ):
         super().__init__()
         self.token_dim = token_dim
@@ -37,20 +34,24 @@ class PointTransformerEncoder(nn.Module):
             dim_feedforward=hidden_dim,
             dropout=dropout,
         )
-        bias_kwargs = bias_kwargs or {}
+        self.centroid_mlp = nn.Sequential(
+            nn.Linear(4, token_dim, bias=False),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim, bias=False),
+        )
         self.layers = NeptuneTransformerEncoder(
             enc_layer,
             num_layers=num_layers,
-            use_spacetime_bias=use_spacetime_bias,
-            spacetime_bias_layers=min(spacetime_bias_layers, num_layers),
-            bias_kwargs=bias_kwargs,
         )
-        self.norm = nn.RMSNorm(token_dim)
+        self.norm = LayerNormNoBias(token_dim)
 
     def forward(self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor] = None) -> Tensor:
-        # Run encoder with centroid-aware 4D RoPE (optional relative bias enabled via config)
+        # Run encoder with centroid-aware inputs
         attn_pad = (~masks) if masks is not None else None
-        x = self.layers(tokens, centroids, src_key_padding_mask=attn_pad, valid_mask=masks)
+        centroid_emb = self.centroid_mlp(centroids.to(tokens.dtype))
+        if masks is not None:
+            centroid_emb = centroid_emb * masks.to(dtype=centroid_emb.dtype).unsqueeze(-1)
+        x = self.layers(tokens + centroid_emb, src_key_padding_mask=attn_pad)
         x = self.norm(x)
         if masks is None:
             return x.mean(dim=1)
@@ -62,7 +63,7 @@ class PointTransformerEncoder(nn.Module):
 class NeptuneModel(nn.Module):
     """
     Next-gen Neptune:
-      - tokenizer_type: "v1" | "v2" | "v3" (default "v3")
+      - tokenizer_type: "fps" | "learned_importance"
     """
     def __init__(
         self,
@@ -74,28 +75,35 @@ class NeptuneModel(nn.Module):
         hidden_dim: int = 3072,
         dropout: float = 0.1,
         output_dim: int = 3,
-        tokenizer_type: str = "v2",
-        use_spacetime_bias: bool = False,
-        spacetime_bias_layers: int = 2,
-        bias_kwargs: Optional[dict] = None,
-        k_neighbors: int = 8,   # only for v1
+        tokenizer_type: str = "learned_importance",
+        k_neighbors: int = 8,   # only for fps
+        tokenizer_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
+        tokenizer_cfg: Dict[str, Any] = dict(tokenizer_kwargs or {})
+        mlp_layers_cfg = tokenizer_cfg.pop("mlp_layers", [256, 512, 768])
 
-        if tokenizer_type == "v1":
-            self.tokenizer = PointCloudTokenizerV1(
-                feature_dim=in_channels, max_tokens=num_patches, token_dim=token_dim, mlp_layers=[256,512,768], k_neighbors=k_neighbors
-            )
-        elif tokenizer_type == "v2":
-            self.tokenizer = PointCloudTokenizerV2(
+        if tokenizer_type == "fps":
+            k_val = tokenizer_cfg.pop("k_neighbors", k_neighbors)
+            self.tokenizer = FPSTokenizer(
                 feature_dim=in_channels,
                 max_tokens=num_patches,
                 token_dim=token_dim,
-                mlp_layers=[256,512,768],
-                k_neighbors=k_neighbors,
+                mlp_layers=mlp_layers_cfg,
+                k_neighbors=k_val,
+                **tokenizer_cfg,
+            )
+        elif tokenizer_type == "learned_importance":
+            tokenizer_cfg.pop("k_neighbors", None)
+            self.tokenizer = LearnedImportanceTokenizer(
+                feature_dim=in_channels,
+                max_tokens=num_patches,
+                token_dim=token_dim,
+                mlp_layers=mlp_layers_cfg,
+                **tokenizer_cfg,
             )
         else:
-            raise ValueError(f"Unknown tokenizer type: {tokenizer_type}")
+            raise ValueError(f"Unknown tokenizer type: {tokenizer_type}. Expected 'fps' or 'learned_importance'.")
 
         self.encoder = PointTransformerEncoder(
             token_dim=token_dim,
@@ -103,12 +111,9 @@ class NeptuneModel(nn.Module):
             num_heads=num_heads,
             hidden_dim=hidden_dim,
             dropout=dropout,
-            use_spacetime_bias=use_spacetime_bias,
-            spacetime_bias_layers=spacetime_bias_layers,
-            bias_kwargs=bias_kwargs,
         )
         self.head = nn.Sequential(
-            nn.Linear(token_dim, token_dim), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(token_dim, token_dim, bias=False), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(token_dim, output_dim)
         )
 
