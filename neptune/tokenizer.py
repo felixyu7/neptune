@@ -4,229 +4,276 @@ from torch import Tensor
 from typing import List, Tuple, Optional
 
 class FPSTokenizer(nn.Module):
-    """Tokenizes batched point clouds via FPS centroids and k-NN feature pooling."""
-    
-    def __init__(self, 
-                 feature_dim: int, 
-                 max_tokens: int = 128, 
-                 token_dim: int = 768, 
+    """
+    GPU-native, vectorized tokenizer for point clouds:
+      - Per-point MLP
+      - If num_points <= max_tokens: use all points (sorted by time), no neighborhood MLP
+      - Else: FPS on 4D (x,y,z,t) to select max_tokens centroids, kNN pooling, neighborhood MLP
+      - Fully batched and vectorized (no Python loop over batch), only a small loop over K=max_tokens for FPS
+    """
+
+    def __init__(self,
+                 feature_dim: int,
+                 max_tokens: int = 128,
+                 token_dim: int = 768,
                  mlp_layers: List[int] = [256, 512, 768],
                  k_neighbors: int = 16):
         super().__init__()
-            
         self.max_tokens = max_tokens
         self.token_dim = token_dim
         self.k_neighbors = k_neighbors
-        
-        # Per-Point Feature MLP
+
+        # Per-Point Feature MLP (shared)
         mlp = []
         in_dim = feature_dim
         for out_dim in mlp_layers:
-            mlp.extend([
-                nn.Linear(in_dim, out_dim),
-                nn.ReLU(inplace=True)
-            ])
+            mlp += [nn.Linear(in_dim, out_dim), nn.ReLU(inplace=True)]
             in_dim = out_dim
-        mlp.append(nn.Linear(in_dim, token_dim))
+        mlp += [nn.Linear(in_dim, token_dim)]
         self.mlp = nn.Sequential(*mlp)
-        
-        # Neighborhood Aggregation MLP
+
+        # Neighborhood Aggregation MLP (used only when num_points > max_tokens)
         self.neighborhood_mlp = nn.Sequential(
             nn.Linear(token_dim, token_dim),
             nn.ReLU(inplace=True),
             nn.Linear(token_dim, token_dim)
         )
 
-    @staticmethod
-    def _segmented_layout(batch_ids: Tensor, N: int):
-        device = batch_ids.device
-        B = int(batch_ids.max().item() + 1) if batch_ids.numel() > 0 else 0
-        counts = (
-            torch.bincount(batch_ids, minlength=B)
-            if B > 0
-            else torch.zeros(0, dtype=torch.long, device=device)
-        )
-        offsets = torch.zeros(B, dtype=torch.long, device=device)
-        if B > 1:
-            offsets[1:] = torch.cumsum(counts[:-1], dim=0)
-        perm = torch.argsort(batch_ids)
-        b_sorted = batch_ids[perm]
-        pos_in_b = torch.arange(N, device=device) - offsets[b_sorted]
-        max_per_b = int(counts.max().item()) if B > 0 else 0
-        return B, counts, offsets, perm, b_sorted, pos_in_b, max_per_b
+    # ---------- helpers (vectorized) ----------
 
     @staticmethod
-    def _segmented_topk(scores: Tensor, layout, k: int, pad_idx: int):
-        B, counts, _, perm, b_sorted, pos_in_b, max_per_b = layout
-        device = scores.device
+    def _pack_flat_to_padded(points4: Tensor,  # [N,4]
+                              feats: Tensor,   # [N,F]
+                              batch_idx: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """
+        Convert flat lists to padded [B, Nmax, *] without Python loops.
+        Returns:
+          padded_points4: [B, Nmax, 4]
+          padded_feats:   [B, Nmax, F]
+          valid_mask:     [B, Nmax] (bool)
+          counts:         [B] number of points per batch
+        """
+        device = points4.device
+        B = int(batch_idx.max().item()) + 1 if points4.numel() > 0 else 0
         if B == 0:
-            sel_idx = torch.full((0, 0), pad_idx, dtype=torch.long, device=device)
-            sel_mask = torch.zeros((0, 0), dtype=torch.bool, device=device)
-            return sel_idx, sel_mask
+            return (torch.zeros(0, 0, 4, device=device, dtype=points4.dtype),
+                    torch.zeros(0, 0, feats.size(-1), device=device, dtype=feats.dtype),
+                    torch.zeros(0, 0, device=device, dtype=torch.bool),
+                    torch.zeros(0, device=device, dtype=torch.long))
 
-        idx_table = torch.full((B, max_per_b), pad_idx, dtype=torch.long, device=device)
-        idx_table[b_sorted, pos_in_b] = perm
+        counts = torch.bincount(batch_idx, minlength=B)                     # [B]
+        Nmax = int(counts.max().item())
+        N = points4.size(0)
 
-        neg_inf = torch.finfo(scores.dtype).min
-        S = torch.full((B, max_per_b), neg_inf, dtype=scores.dtype, device=device)
-        S[b_sorted, pos_in_b] = scores[perm]
+        # Sort by batch so groups are contiguous
+        sort_idx = torch.argsort(batch_idx, stable=True)
+        b_sorted  = batch_idx[sort_idx]                                     # [N]
+        p_sorted  = points4[sort_idx]                                       # [N,4]
+        f_sorted  = feats[sort_idx]                                         # [N,F]
 
-        k_eff = min(k, max_per_b) if max_per_b > 0 else 0
-        if k_eff == 0:
-            sel_idx = torch.full((B, 0), pad_idx, dtype=torch.long, device=device)
-            sel_mask = torch.zeros((B, 0), dtype=torch.bool, device=device)
-            return sel_idx, sel_mask
+        # Position within each batch: pos = arange(N) - offsets[b_sorted]
+        offsets = torch.cumsum(counts, dim=0) - counts                      # [B]
+        pos_sorted = torch.arange(N, device=device) - offsets[b_sorted]     # [N]
 
-        _, top_pos = torch.topk(S, k=k_eff, dim=1)
-        sel_idx = torch.gather(idx_table, dim=1, index=top_pos)
-        counts_exp = counts.unsqueeze(1)
-        sel_mask = top_pos < counts_exp
-        return sel_idx, sel_mask
+        # Allocate and scatter
+        padded_points4 = torch.zeros(B, Nmax, 4, device=device, dtype=points4.dtype)
+        padded_feats   = torch.zeros(B, Nmax, feats.size(-1), device=device, dtype=feats.dtype)
+        padded_points4[b_sorted, pos_sorted] = p_sorted
+        padded_feats[b_sorted, pos_sorted]   = f_sorted
 
-    def _batched_fps(self, points: Tensor, batch_ids: Tensor):
-        device = points.device
-        N = points.size(0)
-        layout = self._segmented_layout(batch_ids, N)
-        B, counts, _, _, _, _, _ = layout
-        pad_idx = N
+        # Valid mask
+        valid_mask = (torch.arange(Nmax, device=device)[None, :] < counts[:, None])  # [B,Nmax]
+        return padded_points4, padded_feats, valid_mask, counts
 
-        sel_idx = torch.full((B, self.max_tokens), pad_idx, dtype=torch.long, device=device)
-        sel_mask = torch.zeros((B, self.max_tokens), dtype=torch.bool, device=device)
-        if B == 0 or N == 0:
-            return sel_idx, sel_mask
+    @staticmethod
+    def _batched_fps(points4: Tensor,           # [B, N, 4]
+                     valid_mask: Tensor,        # [B, N] bool
+                     K: int) -> Tuple[Tensor, Tensor]:
+        """
+        Batched FPS in PyTorch (Euclidean in 4D). Vectorized across batch.
+        Returns:
+          idx:     [B, K] long indices into N
+          validK:  [B, K] bool (True for real selections; False for padded)
+        """
+        B, N, D = points4.shape
+        device = points4.device
 
-        active = counts > 0
-        if not active.any():
-            return sel_idx, sel_mask
+        if N == 0 or B == 0 or K == 0:
+            return (torch.zeros(B, 0, device=device, dtype=torch.long),
+                    torch.zeros(B, 0, device=device, dtype=torch.bool))
 
-        sums = torch.zeros((B, points.size(1)), dtype=points.dtype, device=device)
-        sums.index_add_(0, batch_ids, points)
-        counts_safe = counts.clamp(min=1).unsqueeze(1).to(points.dtype)
-        means = sums / counts_safe
-        means_expanded = means[batch_ids]
-        dist2_mean = ((points - means_expanded) ** 2).sum(dim=1)
+        # Number of valid points per batch
+        counts = valid_mask.sum(dim=1)                        # [B]
+        K_eff  = torch.clamp(counts, max=K)                   # [B]
 
-        neg_inf = torch.finfo(points.dtype).min
-        min_d2 = torch.full((N,), float("inf"), dtype=points.dtype, device=device)
+        # Distances to the selected set: initialize to +inf for valids, 0 for invalids.
+        inf = torch.tensor(float('inf'), device=device, dtype=points4.dtype)
+        min_dists = torch.full((B, N), inf, device=device, dtype=points4.dtype)
+        min_dists = min_dists.masked_fill(~valid_mask, 0.0)
 
-        active_points = active[batch_ids]
-        min_d2[~active_points] = neg_inf
+        # Deterministic start: point with largest 4D norm among valids
+        norms = (points4.square().sum(dim=2)).masked_fill(~valid_mask, -float('inf'))  # [B,N]
+        first = torch.argmax(norms, dim=1)                                             # [B]
 
-        for t in range(self.max_tokens):
-            if not active.any():
-                break
+        idx = torch.zeros(B, K, device=device, dtype=torch.long)
+        validK = torch.arange(K, device=device)[None, :] < K_eff[:, None]              # [B,K]
 
-            scores = dist2_mean if t == 0 else min_d2
-            sel_t, mask_t = self._segmented_topk(scores, layout, k=1, pad_idx=pad_idx)
-            sel_t = sel_t.squeeze(1)
-            mask_t = mask_t.squeeze(1)
-            mask_t = mask_t & active
-            sel_idx[:, t] = torch.where(mask_t, sel_t, sel_idx[:, t])
-            sel_mask[:, t] = mask_t
+        # Iterative greedy FPS across K (no loop over B).
+        last = first  # [B]
+        for i in range(K):
+            # Update min distances using the newly chosen centroids
+            # Gather centroid coords: [B, D]
+            c = points4[torch.arange(B, device=device), last]                          # [B,D]
+            # dists to all points: [B,N]
+            d = (points4 - c[:, None, :]).square().sum(dim=2)
+            # Only update where valid points exist
+            d = d.masked_fill(~valid_mask, inf)
+            min_dists = torch.minimum(min_dists, d)
 
-            if not mask_t.any():
-                break
+            # Record selection (even if i >= K_eff for some batches; will be ignored by validK)
+            idx[:, i] = last
 
-            valid_batches = mask_t
-            if not valid_batches.any():
-                active = torch.zeros_like(active)
-                break
+            if i + 1 < K:
+                # Next farthest among valids (argmax of min_dists)
+                # For batches with no valids (counts=0), argmax will be 0 but validK will mask it later.
+                last = torch.argmax(min_dists, dim=1)
 
-            batch_centroids = torch.zeros((B, points.size(1)), dtype=points.dtype, device=device)
-            batch_centroids[valid_batches] = points[sel_t[valid_batches]]
-            centroid_per_point = batch_centroids[batch_ids]
-            d2_new = ((points - centroid_per_point) ** 2).sum(dim=1)
-            point_valid = valid_batches[batch_ids]
-            min_d2 = torch.where(point_valid, torch.minimum(min_d2, d2_new), min_d2)
+        return idx, validK
 
-            chosen_points = sel_t[valid_batches]
-            min_d2[chosen_points] = neg_inf
-
-            active = active & ((t + 1) < counts)
-            min_d2[~active[batch_ids]] = neg_inf
-
-        return sel_idx, sel_mask
+    # ---------- main forward ----------
 
     def forward(
         self,
-        coords: Tensor,
-        features: Tensor,
-        batch_ids: Tensor,
-        times: Optional[Tensor] = None,
+        coords: Tensor,        # [N, 3]
+        features: Tensor,      # [N, F]
+        batch_ids: Tensor,     # [N]
+        times: Optional[Tensor] = None,  # [N, 1]
     ) -> Tuple[Tensor, Tensor, Tensor]:
-        if features is None:
-            raise ValueError("features must be provided for tokenization")
+        """
+        Args:
+          coords:    [N, 3] spatial coordinates (x, y, z)
+          features:  [N, F]
+          batch_ids: [N] batch indices
+          times:     [N, 1] optional time coordinates
+        Returns:
+          tokens:    [B, max_tokens, token_dim]
+          centroids: [B, max_tokens, 4]   (x,y,z,t)
+          masks:     [B, max_tokens] bool
+        """
+        device = coords.device
+        dtype_p = coords.dtype
+        dtype_f = features.dtype
 
-        time_column = times
-        if time_column is None:
-            if features.size(1) > 0:
-                time_column = features[:, -1:].clone()
-            else:
-                time_column = coords.new_zeros((coords.size(0), 1))
-
-        batch_size = int(batch_ids.max().item() + 1) if batch_ids.numel() > 0 else 0
-        if batch_size == 0:
-            empty_tokens = torch.zeros((0, self.max_tokens, self.token_dim), device=coords.device, dtype=features.dtype)
-            empty_centroids = torch.zeros((0, self.max_tokens, 4), device=coords.device, dtype=coords.dtype)
-            empty_masks = torch.zeros((0, self.max_tokens), device=coords.device, dtype=torch.bool)
+        if coords.numel() == 0:
+            empty_tokens    = torch.zeros((0, self.max_tokens, self.token_dim), device=device, dtype=features.dtype)
+            empty_centroids = torch.zeros((0, self.max_tokens, 4),              device=device, dtype=coords.dtype)
+            empty_masks     = torch.zeros((0, self.max_tokens),                 device=device, dtype=torch.bool)
             return empty_tokens, empty_centroids, empty_masks
 
-        xyzt = torch.cat([coords, time_column], dim=-1)
-        point_feats = self.mlp(features)
+        batch_idx = batch_ids.long()
+        xyz = coords[:, :3]
+        if times is None:
+            times = coords.new_zeros((coords.size(0), 1))
+        points4 = torch.cat([xyz, times], dim=-1)                                   # [N,4]
 
-        centroid_indices, centroid_mask = self._batched_fps(xyzt, batch_ids)
-        pad_idx = coords.size(0)
+        # Per-point features (shared across both branches)
+        point_feats = self.mlp(features)                                         # [N, token_dim]
 
-        tokens = torch.zeros(
-            (batch_size, self.max_tokens, self.token_dim),
-            device=coords.device,
-            dtype=point_feats.dtype,
-        )
-        centroids = torch.zeros(
-            (batch_size, self.max_tokens, 4),
-            device=coords.device,
-            dtype=coords.dtype,
-        )
+        # Pack to padded [B, Nmax, *]
+        P, Fp, valid_mask, counts = self._pack_flat_to_padded(points4, point_feats, batch_idx)
+        B, Nmax, _ = P.shape
 
-        if centroid_mask.any():
-            batch_grid = torch.arange(batch_size, device=coords.device).unsqueeze(1).expand(-1, self.max_tokens)
-            valid_positions = centroid_mask
-            valid_batches = batch_grid[valid_positions]
-            valid_slots = torch.arange(self.max_tokens, device=coords.device).unsqueeze(0).expand(batch_size, -1)
-            valid_slots = valid_slots[valid_positions]
-            flat_indices = centroid_indices[valid_positions]
+        # Identify small vs large batches
+        small_batch = counts <= self.max_tokens                                  # [B]
+        large_batch = ~small_batch
 
-            centroids[valid_batches, valid_slots] = xyzt[flat_indices]
+        # ---- Small case: use all points, sort by time, pad to max_tokens ----
+        # Sort times; send invalid to +inf so they go to the end
+        times_full = P[..., 3]                                                   # [B,Nmax]
+        times_for_sort = times_full.masked_fill(~valid_mask, float('inf'))
+        sorted_idx = torch.argsort(times_for_sort, dim=1)                       # [B, Nmax]
+        K_eff = min(Nmax, self.max_tokens)
+        sort_idx_smallN = sorted_idx[:, :K_eff]                                  # [B, K_eff]
 
-            k = min(self.k_neighbors, coords.size(0))
-            dist = torch.cdist(xyzt[flat_indices], xyzt, p=2)
-            mismatch = valid_batches.unsqueeze(1) != batch_ids.unsqueeze(0)
-            dist.masked_fill_(mismatch, float("inf"))
+        # Pad indices to max_tokens if Nmax < max_tokens
+        if K_eff < self.max_tokens:
+            pad_idx = torch.zeros(B, self.max_tokens - K_eff, device=device, dtype=torch.long)
+            sort_idx_smallN = torch.cat([sort_idx_smallN, pad_idx], dim=1)      # [B, max_tokens]
 
-            knn_dists, knn_indices = torch.topk(dist, k=k, dim=1, largest=False)
-            knn_valid = torch.isfinite(knn_dists)
+        # Gather per-point tokens & centroids (already zero-padded for invalids)
+        gather_idx_KD = sort_idx_smallN.unsqueeze(-1).expand(-1, -1, self.token_dim)  # [B,max_tokens,T]
+        gather_idx_4  = sort_idx_smallN.unsqueeze(-1).expand(-1, -1, 4)               # [B,max_tokens,4]
+        tokens_small  = Fp.gather(dim=1, index=gather_idx_KD)                          # [B,max_tokens,T]
+        cents_small   = P.gather(dim=1, index=gather_idx_4)                            # [B,max_tokens,4]
+        masks_small   = (torch.arange(self.max_tokens, device=device)[None, :] <
+                        counts.clamp(max=self.max_tokens)[:, None])                    # [B,K] True for valid tokens
 
-            gathered = point_feats[knn_indices]
-            if not knn_valid.all():
-                fill_value = torch.finfo(gathered.dtype).min
-                gathered = gathered.masked_fill(~knn_valid.unsqueeze(-1), fill_value)
+        # Zero-out the padded tail explicitly to be safe
+        tokens_small = tokens_small * masks_small.unsqueeze(-1)
+        cents_small  = cents_small  * masks_small.unsqueeze(-1)
 
-            pooled = gathered.max(dim=1).values
-            aggregated = self.neighborhood_mlp(pooled)
+        # ---- Large case: FPS + kNN + neighborhood MLP, then sort by time ----
+        # FPS indices (vectorized across batch)
+        fps_idx, validK = self._batched_fps(P, valid_mask, self.max_tokens)          # [B,K], [B,K]
+        # Selected centroids
+        gather_idx_4 = fps_idx.unsqueeze(-1).expand(-1, -1, 4)
+        cents_large  = P.gather(dim=1, index=gather_idx_4)                            # [B,K,4]
 
-            tokens[valid_batches, valid_slots] = aggregated
+        # Pairwise dists centroids-to-points for kNN
+        # dists: [B,K,Nmax]; inf for invalid padded points
+        diff = cents_large.unsqueeze(2) - P.unsqueeze(1)                              # [B,K,N,4]
+        dists = diff.square().sum(dim=-1)                                             # [B,K,N]
+        dists = dists.masked_fill(~valid_mask.unsqueeze(1), float('inf'))
 
-        # Sort valid tokens in ascending time order so RoPE indices align with temporal structure.
-        if centroid_mask.any():
-            times = centroids[..., 3]
-            inf = torch.finfo(times.dtype).max
-            padded_times = torch.where(centroid_mask, times, times.new_full((), inf))
-            sort_idx = torch.argsort(padded_times, dim=1)
-            tokens = torch.gather(tokens, 1, sort_idx.unsqueeze(-1).expand_as(tokens))
-            centroids = torch.gather(centroids, 1, sort_idx.unsqueeze(-1).expand_as(centroids))
-            centroid_mask = torch.gather(centroid_mask.long(), 1, sort_idx).bool()
+        k_global = min(self.k_neighbors, Nmax if Nmax > 0 else 1)
+        # indices of k nearest neighbors per centroid
+        knn_dists, knn_idx = torch.topk(dists, k=k_global, largest=False, dim=2)      # [B,K,k]
+        # validity of each neighbor - expand valid_mask to match knn_idx dimensions
+        valid_mask_expanded = valid_mask.unsqueeze(1).expand(-1, knn_idx.size(1), -1) # [B,K,Nmax]
+        knn_valid = valid_mask_expanded.gather(dim=2, index=knn_idx)                   # [B,K,k]
 
-        return tokens, centroids, centroid_mask
+        # Gather neighbor features: [B,K,k,T]
+        Fp_expanded = Fp.unsqueeze(1).expand(-1, knn_idx.size(1), -1, -1)             # [B,K,Nmax,T]
+        knn_idx_T = knn_idx.unsqueeze(-1).expand(-1, -1, -1, self.token_dim)
+        neigh_feats = Fp_expanded.gather(dim=2, index=knn_idx_T)                       # [B,K,k,T]
+
+        # Masked max-pooling across neighbors
+        neg_inf = torch.tensor(float('-inf'), device=device, dtype=neigh_feats.dtype)
+        masked_neigh = neigh_feats.masked_fill(~knn_valid.unsqueeze(-1), neg_inf)
+        pooled = masked_neigh.max(dim=2).values                                       # [B,K,T]
+        # Handle edge-case where a centroid has 0 valid neighbors (shouldn't happen if counts>0)
+        pooled = torch.where(torch.isfinite(pooled), pooled, torch.zeros_like(pooled))
+
+        # Neighborhood MLP
+        tokens_large = self.neighborhood_mlp(pooled)                                   # [B,K,T]
+
+        # Sort large tokens by centroid time (validK controls which K are real)
+        ctimes = cents_large[..., 3]
+        ctimes_sort = ctimes.masked_fill(~validK, float('inf'))
+        order = torch.argsort(ctimes_sort, dim=1)                                      # [B,K]
+        order_T  = order.unsqueeze(-1).expand(-1, -1, self.token_dim)
+        order_4  = order.unsqueeze(-1).expand(-1, -1, 4)
+        tokens_large = tokens_large.gather(dim=1, index=order_T)
+        cents_large  = cents_large.gather(dim=1, index=order_4)
+        masks_large  = validK.gather(dim=1, index=order)
+
+        # Zero-out padded tail
+        tokens_large = tokens_large * masks_large.unsqueeze(-1)
+        cents_large  = cents_large  * masks_large.unsqueeze(-1)
+
+        # ---- Choose per-batch branch without Python loops ----
+        tokens_out   = tokens_large.clone()
+        centroids_out= cents_large.clone()
+        masks_out    = masks_large.clone()
+
+        if small_batch.any():
+            sb = small_batch
+            tokens_out[sb]    = tokens_small[sb]
+            centroids_out[sb] = cents_small[sb]
+            masks_out[sb]     = masks_small[sb]
+
+        return tokens_out.to(dtype_f), centroids_out.to(dtype_p), masks_out
+
 
 class LearnedImportanceTokenizer(nn.Module):
     """Learns per-point importance, samples top-k tokens per batch, and returns features, centroids, and a validity mask."""

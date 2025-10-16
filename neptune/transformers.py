@@ -57,8 +57,8 @@ class GeGLU(nn.Module):
     def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.1):
         super().__init__()
         self.hidden_dim = hidden_dim
-        self.input_proj = nn.Linear(dim, hidden_dim * 2, bias=False)
-        self.output_proj = nn.Linear(hidden_dim, dim, bias=False)
+        self.input_proj = nn.Linear(dim, hidden_dim * 2, bias=True)
+        self.output_proj = nn.Linear(hidden_dim, dim, bias=True)
         self.dropout = nn.Dropout(dropout)
         self._initialize_weights()
 
@@ -146,7 +146,7 @@ class NeptuneTransformerEncoderLayer(nn.Module):
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=self.attn_dropout if self.training else 0.0,
-            is_causal=False  # We handle causality manually
+            is_causal=False
         )
 
         # Reshape and project output
