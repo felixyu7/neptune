@@ -8,10 +8,10 @@ from torch import Tensor
 from typing import Optional, Dict, Any
 
 from .transformers import (
-    LayerNormNoBias,
     NeptuneTransformerEncoder,
     NeptuneTransformerEncoderLayer,
 )
+from torch.nn import RMSNorm
 from .tokenizer import FPSTokenizer, LearnedImportanceTokenizer
 
 
@@ -43,7 +43,7 @@ class PointTransformerEncoder(nn.Module):
             enc_layer,
             num_layers=num_layers,
         )
-        self.norm = LayerNormNoBias(token_dim)
+        self.norm = RMSNorm(token_dim)
 
     def forward(self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor] = None) -> Tensor:
         # Run encoder with centroid-aware inputs

@@ -111,12 +111,15 @@ class FPSTokenizer(nn.Module):
         min_dists = torch.full((B, N), inf, device=device, dtype=points4.dtype)
         min_dists = min_dists.masked_fill(~valid_mask, 0.0)
 
-        # Deterministic start: point with largest 4D norm among valids
-        norms = (points4.square().sum(dim=2)).masked_fill(~valid_mask, -float('inf'))  # [B,N]
-        first = torch.argmax(norms, dim=1)                                             # [B]
-
         idx = torch.zeros(B, K, device=device, dtype=torch.long)
         validK = torch.arange(K, device=device)[None, :] < K_eff[:, None]              # [B,K]
+
+        # Random initial point per batch (vectorized RNG)
+        large_batches = counts > K                                                     # [B]
+        rand = torch.rand(B, device=device, dtype=points4.dtype)
+        first = torch.floor(rand * counts.to(points4.dtype).clamp(min=1)).to(torch.long)
+        first = first.masked_fill(counts == 0, 0)
+        first = torch.where(large_batches, first, torch.zeros_like(first))
 
         # Iterative greedy FPS across K (no loop over B).
         last = first  # [B]
@@ -173,7 +176,10 @@ class FPSTokenizer(nn.Module):
         batch_idx = batch_ids.long()
         xyz = coords[:, :3]
         if times is None:
-            times = coords.new_zeros((coords.size(0), 1))
+            if features.size(1) > 0:
+                times = features[:, -1:].clone()
+            else:
+                times = coords.new_zeros((coords.size(0), 1))
         points4 = torch.cat([xyz, times], dim=-1)                                   # [N,4]
 
         # Per-point features (shared across both branches)
