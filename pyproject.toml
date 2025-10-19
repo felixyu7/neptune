@@ -44,7 +44,7 @@ Issues = "https://github.com/felixyu7/neptune/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["neptune*", "nt_summary_stats*"]
+include = ["neptune*"]
 
 [tool.black]
 line-length = 100

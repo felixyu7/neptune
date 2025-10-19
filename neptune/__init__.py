@@ -12,7 +12,10 @@ Example usage:
     ...     token_dim=768,
     ...     output_dim=3
     ... )
-    >>> output = model(coordinates, features)
+    >>> coords = torch.randn(1024, 4)        # [x, y, z, t]
+    >>> features = torch.randn(1024, 6)
+    >>> batch_ids = torch.zeros(1024, dtype=torch.long)
+    >>> output = model(coords, features, batch_ids)
 """
 
 from .model import NeptuneModel

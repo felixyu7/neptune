@@ -12,7 +12,7 @@ from .transformers import (
     NeptuneTransformerEncoderLayer,
 )
 from torch.nn import RMSNorm
-from .tokenizer import FPSTokenizer, LearnedImportanceTokenizer
+from .tokenizer import FPSTokenizer, LearnedImportanceTokenizer, TokenLearnerTokenizer
 
 
 class PointTransformerEncoder(nn.Module):
@@ -35,9 +35,11 @@ class PointTransformerEncoder(nn.Module):
             dropout=dropout,
         )
         self.centroid_mlp = nn.Sequential(
-            nn.Linear(4, token_dim, bias=False),
+            nn.Linear(4, token_dim // 2),
             nn.GELU(),
-            nn.Linear(token_dim, token_dim, bias=False),
+            nn.Linear(token_dim // 2, token_dim),
+            nn.GELU(),
+            nn.Linear(token_dim, token_dim),
         )
         self.layers = NeptuneTransformerEncoder(
             enc_layer,
@@ -63,7 +65,8 @@ class PointTransformerEncoder(nn.Module):
 class NeptuneModel(nn.Module):
     """
     Next-gen Neptune:
-      - tokenizer_type: "fps" | "learned_importance"
+      - tokenizer_type: "fps" | "learned_importance" | "tokenlearner"
+      - coords are expected as [N, 4] = [x, y, z, t]
     """
     def __init__(
         self,
@@ -102,8 +105,19 @@ class NeptuneModel(nn.Module):
                 mlp_layers=mlp_layers_cfg,
                 **tokenizer_cfg,
             )
+        elif tokenizer_type == "tokenlearner":
+            tokenizer_cfg.pop("k_neighbors", None)
+            self.tokenizer = TokenLearnerTokenizer(
+                feature_dim=in_channels,
+                max_tokens=num_patches,
+                token_dim=token_dim,
+                mlp_layers=mlp_layers_cfg,
+                **tokenizer_cfg,
+            )
         else:
-            raise ValueError(f"Unknown tokenizer type: {tokenizer_type}. Expected 'fps' or 'learned_importance'.")
+            raise ValueError(
+                f"Unknown tokenizer type: {tokenizer_type}. Expected 'fps', 'learned_importance', or 'tokenlearner'."
+            )
 
         self.encoder = PointTransformerEncoder(
             token_dim=token_dim,
@@ -119,16 +133,12 @@ class NeptuneModel(nn.Module):
 
     def forward(
         self,
-        coords: Tensor,       # [N,4] or [N,3] (+ time inferred)
+        coords: Tensor,       # [N,4] -> [x, y, z, t]
         features: Tensor,     # [N,F]
         batch_ids: Tensor,    # [N]
-        times: Optional[Tensor] = None,
     ) -> Tensor:
-        spatial = coords[:, :3] if coords.size(1) >= 3 else coords
-        if times is None:
-            if coords.size(1) >= 4: times = coords[:, 3:4]
-            elif features is not None and features.size(1) > 0: times = features[:, -1:].clone()
-            else: times = spatial.new_zeros((spatial.size(0), 1))
+        spatial = coords[:, :3]
+        times = coords[:, 3].unsqueeze(-1)
 
         tokens, centroids, masks = self.tokenizer(spatial, features, batch_ids, times)
         global_feat = self.encoder(tokens, centroids, masks)

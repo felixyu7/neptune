@@ -90,9 +90,9 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     else:
         raise ValueError(f"Unsupported downstream_task '{task}'")
 
-    tokenizer_type = model_opts.get("tokenizer_type", "learned_importance")
-    if tokenizer_type not in {"fps", "learned_importance"}:
-        raise ValueError(f"tokenizer_type must be 'fps' or 'learned_importance', got {tokenizer_type}")
+    tokenizer_type = model_opts.get("tokenizer_type", "fps")
+    if tokenizer_type not in {"fps", "learned_importance", "tokenlearner"}:
+        raise ValueError(f"tokenizer_type must be 'fps', 'learned_importance', or 'tokenlearner', got {tokenizer_type}")
 
     k_neighbors = model_opts.get("k_neighbors", 8)
     tokenizer_kwargs = model_opts.get("tokenizer_kwargs")

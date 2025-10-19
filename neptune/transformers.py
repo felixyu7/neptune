@@ -58,7 +58,7 @@ class RoPE(nn.Module):
         x_even = x[..., 0::2]
         x_odd = x[..., 1::2]
         
-        # Apply rotation - CORRECTED FORMULA
+        # Apply rotation
         rotated_even = x_even * cos - x_odd * sin
         rotated_odd = x_odd * cos + x_even * sin
         
@@ -69,27 +69,27 @@ class RoPE(nn.Module):
         return out.to(original_dtype)
 
 
-class SwiGLU(nn.Module):
+class GeGLU(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.1, bias=False):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
         self.w2 = nn.Linear(hidden_dim, dim, bias=bias)
         self.w3 = nn.Linear(dim, hidden_dim, bias=bias)
         self.dropout = nn.Dropout(dropout)
-        
+
         # Initialize with Xavier/Glorot for stable training
         self._initialize_weights()
-    
+
     def _initialize_weights(self):
-        """Initialize SwiGLU weights using Xavier/Glorot initialization."""
+        """Initialize GeGLU weights using Xavier/Glorot initialization."""
         for module in [self.w1, self.w2, self.w3]:
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
     def forward(self, x):
-        # SwiGLU: SiLU(W1 @ x) ⊙ (W3 @ x), then W2
-        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+        # GeGLU: GELU(W1 @ x) ⊙ (W3 @ x), then W2
+        return self.dropout(self.w2(F.gelu(self.w1(x)) * self.w3(x)))
 
 
 class NeptuneTransformerEncoderLayer(nn.Module):
@@ -113,8 +113,8 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         self.norm1 = RMSNorm(d_model, eps=layer_norm_eps)
         self.norm2 = RMSNorm(d_model, eps=layer_norm_eps)
         
-        # Use SwiGLU instead of regular FFN
-        self.ffn = SwiGLU(d_model, dim_feedforward, dropout, bias=bias)
+        # Use GeGLU instead of regular FFN
+        self.ffn = GeGLU(d_model, dim_feedforward, dropout, bias=bias)
         
         # RoPE
         self.rope = RoPE(dim=self.head_dim, max_seq_len=rope_max_seq_len, base=rope_base)
@@ -180,7 +180,7 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         # FFN block with pre-norm
         x_norm = self.norm2(x)
         ff_output = self.ffn(x_norm)
-        x = x + ff_output  # Dropout already applied in SwiGLU
+        x = x + ff_output  # Dropout already applied in GeGLU
         
         return x
     
@@ -236,7 +236,7 @@ class NeptuneTransformerEncoder(nn.Module):
                 with torch.no_grad():
                     layer.out_proj.weight.mul_(scale_factor)
                 
-                # Scale FFN down projection (w2 in SwiGLU)
+                # Scale FFN down projection (w2 in GeGLU)
                 with torch.no_grad():
                     layer.ffn.w2.weight.mul_(scale_factor)
 
