@@ -53,7 +53,7 @@ class PointTransformerEncoder(nn.Module):
         centroid_emb = self.centroid_mlp(centroids.to(tokens.dtype))
         if masks is not None:
             centroid_emb = centroid_emb * masks.to(dtype=centroid_emb.dtype).unsqueeze(-1)
-        x = self.layers(tokens + centroid_emb, src_key_padding_mask=attn_pad)
+        x = self.layers(tokens + centroid_emb, centroids, src_key_padding_mask=attn_pad)
         x = self.norm(x)
         if masks is None:
             return x.mean(dim=1)

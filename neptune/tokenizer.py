@@ -257,16 +257,10 @@ class FPSTokenizer(nn.Module):
         # MLP 2: Always apply token refinement (consistent depth)
         token_feats = self.mlp2(token_feats)  # [B, max_tokens, token_dim]
 
-        # Sort all tokens by centroid time
-        ctimes = cents[..., 3]
-        ctimes_sort = ctimes.masked_fill(~validK, float('inf'))
-        order = torch.argsort(ctimes_sort, dim=1)  # [B, max_tokens]
-
-        order_T = order.unsqueeze(-1).expand(-1, -1, self.token_dim)
-        order_4 = order.unsqueeze(-1).expand(-1, -1, 4)
-        tokens = token_feats.gather(dim=1, index=order_T)
-        centroids = cents.gather(dim=1, index=order_4)
-        masks = validK.gather(dim=1, index=order)
+        # No time sorting - let 4D RoPE handle spatial-temporal relationships
+        tokens = token_feats
+        centroids = cents
+        masks = validK
 
         # Zero out padded positions
         tokens = tokens * masks.unsqueeze(-1)
@@ -485,16 +479,7 @@ class LearnedImportanceTokenizer(nn.Module):
         tokens = sel_tokens_hard + (soft_feat_rep - soft_feat_rep.detach()) * st_scale.to(dtype)
         centroids = sel_xyzt_hard + (soft_cent_rep - soft_cent_rep.detach()) * st_scale.to(sel_xyzt_hard.dtype)
 
-        # Ensure temporal order matches positional encoding expectations.
-        if sel_mask.any():
-            times = centroids[..., 3]
-            inf = torch.finfo(times.dtype).max
-            padded_times = torch.where(sel_mask, times, times.new_full((), inf))
-            sort_idx = torch.argsort(padded_times, dim=1)
-            tokens = torch.gather(tokens, 1, sort_idx.unsqueeze(-1).expand_as(tokens))
-            centroids = torch.gather(centroids, 1, sort_idx.unsqueeze(-1).expand_as(centroids))
-            sel_mask = torch.gather(sel_mask.long(), 1, sort_idx).bool()
-
+        # No time sorting - let 4D RoPE handle spatial-temporal relationships
         return tokens, centroids, sel_mask
 
 
@@ -656,11 +641,6 @@ class TokenLearnerTokenizer(nn.Module):
         Wnorm = A / denom_pos
         centroids = torch.einsum('bns,bnd->bsd', Wnorm, P)
 
-        order = torch.argsort(centroids[..., 3], dim=1)
-        gather_T = order.unsqueeze(-1).expand(-1, -1, self.token_dim)
-        gather_4 = order.unsqueeze(-1).expand(-1, -1, 4)
-        tokens = tokens.gather(1, gather_T)
-        centroids = centroids.gather(1, gather_4)
-
+        # No time sorting - let 4D RoPE handle spatial-temporal relationships
         masks = (counts > 0).unsqueeze(-1).expand(-1, self.max_tokens)
         return tokens, centroids, masks

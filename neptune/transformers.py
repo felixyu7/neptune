@@ -3,73 +3,128 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import RMSNorm  # Assume availability (PyTorch >= 2.1)
 
-class RoPE(nn.Module):
-    def __init__(self, dim, max_seq_len=512, base=10000):
+class RoPE4D(nn.Module):
+    """
+    4D Rotary Position Embedding for (x, y, z, t) coordinates.
+
+    Implements standard axis-aligned 4D RoPE (maximal toral construction).
+    Each coordinate axis gets dedicated rotation planes, ensuring the four
+    generators B_x, B_y, B_z, B_t are linearly independent.
+
+    Requirements:
+        - dim >= 8 (need at least one 2x2 plane per axis)
+        - scales should be chosen so max_angle < 2π for local injectivity
+          Example: if x ∈ [0, X_max], ensure s_x * X_max * ω_max < 2π
+    """
+
+    def __init__(self, dim, scales=(1.0, 1.0, 1.0, 1.0), base=10000):
+        """
+        Args:
+            dim: Head dimension (must be even and >= 8 for valid 4D RoPE)
+            scales: (s_x, s_y, s_z, s_t) scaling factors for coordinate axes
+            base: Base for log-spaced frequency schedule
+        """
         super().__init__()
-        assert dim % 2 == 0, f"RoPE dim must be even (got dim={dim})"
+        assert dim % 2 == 0, f"RoPE4D dim must be even (got {dim})"
+        assert dim >= 8, f"RoPE4D requires dim >= 8 for 4 axes (got {dim})"
         self.dim = dim
-        self.max_seq_len = max_seq_len
+        self.scales = scales
         self.base = base
 
-        inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2).float() / self.dim))
-        self.register_buffer("inv_freq", inv_freq)
-        
-        # Pre-compute cos and sin values up to max_seq_len for efficiency
-        self._set_cos_sin_cache(seq_len=self.max_seq_len, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
+        # Divide dim into M = dim/2 planes
+        num_planes = dim // 2
 
-    def _set_cos_sin_cache(self, seq_len, device, dtype):
-        """Pre-compute and cache cos/sin values for efficient lookup."""
-        self.max_seq_len = seq_len
-        t = torch.arange(self.max_seq_len, device=device, dtype=dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        
-        # Cache cos and sin values with persistent=False to save checkpoint space
-        # (they can be deterministically recreated from inv_freq and max_seq_len)
-        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
-        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+        # Allocate at least one plane per axis first (ensures linear independence)
+        base_allocation = [1, 1, 1, 1]
+        remaining = num_planes - 4
 
-    def forward(self, x, seq_len=None):
-        if seq_len is None:
-            seq_len = x.shape[-2]
+        # Distribute remaining planes round-robin
+        for i in range(remaining):
+            base_allocation[i % 4] += 1
+
+        self.num_planes_per_axis = base_allocation
+
+        # Build log-spaced frequencies for each axis
+        self.register_buffer("freqs_x", self._build_freqs(self.num_planes_per_axis[0], scales[0]))
+        self.register_buffer("freqs_y", self._build_freqs(self.num_planes_per_axis[1], scales[1]))
+        self.register_buffer("freqs_z", self._build_freqs(self.num_planes_per_axis[2], scales[2]))
+        self.register_buffer("freqs_t", self._build_freqs(self.num_planes_per_axis[3], scales[3]))
+
+    def _build_freqs(self, num_bands, scale):
+        """Build log-spaced frequency bands: omega_min * rho^(l/(L-1))."""
+        if num_bands == 0:
+            return torch.zeros(0)
+        if num_bands == 1:
+            return torch.tensor([1.0 / self.base]) * scale
+
+        exponents = torch.arange(num_bands, dtype=torch.float32) / (num_bands - 1)
+        freqs = (1.0 / self.base) * (self.base ** exponents)
+        return freqs * scale
+
+    def forward(self, x, coords):
+        """
+        Apply 4D rotations to Q or K based on spatial-temporal coordinates.
+
+        Args:
+            x: (B, H, S, D) queries or keys
+            coords: (B, S, 4) coordinates (x, y, z, t)
+        Returns:
+            Rotated tensor (B, H, S, D)
+        """
+        B, H, S, D = x.shape
         original_dtype = x.dtype
-        
-        # Handle edge case where seq_len > max_seq_len by extending cache
-        if seq_len > self.max_seq_len:
-            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=self.inv_freq.dtype)
-        
-        # Efficiently slice pre-computed values instead of recomputing
-        cos_freq = self.cos_cached[:seq_len]
-        sin_freq = self.sin_cached[:seq_len]
-        
-        return self.apply_rotary_pos_emb(x, cos_freq, sin_freq, original_dtype)
-    
-    def apply_rotary_pos_emb(self, x, cos, sin, original_dtype):
-        # x shape: (..., seq_len, dim)
-        seq_len = x.shape[-2]
-        
-        # Ensure cos and sin have the right shape for broadcasting
-        cos = cos[:seq_len, :].unsqueeze(0).unsqueeze(0) if x.ndim == 4 else cos[:seq_len, :]
-        sin = sin[:seq_len, :].unsqueeze(0).unsqueeze(0) if x.ndim == 4 else sin[:seq_len, :]
-        
-        # Convert to float for computation
-        x = x.float()
-        
-        # Split into even and odd indices
-        x_even = x[..., 0::2]
-        x_odd = x[..., 1::2]
-        
-        # Apply rotation
-        rotated_even = x_even * cos - x_odd * sin
-        rotated_odd = x_odd * cos + x_even * sin
-        
-        # Interleave back
-        out = torch.stack([rotated_even, rotated_odd], dim=-1)
-        out = out.flatten(-2)
-        
-        return out.to(original_dtype)
+
+        # Reshape to planes: (B, H, S, M, 2) where M = D/2
+        x_planes = x.float().reshape(B, H, S, D // 2, 2)
+        x_complex = torch.view_as_complex(x_planes.contiguous())  # (B, H, S, M)
+
+        # Extract coordinates
+        coords = coords.float()
+        x_c, y_c, z_c, t_c = coords[..., 0], coords[..., 1], coords[..., 2], coords[..., 3]
+
+        plane_idx = 0
+
+        # Rotate planes for x-axis
+        if self.num_planes_per_axis[0] > 0:
+            angles = x_c.unsqueeze(-1) * self.freqs_x  # (B, S, L_x)
+            angles = angles.unsqueeze(1)  # (B, 1, S, L_x) broadcast over heads
+            rot = torch.polar(torch.ones_like(angles), angles)
+            end = plane_idx + self.num_planes_per_axis[0]
+            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
+            plane_idx = end
+
+        # Rotate planes for y-axis
+        if self.num_planes_per_axis[1] > 0:
+            angles = y_c.unsqueeze(-1) * self.freqs_y
+            angles = angles.unsqueeze(1)
+            rot = torch.polar(torch.ones_like(angles), angles)
+            end = plane_idx + self.num_planes_per_axis[1]
+            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
+            plane_idx = end
+
+        # Rotate planes for z-axis
+        if self.num_planes_per_axis[2] > 0:
+            angles = z_c.unsqueeze(-1) * self.freqs_z
+            angles = angles.unsqueeze(1)
+            rot = torch.polar(torch.ones_like(angles), angles)
+            end = plane_idx + self.num_planes_per_axis[2]
+            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
+            plane_idx = end
+
+        # Rotate planes for t-axis
+        if self.num_planes_per_axis[3] > 0:
+            angles = t_c.unsqueeze(-1) * self.freqs_t
+            angles = angles.unsqueeze(1)
+            rot = torch.polar(torch.ones_like(angles), angles)
+            end = plane_idx + self.num_planes_per_axis[3]
+            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
+
+        # Convert back to real representation
+        x_real = torch.view_as_real(x_complex).reshape(B, H, S, D)
+        return x_real.to(original_dtype)
 
 
-class GeGLU(nn.Module):
+class SwiGLU(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.1, bias=False):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
@@ -81,50 +136,53 @@ class GeGLU(nn.Module):
         self._initialize_weights()
 
     def _initialize_weights(self):
-        """Initialize GeGLU weights using Xavier/Glorot initialization."""
+        """Initialize SwiGLU weights using Xavier/Glorot initialization."""
         for module in [self.w1, self.w2, self.w3]:
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
     def forward(self, x):
-        # GeGLU: GELU(W1 @ x) ⊙ (W3 @ x), then W2
-        return self.dropout(self.w2(F.gelu(self.w1(x)) * self.w3(x)))
+        # SwiGLU: SiLU(W1 @ x) ⊙ (W3 @ x), then W2
+        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
 
 
 class NeptuneTransformerEncoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1, 
-                 layer_norm_eps=1e-5, bias=False, rope_max_seq_len=512, rope_base=10000):
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1,
+                 layer_norm_eps=1e-5, bias=False, rope_scales=(1.0, 1.0, 1.0, 1.0), rope_base=10000):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
         self.head_dim = d_model // nhead
         assert d_model % nhead == 0, "d_model must be divisible by nhead"
-        assert self.head_dim % 2 == 0, f"head_dim must be even for RoPE (got {self.head_dim})"
-        
-        # Multi-head attention components - using bias=False for stability
+        assert self.head_dim % 2 == 0, f"head_dim must be even for RoPE4D (got {self.head_dim})"
+
+        # Multi-head attention components
         self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=bias)
         self.out_proj = nn.Linear(d_model, d_model, bias=bias)
-        
-        # Initialize weights using industry-standard practices
+
         self._initialize_weights()
 
         # RMSNorm
         self.norm1 = RMSNorm(d_model, eps=layer_norm_eps)
         self.norm2 = RMSNorm(d_model, eps=layer_norm_eps)
-        
-        # Use GeGLU instead of regular FFN
-        self.ffn = GeGLU(d_model, dim_feedforward, dropout, bias=bias)
-        
-        # RoPE
-        self.rope = RoPE(dim=self.head_dim, max_seq_len=rope_max_seq_len, base=rope_base)
-        
+
+        # SwiGLU FFN
+        self.ffn = SwiGLU(d_model, dim_feedforward, dropout, bias=bias)
+
+        # 4D RoPE
+        self.rope = RoPE4D(dim=self.head_dim, scales=rope_scales, base=rope_base)
+
+        # LayerScale: learnable per-channel scaling for residual branches
+        self.gamma_1 = nn.Parameter(1e-5 * torch.ones(d_model))
+        self.gamma_2 = nn.Parameter(1e-5 * torch.ones(d_model))
+
         # Store hyperparameters for cloning
         self.layer_norm_eps = layer_norm_eps
         self.bias = bias
-        self.rope_max_seq_len = rope_max_seq_len
+        self.rope_scales = rope_scales
         self.rope_base = rope_base
-        
+
         # Dropout
         self.dropout = nn.Dropout(dropout)
         self.attn_dropout = dropout
@@ -141,47 +199,47 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         if self.out_proj.bias is not None:
             nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, src, src_key_padding_mask=None):
+    def forward(self, src, centroids, src_key_padding_mask=None):
         batch_size, seq_len, _ = src.shape
-        
+
         # Self-attention block with pre-norm
         x = src
         x_norm = self.norm1(x)
-        
+
         # Compute Q, K, V
         qkv = self.qkv_proj(x_norm)
         qkv = qkv.reshape(batch_size, seq_len, 3, self.nhead, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, S, D)
         q, k, v = qkv[0], qkv[1], qkv[2]  # Each is (B, H, S, D)
-        
-        # Apply RoPE to Q and K
-        q = self.rope(q)
-        k = self.rope(k)
-        
+
+        # Apply 4D RoPE to Q and K using spatial-temporal coordinates
+        q = self.rope(q, centroids)
+        k = self.rope(k, centroids)
+
         # Prepare attention mask
         attn_mask = self._prepare_attention_mask(src_key_padding_mask, q.device)
-        
+
         # Apply attention
         attn_output = F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
             dropout_p=self.attn_dropout if self.training else 0.0,
-            is_causal=False  # We handle causality manually
+            is_causal=False
         )
-        
+
         # Reshape and project output
         attn_output = attn_output.transpose(1, 2)  # (B, S, H, D)
         attn_output = attn_output.contiguous().view(batch_size, seq_len, self.d_model)
         attn_output = self.out_proj(attn_output)
-        
-        # Residual connection
-        x = x + self.dropout(attn_output)
-        
+
+        # Residual connection with LayerScale
+        x = x + self.dropout(self.gamma_1 * attn_output)
+
         # FFN block with pre-norm
         x_norm = self.norm2(x)
         ff_output = self.ffn(x_norm)
-        x = x + ff_output  # Dropout already applied in GeGLU
-        
+        x = x + self.gamma_2 * ff_output
+
         return x
     
     def _prepare_attention_mask(self, key_padding_mask, device):
@@ -203,9 +261,6 @@ class NeptuneTransformerEncoder(nn.Module):
         ])
         self.num_layers = num_layers
         self.norm = norm
-        
-        # Apply depth-scaled initialization for residual connections
-        self._apply_depth_scaled_init()
 
     def _get_cloned_layer(self, module):
         """Create a new layer with the same parameters"""
@@ -217,37 +272,18 @@ class NeptuneTransformerEncoder(nn.Module):
                 dropout=module.dropout.p,
                 layer_norm_eps=module.layer_norm_eps,
                 bias=module.bias,
-                rope_max_seq_len=module.rope_max_seq_len,
+                rope_scales=module.rope_scales,
                 rope_base=module.rope_base,
             )
         else:
             import copy
             return copy.deepcopy(module)
 
-    def _apply_depth_scaled_init(self):
-        """Apply depth-scaled initialization for stable deep network training."""
-        # Scale down residual output projections by 1/sqrt(2*N) for stable training
-        # Factor of 2 accounts for two residual connections per layer (attn + ffn)
-        scale_factor = 1.0 / (2.0 * self.num_layers) ** 0.5
-        
-        for layer in self.layers:
-            if isinstance(layer, NeptuneTransformerEncoderLayer):
-                # Scale attention output projection
-                with torch.no_grad():
-                    layer.out_proj.weight.mul_(scale_factor)
-                
-                # Scale FFN down projection (w2 in GeGLU)
-                with torch.no_grad():
-                    layer.ffn.w2.weight.mul_(scale_factor)
-
-    def forward(self, src, src_key_padding_mask=None):
+    def forward(self, src, centroids, src_key_padding_mask=None):
         output = src
-        
+
         for mod in self.layers:
-            output = mod(
-                output, 
-                src_key_padding_mask=src_key_padding_mask
-            )
+            output = mod(output, centroids, src_key_padding_mask=src_key_padding_mask)
 
         if self.norm is not None:
             output = self.norm(output)
