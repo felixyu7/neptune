@@ -3,6 +3,8 @@ import torch.nn as nn
 from torch import Tensor
 from typing import List, Tuple, Optional
 
+from torch_fps import farthest_point_sampling_with_knn
+
 class FPSTokenizer(nn.Module):
     """
     GPU-native, vectorized FPS-based tokenizer for point clouds:
@@ -85,64 +87,6 @@ class FPSTokenizer(nn.Module):
         valid_mask = (torch.arange(Nmax, device=device)[None, :] < counts[:, None])  # [B,Nmax]
         return padded_points4, padded_feats, valid_mask, counts
 
-    @staticmethod
-    def _batched_fps(points4: Tensor,           # [B, N, 4]
-                     valid_mask: Tensor,        # [B, N] bool
-                     K: int) -> Tuple[Tensor, Tensor]:
-        """
-        Batched FPS in PyTorch (Euclidean in 4D). Vectorized across batch.
-        Returns:
-          idx:     [B, K] long indices into N
-          validK:  [B, K] bool (True for real selections; False for padded)
-        """
-        B, N, D = points4.shape
-        device = points4.device
-
-        if N == 0 or B == 0 or K == 0:
-            return (torch.zeros(B, 0, device=device, dtype=torch.long),
-                    torch.zeros(B, 0, device=device, dtype=torch.bool))
-
-        # Number of valid points per batch
-        counts = valid_mask.sum(dim=1)                        # [B]
-        K_eff  = torch.clamp(counts, max=K)                   # [B]
-
-        # Distances to the selected set: initialize to +inf for valids, 0 for invalids.
-        inf = torch.tensor(float('inf'), device=device, dtype=points4.dtype)
-        min_dists = torch.full((B, N), inf, device=device, dtype=points4.dtype)
-        min_dists = min_dists.masked_fill(~valid_mask, 0.0)
-
-        idx = torch.zeros(B, K, device=device, dtype=torch.long)
-        validK = torch.arange(K, device=device)[None, :] < K_eff[:, None]              # [B,K]
-
-        # Random initial point per batch (vectorized RNG)
-        large_batches = counts > K                                                     # [B]
-        rand = torch.rand(B, device=device, dtype=points4.dtype)
-        first = torch.floor(rand * counts.to(points4.dtype).clamp(min=1)).to(torch.long)
-        first = first.masked_fill(counts == 0, 0)
-        first = torch.where(large_batches, first, torch.zeros_like(first))
-
-        # Iterative greedy FPS across K (no loop over B).
-        last = first  # [B]
-        for i in range(K):
-            # Update min distances using the newly chosen centroids
-            # Gather centroid coords: [B, D]
-            c = points4[torch.arange(B, device=device), last]                          # [B,D]
-            # dists to all points: [B,N]
-            d = (points4 - c[:, None, :]).square().sum(dim=2)
-            # Only update where valid points exist
-            d = d.masked_fill(~valid_mask, inf)
-            min_dists = torch.minimum(min_dists, d)
-
-            # Record selection (even if i >= K_eff for some batches; will be ignored by validK)
-            idx[:, i] = last
-
-            if i + 1 < K:
-                # Next farthest among valids (argmax of min_dists)
-                # For batches with no valids (counts=0), argmax will be 0 but validK will mask it later.
-                last = torch.argmax(min_dists, dim=1)
-
-        return idx, validK
-
     # ---------- main forward ----------
 
     def forward(
@@ -203,11 +147,17 @@ class FPSTokenizer(nn.Module):
             counts_small = counts[small_batch].clamp(max=self.max_tokens)
             validK[small_batch] = torch.arange(self.max_tokens, device=device)[None, :] < counts_small[:, None]
 
-        # Large batches: use FPS
+        # Large batches: use fused FPS+kNN
         if large_batch.any():
-            fps_idx, fps_validK = self._batched_fps(P[large_batch], valid_mask[large_batch], self.max_tokens)
+            k_global = min(self.k_neighbors, Nmax if Nmax > 0 else 1)
+            fps_idx, knn_idx = farthest_point_sampling_with_knn(
+                P[large_batch],
+                valid_mask[large_batch],
+                self.max_tokens,
+                k_global
+            )
             cent_idx[large_batch] = fps_idx
-            validK[large_batch] = fps_validK
+            validK[large_batch] = torch.ones_like(fps_idx, dtype=torch.bool)
 
         # Gather centroids
         gather_idx_4 = cent_idx.unsqueeze(-1).expand(-1, -1, 4)
@@ -221,21 +171,10 @@ class FPSTokenizer(nn.Module):
             gather_idx_T = cent_idx[small_batch].unsqueeze(-1).expand(-1, -1, self.token_dim)
             token_feats[small_batch] = Fp[small_batch].gather(dim=1, index=gather_idx_T)
 
-        # Large batches: kNN pooling (preserve info from non-selected points)
+        # Large batches: kNN pooling using neighbor indices from fused kernel
         if large_batch.any():
-            cents_large = cents[large_batch]
-            P_large = P[large_batch]
             Fp_large = Fp[large_batch]
             valid_large = valid_mask[large_batch]
-
-            # Compute pairwise distances
-            diff = cents_large.unsqueeze(2) - P_large.unsqueeze(1)  # [B_large, K, Nmax, 4]
-            dists = diff.square().sum(dim=-1)  # [B_large, K, Nmax]
-            dists = dists.masked_fill(~valid_large.unsqueeze(1), float('inf'))
-
-            # Find k nearest neighbors
-            k_global = min(self.k_neighbors, Nmax if Nmax > 0 else 1)
-            _, knn_idx = torch.topk(dists, k=k_global, largest=False, dim=2)  # [B_large, K, k]
 
             # Determine validity of each neighbor
             valid_expanded = valid_large.unsqueeze(1).expand(-1, knn_idx.size(1), -1)

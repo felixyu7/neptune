@@ -1,6 +1,16 @@
 # Neptune: An Efficient Point Transformer for Ultrarelativistic Neutrino Events
 
-Neptune (a**N** **E**fficient **P**oint **T**ransformer for **U**ltrarelativistic **N**eutrino **E**vents) is a transformer-based point cloud processing model for neutrino event reconstruction, as described in this [paper](https://arxiv.org/abs/2510.01733).
+Neptune (a**N** **E**fficient **P**oint **T**ransformer for **U**ltrarelativistic **N**eutrino **E**vents) is a transformer-based point cloud processing model for neutrino event reconstruction, as described in our [paper](https://arxiv.org/abs/2510.01733).
+
+## Installation
+
+This repository now requires [torch-fps](https://github.com/felixyu7/torch-fps) for optimized FPS+kNN implementations. **Ensure gcc > 9 and < 14**. Then you can install this with
+
+```bash
+pip install torch-fps
+```
+
+Then do
 
 ```bash
 pip install -e .
@@ -55,7 +65,7 @@ python scripts/run.py -c scripts/configs/prometheus_angular_reco.cfg
 ## How it works
 
 1. **Tokenization** – choose `fps` (farthest-point sampling + k-NN aggregation), `learned_importance` (learned top-k selection per batch), or `tokenlearner` (TokenLearner-style soft pooling).
-2. **Transformer encoder** – RoPE-enabled self-attention over centroid-aware tokens.
+2. **Transformer encoder** – 4D RoPE-enabled (based on this [paper](https://arxiv.org/abs/2504.06308)) self-attention over tokens.
 3. **Pooling** – masked mean pool to obtain a global representation.
 4. **Prediction head** – MLP for the downstream task.
 
@@ -74,3 +84,4 @@ python scripts/run.py -c scripts/configs/prometheus_angular_reco.cfg
 ## Requirements
 
 - torch >= 2.0
+- torch-fps
