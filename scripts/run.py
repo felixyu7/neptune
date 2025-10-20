@@ -49,7 +49,7 @@ def main():
     elif model_options['downstream_task'] == 'energy_reco':
         output_dim = 2 if model_options['loss_fn'] == 'gaussian_nll' else 1
     elif model_options['downstream_task'] == 'multiclassification':
-        output_dim = 5  # Assuming 5 classes for multiclassification
+        output_dim = model_options['n_classes']  # Assuming 5 classes for multiclassification
     else:
         raise ValueError(f"Unknown task: {model_options['downstream_task']}")
 

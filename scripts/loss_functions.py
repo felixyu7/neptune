@@ -49,9 +49,10 @@ def GaussianNLLLoss(mu: Tensor, var: Tensor, target: Tensor) -> Tensor:
     # Return average over batch
     return torch.mean(nll)
 
-def FocalLoss(inputs: Tensor, targets: Tensor, alpha: float = 0.25, gamma: float = 2.0, reduction: str = "mean") -> Tensor:
+def FocalLoss(inputs: Tensor, targets: Tensor, alpha: float = 0.25, gamma: float = 2.0, reduction: str = "mean", n_classes=4) -> Tensor:
     """ Focal Loss for multi-class classification tasks. """
-    bce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    class_labels = F.one_hot(targets, num_classes=n_classes).float()
+    bce_loss = F.binary_cross_entropy_with_logits(inputs, class_labels, reduction="none")
     pt = torch.exp(-bce_loss)
     focal_loss = alpha * (1 - pt) ** gamma * bce_loss
 
@@ -64,9 +65,10 @@ def FocalLoss(inputs: Tensor, targets: Tensor, alpha: float = 0.25, gamma: float
     else:
         raise ValueError(f"Unknown reduction: {reduction}")
 
-def CrossEntropyLoss(inputs: Tensor, targets: Tensor, reduction: str = "mean") -> Tensor:
+def CrossEntropyLoss(inputs: Tensor, targets: Tensor, reduction: str = "mean", n_classes=4) -> Tensor:
     """ Cross Entropy Loss for multi-class classification tasks. """
-    ce_loss = F.cross_entropy(inputs, targets, reduction=reduction)
+    class_labels = F.one_hot(targets, num_classes=n_classes).float()
+    ce_loss = F.cross_entropy(inputs, class_labels, reduction=reduction)
     return ce_loss
 
 def VonMisesFisherLoss(n_pred, n_true, eps = 1e-8):

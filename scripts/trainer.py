@@ -139,7 +139,6 @@ class Trainer:
                 return lambda preds, labels: GaussianNLLLoss(preds[:, 0], preds[:, 1], labels[:, 0])
         elif self.downstream_task == 'multiclassification':
             if self.loss_fn_name == 'focal_loss':
-                from loss_functions import FocalLoss
                 return lambda preds, labels: FocalLoss(preds, labels[:,4].long())
             elif self.loss_fn_name == 'cross_entropy':
                 return lambda preds, labels: CrossEntropyLoss(preds, labels[:,4].long())

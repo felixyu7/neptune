@@ -189,12 +189,13 @@ class MmapDataset(torch.utils.data.Dataset):
             labels = np.array([log_energy, dir_x, dir_y, dir_z, pid], dtype=np.float32)
         elif self.dataset_type == 'magnemite':
             interaction_type = event_record['interaction']
-            class_label = np.ones_like(interaction_type, dtype=np.float32)
-            class_label[interaction_type == 0] = 0. # signal
-            class_label[interaction_type == 1 & np.abs(event_record["initial_type"])==12] = 1. # bkg numu CC
-            class_label[interaction_type == 1 & (np.abs(event_record["initial_type"])==14 | np.abs(event_record["initial_type"])==16)] = 2. # bkg nue/nutau CC
-            class_label[interaction_type == 2] = 3. # bkg NC
-            class_label[interaction_type == 3] = 4. # bkg atmospheric muon
+            class_label = 1#np.ones_like(interaction_type, dtype=np.float32)
+            if interaction_type==0: class_label = 0. #class_label[interaction_type == 0] = 0. # signal
+            elif interaction_type == 1 & np.abs(event_record["initial_type"])==14: class_label = 1. # bkg numu CC
+            elif interaction_type == 1 & (np.abs(event_record["initial_type"])==12 | np.abs(event_record["initial_type"])==16): class_label = 2. # bkg nue/nutau CC
+            elif interaction_type == 2: class_label = 2. # bkg NC
+            elif interaction_type == 3: class_label = 3. # bkg atmospheric muon
+            #print(event_record["initial_type"],interaction_type,class_label)
             hnl_length = event_record['hnl_length']
             hadrons_energy = event_record['final_energy'][1]
             gamma_energy = event_record['final_energy'][2]
