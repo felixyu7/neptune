@@ -64,7 +64,7 @@ python scripts/run.py -c scripts/configs/prometheus_angular_reco.cfg
 
 ## How it works
 
-1. **Tokenization** – choose `fps` (farthest-point sampling + k-NN aggregation), `learned_importance` (learned top-k selection per batch), or `tokenlearner` (TokenLearner-style soft pooling).
+1. **Tokenization** – farthest-point sampling down to `num_patches` + k-NN aggregation.
 2. **Transformer encoder** – 4D RoPE-enabled (based on this [paper](https://arxiv.org/abs/2504.06308)) self-attention over tokens.
 3. **Pooling** – masked mean pool to obtain a global representation.
 4. **Prediction head** – MLP for the downstream task.
@@ -77,8 +77,7 @@ python scripts/run.py -c scripts/configs/prometheus_angular_reco.cfg
 - `num_layers`: transformer depth (default: 12)
 - `num_heads`: attention heads (default: 12)
 - `output_dim`: task output dim (default: 3)
-- `tokenizer_type`: `"fps"` (default), `"learned_importance"`, or `"tokenlearner"`
-- `k_neighbors`: only used when `tokenizer_type="fps"` (default: 16)
+- `k_neighbors`: k for k-NN (default: 16)
 - `tokenizer_kwargs`: optional dict forwarded to the tokenizer implementation
 
 ## Requirements
