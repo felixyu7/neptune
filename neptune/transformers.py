@@ -125,7 +125,7 @@ class RoPE4D(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, dim, hidden_dim, dropout=0.1, bias=False):
+    def __init__(self, dim, hidden_dim, dropout=0.1, bias=True):
         super().__init__()
         self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
         self.w2 = nn.Linear(hidden_dim, dim, bias=bias)
@@ -149,7 +149,7 @@ class SwiGLU(nn.Module):
 
 class NeptuneTransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1,
-                 layer_norm_eps=1e-5, bias=False, rope_scales=(1.0, 1.0, 1.0, 1.0), rope_base=10000):
+                 layer_norm_eps=1e-5, bias=True, rope_scales=(1.0, 1.0, 1.0, 1.0), rope_base=10000):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead

@@ -12,7 +12,7 @@ from .transformers import (
     NeptuneTransformerEncoderLayer,
 )
 from torch.nn import RMSNorm
-from .tokenizer import FPSTokenizer, LearnedImportanceTokenizer, TokenLearnerTokenizer
+from .tokenizer import FPSTokenizer
 
 
 class PointTransformerEncoder(nn.Module):
@@ -64,9 +64,7 @@ class PointTransformerEncoder(nn.Module):
 
 class NeptuneModel(nn.Module):
     """
-    Next-gen Neptune:
-      - tokenizer_type: "fps" | "learned_importance" | "tokenlearner"
-      - coords are expected as [N, 4] = [x, y, z, t]
+      Note: coords are expected as [N, 4] = [x, y, z, t]
     """
     def __init__(
         self,
@@ -78,46 +76,21 @@ class NeptuneModel(nn.Module):
         hidden_dim: int = 3072,
         dropout: float = 0.1,
         output_dim: int = 3,
-        tokenizer_type: str = "learned_importance",
         k_neighbors: int = 8,   # only for fps
         tokenizer_kwargs: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         tokenizer_cfg: Dict[str, Any] = dict(tokenizer_kwargs or {})
         mlp_layers_cfg = tokenizer_cfg.pop("mlp_layers", [256, 512, 768])
-
-        if tokenizer_type == "fps":
-            k_val = tokenizer_cfg.pop("k_neighbors", k_neighbors)
-            self.tokenizer = FPSTokenizer(
-                feature_dim=in_channels,
-                max_tokens=num_patches,
-                token_dim=token_dim,
-                mlp_layers=mlp_layers_cfg,
-                k_neighbors=k_val,
-                **tokenizer_cfg,
-            )
-        elif tokenizer_type == "learned_importance":
-            tokenizer_cfg.pop("k_neighbors", None)
-            self.tokenizer = LearnedImportanceTokenizer(
-                feature_dim=in_channels,
-                max_tokens=num_patches,
-                token_dim=token_dim,
-                mlp_layers=mlp_layers_cfg,
-                **tokenizer_cfg,
-            )
-        elif tokenizer_type == "tokenlearner":
-            tokenizer_cfg.pop("k_neighbors", None)
-            self.tokenizer = TokenLearnerTokenizer(
-                feature_dim=in_channels,
-                max_tokens=num_patches,
-                token_dim=token_dim,
-                mlp_layers=mlp_layers_cfg,
-                **tokenizer_cfg,
-            )
-        else:
-            raise ValueError(
-                f"Unknown tokenizer type: {tokenizer_type}. Expected 'fps', 'learned_importance', or 'tokenlearner'."
-            )
+        
+        self.tokenizer = FPSTokenizer(
+            feature_dim=in_channels,
+            max_tokens=num_patches,
+            token_dim=token_dim,
+            mlp_layers=mlp_layers_cfg,
+            k_neighbors=k_neighbors,
+            **tokenizer_cfg,
+        )
 
         self.encoder = PointTransformerEncoder(
             token_dim=token_dim,
@@ -127,7 +100,7 @@ class NeptuneModel(nn.Module):
             dropout=dropout,
         )
         self.head = nn.Sequential(
-            nn.Linear(token_dim, token_dim, bias=False), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(token_dim, token_dim), nn.GELU(), nn.Dropout(dropout),
             nn.Linear(token_dim, output_dim)
         )
 
