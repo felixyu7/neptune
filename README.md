@@ -27,8 +27,7 @@ model = NeptuneModel(
     num_patches = 128,                 # max tokens after tokenization
     token_dim = 768,                   # transformer dim
     num_layers = 12,                   # transformer layers
-    output_dim = 3,                    # task output (3D direction, energy, etc.)
-    tokenizer_type = "fps"             # or "learned_importance" / "tokenlearner"
+    output_dim = 3                     # task output (3D direction, energy, etc.)
 )
 
 # coordinates: [N, 4] -> [x, y, z, t]
