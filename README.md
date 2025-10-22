@@ -1,6 +1,16 @@
 # Neptune: An Efficient Point Transformer for Ultrarelativistic Neutrino Events
 
-Neptune (a**N** **E**fficient **P**oint **T**ransformer for **U**ltrarelativistic **N**eutrino **E**vents) is a transformer-based point cloud processing model specifically designed for neutrino event reconstruction. (WIP, not yet on PyPI)
+Neptune (a**N** **E**fficient **P**oint **T**ransformer for **U**ltrarelativistic **N**eutrino **E**vents) is a transformer-based point cloud processing model for neutrino event reconstruction, as described in our [paper](https://arxiv.org/abs/2510.01733).
+
+## Installation
+
+This repository now requires [torch-fps](https://github.com/felixyu7/torch-fps) for optimized FPS+kNN implementations. **Ensure gcc > 9 and < 14**. Then you can install this with
+
+```bash
+pip install torch-fps
+```
+
+Then do
 
 ```bash
 pip install -e .
@@ -13,19 +23,20 @@ import torch
 from neptune import NeptuneModel
 
 model = NeptuneModel(
-    in_channels = 6,        # point features
-    num_patches = 128,      # tokens after FPS sampling  
-    token_dim = 768,        # transformer dim
-    num_layers = 12,        # transformer layers
-    output_dim = 3          # task output (3D direction, energy, etc.)
+    in_channels = 6,                   # point features
+    num_patches = 128,                 # max tokens after tokenization
+    token_dim = 768,                   # transformer dim
+    num_layers = 12,                   # transformer layers
+    output_dim = 3                     # task output (3D direction, energy, etc.)
 )
 
-# coordinates: [N, 5] -> [batch_idx, x, y, z, t]
+# coordinates: [N, 4] -> [x, y, z, t]
 # features: [N, 6] -> point features
-coords = torch.randn(1000, 5)
+coords = torch.randn(1000, 4)
 features = torch.randn(1000, 6)
+batch_ids = torch.zeros(1000, dtype=torch.long)  # per-point batch indices
 
-out = model(coords, features) # [batch_size, 3]
+out = model(coords, features, batch_ids) # [batch_size, 3]
 
 # train with angular distance loss for 3D directions
 import torch.nn.functional as F
@@ -42,13 +53,20 @@ loss = angular_distance_loss(out, directions)
 loss.backward()
 ```
 
+Neptune assumes `coords` is an `[N, 4]` tensor with time in the fourth column.
+
+For full training runs, the CLI entry point `scripts/run.py` uses shared tooling from [ml-common](https://github.com/felixyu7/ml-common) for dataloaders, losses, and the trainer:
+
+```bash
+python scripts/run.py -c scripts/configs/prometheus_angular_reco.cfg
+```
+
 ## How it works
 
-1. **FPS sampling** - select representative points from irregular point cloud
-2. **Neighborhood aggregation** - k-NN around each sample point → tokens  
-3. **Transformer** - standard attention + 4D position embeddings (x,y,z,t)
-4. **Global pooling** - average pool tokens → single representation
-5. **Head** - linear layer for task (direction, energy, classification)
+1. **Tokenization** – farthest-point sampling down to `num_patches` + k-NN aggregation.
+2. **Transformer encoder** – 4D RoPE-enabled (based on this [paper](https://arxiv.org/abs/2504.06308)) self-attention over tokens.
+3. **Pooling** – masked mean pool to obtain a global representation.
+4. **Prediction head** – MLP for the downstream task.
 
 ## Parameters
 
@@ -58,14 +76,10 @@ loss.backward()
 - `num_layers`: transformer depth (default: 12)
 - `num_heads`: attention heads (default: 12)
 - `output_dim`: task output dim (default: 3)
-- `k_neighbors`: neighbors for aggregation (default: 16)
-- `pool_method`: 'max' or 'mean' pooling (default: 'max')
-
-## Training examples
-
-See `examples/` for PyTorch Lightning integration with Prometheus datasets
+- `k_neighbors`: k for k-NN (default: 16)
+- `tokenizer_kwargs`: optional dict forwarded to the tokenizer implementation
 
 ## Requirements
 
-- torch >= 1.12.0
-- fpsample >= 0.2.0
+- torch >= 2.0
+- torch-fps

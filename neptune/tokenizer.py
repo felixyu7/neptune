@@ -1,345 +1,207 @@
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
+from torch import Tensor
+from typing import List, Tuple, Optional
 
-class LightweightPointSelector(nn.Module):
-    """Lightweight importance-based point selector with hybrid selection for gradient flow."""
-    def __init__(self, 
-                 feature_dim: int, 
-                 max_tokens: int = 128, 
-                 token_dim: int = 768, 
-                 mlp_layers: list = [256, 512, 768],
-                 tau: float = 2.0):
-        super().__init__()
-        self.max_tokens = max_tokens
-        self.token_dim = token_dim
-        self.tau = nn.Parameter(torch.tensor(tau, dtype=torch.float32))  # Learnable temperature parameter
+from torch_fps import farthest_point_sampling_with_knn
 
-        # Coordinate processing
-        self.coord_norm = nn.LayerNorm(4)  # Normalize coordinates
-        self.spatial_encoder = nn.Sequential(
-            nn.Linear(4, 64),  # Dedicated network for coordinates
-            nn.ReLU(),
-            nn.Linear(64, 64)
-        )
-        
-        # Per-point feature MLP (maps input features + spatial features to token_dim)
-        layers = []
-        in_dim = feature_dim + 64  # Features + spatial encoding
-        for out_dim in mlp_layers:
-            layers += [nn.Linear(in_dim, out_dim), nn.ReLU(inplace=True)]
-            in_dim = out_dim
-        layers.append(nn.Linear(in_dim, token_dim))
-        self.mlp = nn.Sequential(*layers)
-        
-        # Simple importance scorer (no global context)
-        self.importance_head = nn.Sequential(
-            nn.Linear(token_dim, token_dim // 2),
-            nn.ReLU(inplace=True),
-            nn.Linear(token_dim // 2, 1)
-        )
+class FPSTokenizer(nn.Module):
+    """
+    GPU-native, vectorized FPS-based tokenizer for point clouds:
+      - MLP 1: Per-point feature extraction
+      - If num_points <= max_tokens: use all points (no FPS, no kNN pooling)
+      - Else: FPS on 4D (x,y,z,t) to select centroids, then kNN pooling
+      - MLP 2: Token refinement (always applied for consistent depth)
+    """
 
-    def forward(self, coordinates: torch.Tensor, features: torch.Tensor):
-        """
-        Args:
-            coordinates: Tensor of shape [N, 5] with columns [batch_index, x, y, z, time].
-            features: Tensor of shape [N, F] containing per-point features.
-        Returns:
-            tokens: Tensor [B, max_tokens, token_dim] - selected tokens.
-            centroids: Tensor [B, max_tokens, 4] - [x, y, z, time] for each token.
-            mask: Tensor [B, max_tokens] (bool) - True for valid positions.
-        """
-        if coordinates.numel() == 0:
-            empty_tokens = torch.zeros((0, self.max_tokens, self.token_dim), device=features.device, dtype=features.dtype)
-            empty_centroids = torch.zeros((0, self.max_tokens, 4), device=features.device, dtype=coordinates.dtype)
-            empty_mask = torch.zeros((0, self.max_tokens), device=features.device, dtype=torch.bool)
-            return empty_tokens, empty_centroids, empty_mask
-
-        batch_indices = coordinates[:, 0].long()
-        xyz = coordinates[:, 1:4]
-        time = coordinates[:, 4:5]
-        batch_size = batch_indices.max().item() + 1
-
-        # Normalize and encode coordinates
-        coords_features = coordinates[:, 1:]  # [N, 4] - remove batch index
-        coords_features = self.coord_norm(coords_features)  # Normalize coordinates
-        spatial_features = self.spatial_encoder(coords_features)  # [N, 64]
-        combined_input = torch.cat([features, spatial_features], dim=1)  # [N, F+64]
-        
-        # Encode all points at once
-        point_feats = self.mlp(combined_input)  # [N, token_dim]
-        
-        # Compute importance scores directly from point features
-        importance_scores = self.importance_head(point_feats).squeeze(-1)  # [N]
-
-        tokens_list = []
-        centroids_list = []
-        mask_list = []
-
-        for b in range(batch_size):
-            idx_mask = (batch_indices == b)
-            pts_xyz = xyz[idx_mask]            
-            pts_time = time[idx_mask]          
-            pts_features = point_feats[idx_mask]  # [M, token_dim]
-            pts_coords = torch.cat([pts_xyz, pts_time], dim=1)  # [M, 4]
-            batch_scores = importance_scores[idx_mask]  # [M]
-            M = pts_features.shape[0]
-
-            if M == 0:
-                tokens = torch.zeros((self.max_tokens, self.token_dim), device=features.device, dtype=point_feats.dtype)
-                cents = torch.zeros((self.max_tokens, 4), device=coordinates.device, dtype=coordinates.dtype)
-                mask = torch.zeros((self.max_tokens,), device=features.device, dtype=torch.bool)
-                tokens_list.append(tokens)
-                centroids_list.append(cents)
-                mask_list.append(mask)
-                continue
-
-            if M <= self.max_tokens:
-                # Use all points
-                selected_feats = pts_features  # [M, token_dim]
-                selected_coords = pts_coords   # [M, 4]
-                num_valid = M
-            else:
-                # Differentiable selection using straight-through estimator
-                if self.training:
-                    # Training: straight-through estimator for differentiable top-k
-                    
-                    # 1. Hard selection (forward pass - discrete)
-                    _, topk_indices = torch.topk(batch_scores, self.max_tokens, largest=True)
-                    selected_feats_hard = pts_features[topk_indices]  # [max_tokens, token_dim]
-                    selected_coords_hard = pts_coords[topk_indices]   # [max_tokens, 4]
-                    
-                    # 2. Soft selection (backward pass - differentiable)
-                    soft_weights = torch.softmax(batch_scores / self.tau, dim=0)  # [M]
-                    selected_feats_soft = torch.matmul(soft_weights.unsqueeze(0), pts_features).squeeze(0)  # [token_dim]
-                    selected_coords_soft = torch.matmul(soft_weights.unsqueeze(0), pts_coords).squeeze(0)   # [4]
-                    
-                    # Expand to match hard selection shape
-                    selected_feats_soft = selected_feats_soft.unsqueeze(0).expand(self.max_tokens, -1)
-                    selected_coords_soft = selected_coords_soft.unsqueeze(0).expand(self.max_tokens, -1)
-                    
-                    # 3. Combine using straight-through trick
-                    # Note: detach() only affects the soft part, preserving gradients through soft_weights
-                    selected_feats = selected_feats_hard + selected_feats_soft - selected_feats_soft.detach()
-                    selected_coords = selected_coords_hard + selected_coords_soft - selected_coords_soft.detach()
-                else:
-                    # Inference: use standard top-k for efficiency
-                    _, topk_indices = torch.topk(batch_scores, self.max_tokens, largest=True)
-                    selected_feats = pts_features[topk_indices]  # [max_tokens, token_dim]
-                    selected_coords = pts_coords[topk_indices]   # [max_tokens, 4]
-                num_valid = self.max_tokens
-
-            # Sort selected tokens by time
-            if num_valid > 0:
-                time_vals = selected_coords[:, 3]
-                sort_idx = torch.argsort(time_vals)
-                selected_feats = selected_feats[sort_idx]
-                selected_coords = selected_coords[sort_idx]
-
-            # Pad to max_tokens if needed
-            if num_valid < self.max_tokens:
-                pad_count = self.max_tokens - num_valid
-                pad_feat = torch.zeros((pad_count, self.token_dim), device=features.device, dtype=selected_feats.dtype)
-                pad_coord = torch.zeros((pad_count, 4), device=features.device, dtype=selected_coords.dtype)
-                selected_feats = torch.cat([selected_feats, pad_feat], dim=0)
-                selected_coords = torch.cat([selected_coords, pad_coord], dim=0)
-
-            # Create mask (True for valid tokens, False for padding)
-            mask = torch.zeros((self.max_tokens,), device=features.device, dtype=torch.bool)
-            mask[:num_valid] = True
-
-            tokens_list.append(selected_feats)
-            centroids_list.append(selected_coords)
-            mask_list.append(mask)
-
-        tokens = torch.stack(tokens_list, dim=0)       # [B, max_tokens, token_dim]
-        centroids = torch.stack(centroids_list, dim=0) # [B, max_tokens, 4]
-        mask = torch.stack(mask_list, dim=0)           # [B, max_tokens]
-
-        return tokens, centroids, mask
-
-class GumbelSoftmaxTokenizer(nn.Module):
-    """Optimized version: Downsamples point cloud into tokens using differentiable Gumbel-Softmax sampling."""
-    def __init__(self, 
-                 feature_dim: int, 
-                 max_tokens: int = 128, 
-                 token_dim: int = 768, 
-                 mlp_layers: list = [256, 512, 768],
-                 k_neighbors: int = 16, 
-                 tau: float = 1.0):
+    def __init__(self,
+                 feature_dim: int,
+                 max_tokens: int = 128,
+                 token_dim: int = 768,
+                 mlp_layers: List[int] = [256, 512, 768],
+                 k_neighbors: int = 16):
         super().__init__()
         self.max_tokens = max_tokens
         self.token_dim = token_dim
         self.k_neighbors = k_neighbors
-        self.tau = tau  # Gumbel-Softmax temperature
 
-        # Per-point feature MLP (maps input features to token_dim)
-        layers = []
+        # MLP 1: Per-point feature extraction
+        mlp1 = []
         in_dim = feature_dim
         for out_dim in mlp_layers:
-            layers += [nn.Linear(in_dim, out_dim), nn.ReLU(inplace=True)]
+            mlp1 += [nn.Linear(in_dim, out_dim), nn.GELU()]
             in_dim = out_dim
-        # Final layer to token_dim (no ReLU here, let raw features pass to selection)
-        layers.append(nn.Linear(in_dim, token_dim))
-        self.mlp = nn.Sequential(*layers)
+        mlp1 += [nn.Linear(in_dim, token_dim)]
+        self.mlp1 = nn.Sequential(*mlp1)
 
-        # Learnable queries for Gumbel-Softmax sampling (W in R^{max_tokens x token_dim})
-        self.selection_weights = nn.Parameter(torch.randn(max_tokens, token_dim) * 0.02)
-
-        # Neighborhood aggregation MLP (optional, similar to original)
-        self.neighborhood_mlp = nn.Sequential(
+        # MLP 2: Token refinement (always applied)
+        self.mlp2 = nn.Sequential(
             nn.Linear(token_dim, token_dim),
-            nn.ReLU(inplace=True),
+            nn.GELU(),
             nn.Linear(token_dim, token_dim)
         )
 
-    def forward(self, coordinates: torch.Tensor, features: torch.Tensor):
+    @staticmethod
+    def _pack_flat_to_padded(points4: Tensor,  # [N,4]
+                              feats: Tensor,   # [N,F]
+                              batch_idx: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+        """
+        Convert flat lists to padded [B, Nmax, *] without Python loops.
+        Returns:
+          padded_points4: [B, Nmax, 4]
+          padded_feats:   [B, Nmax, F]
+          valid_mask:     [B, Nmax] (bool)
+          counts:         [B] number of points per batch
+        """
+        device = points4.device
+        B = int(batch_idx.max().item()) + 1 if points4.numel() > 0 else 0
+        if B == 0:
+            return (torch.zeros(0, 0, 4, device=device, dtype=points4.dtype),
+                    torch.zeros(0, 0, feats.size(-1), device=device, dtype=feats.dtype),
+                    torch.zeros(0, 0, device=device, dtype=torch.bool),
+                    torch.zeros(0, device=device, dtype=torch.long))
+
+        counts = torch.bincount(batch_idx, minlength=B)                     # [B]
+        Nmax = int(counts.max().item())
+        N = points4.size(0)
+
+        # Sort by batch so groups are contiguous
+        sort_idx = torch.argsort(batch_idx, stable=True)
+        b_sorted  = batch_idx[sort_idx]                                     # [N]
+        p_sorted  = points4[sort_idx]                                       # [N,4]
+        f_sorted  = feats[sort_idx]                                         # [N,F]
+
+        # Position within each batch: pos = arange(N) - offsets[b_sorted]
+        offsets = torch.cumsum(counts, dim=0) - counts                      # [B]
+        pos_sorted = torch.arange(N, device=device) - offsets[b_sorted]     # [N]
+
+        # Allocate and scatter
+        padded_points4 = torch.zeros(B, Nmax, 4, device=device, dtype=points4.dtype)
+        padded_feats   = torch.zeros(B, Nmax, feats.size(-1), device=device, dtype=feats.dtype)
+        padded_points4[b_sorted, pos_sorted] = p_sorted
+        padded_feats[b_sorted, pos_sorted]   = f_sorted
+
+        # Valid mask
+        valid_mask = (torch.arange(Nmax, device=device)[None, :] < counts[:, None])  # [B,Nmax]
+        return padded_points4, padded_feats, valid_mask, counts
+
+    # ---------- main forward ----------
+
+    def forward(
+        self,
+        coords: Tensor,        # [N, 3]
+        features: Tensor,      # [N, F]
+        batch_ids: Tensor,     # [N]
+        times: Tensor,         # [N, 1]
+    ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Args:
-            coordinates: Tensor of shape [N, 5] with columns [batch_index, x, y, z, time].
-            features: Tensor of shape [N, F] containing per-point features.
+          coords:    [N, 3] spatial coordinates (x, y, z)
+          features:  [N, F]
+          batch_ids: [N] batch indices
+          times:     [N, 1] time coordinates
         Returns:
-            tokens: Tensor [B, max_tokens, token_dim] - output token features per batch.
-            centroids: Tensor [B, max_tokens, 4] - [x, y, z, time] for each token (padded for empty slots).
-            mask: Tensor [B, max_tokens] (bool) - True for valid token positions (False for padding).
+          tokens:    [B, max_tokens, token_dim]
+          centroids: [B, max_tokens, 4]   (x,y,z,t)
+          masks:     [B, max_tokens] bool
         """
-        if coordinates.numel() == 0:
-            # Handle empty input (no points)
-            empty_tokens = torch.zeros((0, self.max_tokens, self.token_dim), device=features.device, dtype=features.dtype)
-            empty_centroids = torch.zeros((0, self.max_tokens, 4), device=features.device, dtype=coordinates.dtype)
-            empty_mask = torch.zeros((0, self.max_tokens), device=features.device, dtype=torch.bool)
-            return empty_tokens, empty_centroids, empty_mask
+        device = coords.device
+        dtype_p = coords.dtype
+        dtype_f = features.dtype
 
-        batch_indices = coordinates[:, 0].long()
-        xyz = coordinates[:, 1:4]   # spatial coordinates
-        time = coordinates[:, 4:5]  # time coordinate (will keep as [N,1] for concatenation)
-        batch_size = batch_indices.max().item() + 1
+        if coords.numel() == 0:
+            empty_tokens    = torch.zeros((0, self.max_tokens, self.token_dim), device=device, dtype=features.dtype)
+            empty_centroids = torch.zeros((0, self.max_tokens, 4),              device=device, dtype=coords.dtype)
+            empty_masks     = torch.zeros((0, self.max_tokens),                 device=device, dtype=torch.bool)
+            return empty_tokens, empty_centroids, empty_masks
 
-        # Lists to collect outputs for each batch
-        tokens_list = []
-        centroids_list = []
-        mask_list = []
+        batch_idx = batch_ids.long()
+        xyz = coords[:, :3]
+        points4 = torch.cat([xyz, times], dim=-1)  # [N,4]
 
-        # Process each cloud in the batch independently
-        for b in range(batch_size):
-            idx_mask = (batch_indices == b)
-            pts_xyz = xyz[idx_mask]            # [M, 3]
-            pts_time = time[idx_mask]          # [M, 1]
-            pts_features = features[idx_mask]  # [M, F]
-            M = pts_xyz.shape[0]              # number of points in this batch element
+        # MLP 1: Per-point feature extraction
+        point_feats = self.mlp1(features)  # [N, token_dim]
 
-            # Embed per-point features to token_dim
-            point_feats = self.mlp(pts_features)  # [M, token_dim]
+        # Pack to padded [B, Nmax, *]
+        P, Fp, valid_mask, counts = self._pack_flat_to_padded(points4, point_feats, batch_idx)
+        B, Nmax, _ = P.shape
 
-            # Combine spatial coords and time for neighbor search
-            pts_coords = torch.cat([pts_xyz, pts_time], dim=1)  # [M, 4]
+        # Identify small vs large batches
+        small_batch = counts <= self.max_tokens
+        large_batch = ~small_batch
 
-            if M == 0:
-                # No points in this batch (edge case)
-                # create padded outputs with no valid tokens
-                tokens = torch.zeros((self.max_tokens, self.token_dim), device=features.device, dtype=point_feats.dtype)
-                cents = torch.zeros((self.max_tokens, 4), device=pts_coords.device, dtype=pts_coords.dtype)
-                mask = torch.zeros((self.max_tokens,), device=features.device, dtype=torch.bool)
-                tokens_list.append(tokens)
-                centroids_list.append(cents)
-                mask_list.append(mask)
-                continue
+        # Initialize centroid indices and validity masks
+        cent_idx = torch.zeros(B, self.max_tokens, device=device, dtype=torch.long)
+        validK = torch.zeros(B, self.max_tokens, device=device, dtype=torch.bool)
 
-            if M <= self.max_tokens:
-                # If points are fewer than max_tokens, use all points directly
-                selected_feats = point_feats  # [M, token_dim]
-                selected_coords = pts_coords  # [M, 4]
-                num_valid = M
-            else:
-                # We'll pick `self.max_tokens` indices sequentially with masking
-                K = self.max_tokens
-                y_list = []
-                avail = torch.ones(M, dtype=torch.bool, device=features.device)
-                feats_T = point_feats.transpose(0, 1)  # [token_dim, M]
+        # Small batches: use all valid points (no FPS needed)
+        if small_batch.any():
+            K_eff = min(Nmax, self.max_tokens)
+            idx_range = torch.arange(K_eff, device=device)[None, :].expand(small_batch.sum(), -1)
+            if K_eff < self.max_tokens:
+                pad = torch.zeros(small_batch.sum(), self.max_tokens - K_eff, device=device, dtype=torch.long)
+                idx_range = torch.cat([idx_range, pad], dim=1)
+            cent_idx[small_batch] = idx_range
+            counts_small = counts[small_batch].clamp(max=self.max_tokens)
+            validK[small_batch] = torch.arange(self.max_tokens, device=device)[None, :] < counts_small[:, None]
 
-                all_scores = torch.matmul(self.selection_weights, feats_T)  # [K, M]
+        # Large batches: use fused FPS+kNN
+        if large_batch.any():
+            k_global = min(self.k_neighbors, Nmax if Nmax > 0 else 1)
+            fps_idx, knn_idx = farthest_point_sampling_with_knn(
+                P[large_batch],
+                valid_mask[large_batch],
+                self.max_tokens,
+                k_global
+            )
+            cent_idx[large_batch] = fps_idx
+            validK[large_batch] = torch.ones_like(fps_idx, dtype=torch.bool)
 
-                for k in range(K):
-                    # scores: [M] for this token slot
-                    scores = all_scores[k]  # [M] - no computation, just indexing!
-                    # mask out already selected points
-                    scores = scores.masked_fill(~avail, float('-inf'))
+        # Gather centroids
+        gather_idx_4 = cent_idx.unsqueeze(-1).expand(-1, -1, 4)
+        cents = P.gather(dim=1, index=gather_idx_4)  # [B, max_tokens, 4]
 
-                    # handle degenerate case: if all masked (shouldn't happen), break
-                    if not torch.isfinite(scores).any():
-                        break
+        # Get features for each centroid
+        token_feats = torch.zeros(B, self.max_tokens, self.token_dim, device=device, dtype=Fp.dtype)
 
-                    # Straight-through Gumbel-Softmax: one-hot forward, soft gradients
-                    y = F.gumbel_softmax(scores, tau=self.tau, hard=True, dim=0)  # [M]
-                    y_list.append(y)
+        # Small batches: direct gather (no pooling needed - transformer will mix)
+        if small_batch.any():
+            gather_idx_T = cent_idx[small_batch].unsqueeze(-1).expand(-1, -1, self.token_dim)
+            token_feats[small_batch] = Fp[small_batch].gather(dim=1, index=gather_idx_T)
 
-                    # Update the availability mask for the next iteration
-                    # This operation does not need to be differentiable
-                    with torch.no_grad():
-                        selected_idx = y.argmax()  # Direct index instead of boolean mask
-                        avail[selected_idx] = False
+        # Large batches: kNN pooling using neighbor indices from fused kernel
+        if large_batch.any():
+            Fp_large = Fp[large_batch]
+            valid_large = valid_mask[large_batch]
 
-                if not y_list:
-                    # Handle case where loop broke immediately
-                    selected_feats = torch.zeros((0, self.token_dim), device=point_feats.device, dtype=point_feats.dtype)
-                    selected_coords = torch.zeros((0, 4), device=pts_coords.device, dtype=pts_coords.dtype)
-                    num_valid = 0
-                else:
-                    selection_matrix = torch.stack(y_list, dim=0)  # [K_selected, M]
+            # Determine validity of each neighbor
+            valid_expanded = valid_large.unsqueeze(1).expand(-1, knn_idx.size(1), -1)
+            knn_valid = valid_expanded.gather(dim=2, index=knn_idx)  # [B_large, K, k]
 
-                    # Differentiable selection via matrix multiplication
-                    selected_feats = torch.matmul(selection_matrix, point_feats)  # [K_selected, token_dim]
-                    selected_coords = torch.matmul(selection_matrix, pts_coords) # [K_selected, 4]
-                    num_valid = selected_feats.shape[0]
+            # Gather neighbor features
+            Fp_expanded = Fp_large.unsqueeze(1).expand(-1, knn_idx.size(1), -1, -1)  # [B_large, K, Nmax, T]
+            knn_idx_T = knn_idx.unsqueeze(-1).expand(-1, -1, -1, self.token_dim)
+            neigh_feats = Fp_expanded.gather(dim=2, index=knn_idx_T)  # [B_large, K, k, T]
 
-            # ====== Optional neighborhood aggregation (recommended) ======
-            if M > 0 and num_valid > 0 and self.k_neighbors > 0:
-                k = min(self.k_neighbors, M)
-                with torch.no_grad():
-                    # distances in XYZ for neighbor search
-                    dist_matrix = torch.cdist(selected_coords[:, :3], pts_xyz)  # [num_valid, M]
-                    _, knn_indices = torch.topk(dist_matrix, k=k, largest=False, dim=1)  # [num_valid, k]
+            # Max-pool across neighbors
+            neg_inf = torch.tensor(float('-inf'), device=device, dtype=neigh_feats.dtype)
+            masked_neigh = neigh_feats.masked_fill(~knn_valid.unsqueeze(-1), neg_inf)
+            pooled = masked_neigh.max(dim=2).values  # [B_large, K, T]
+            pooled = torch.where(torch.isfinite(pooled), pooled, torch.zeros_like(pooled))
 
-                gathered = point_feats[knn_indices.reshape(-1)]            # [num_valid*k, token_dim]
-                neighborhood_features = gathered.view(num_valid, k, self.token_dim)       # [num_valid, k, C]
-                pooled = neighborhood_features.max(dim=1)[0]                      # [num_valid, C]
-                aggregated_feats = self.neighborhood_mlp(pooled)                      # [num_valid, C]
-                
-                # Add neighborhood information to the selected features (preserving gradient path)
-                selected_feats = selected_feats + aggregated_feats
+            token_feats[large_batch] = pooled
 
-            # Sort tokens by time coordinate (ascending) for the valid tokens
-            if num_valid > 0:
-                time_vals = selected_coords[:, 3]  # time column of shape [num_valid]
-                sort_idx = torch.argsort(time_vals)
-                # Apply the sort to all tokens (they're all valid at this point)
-                selected_feats = selected_feats[sort_idx]
-                selected_coords = selected_coords[sort_idx]
+        # MLP 2: Always apply token refinement (consistent depth)
+        token_feats = self.mlp2(token_feats)  # [B, max_tokens, token_dim]
 
-            # Pad tokens/coords if fewer than max_tokens
-            if num_valid < self.max_tokens:
-                pad_count = self.max_tokens - num_valid
-                pad_feat = torch.zeros((pad_count, self.token_dim), device=features.device, dtype=selected_feats.dtype)
-                pad_coord = torch.zeros((pad_count, 4), device=features.device, dtype=selected_coords.dtype)
-                selected_feats = torch.cat([selected_feats, pad_feat], dim=0)
-                selected_coords = torch.cat([selected_coords, pad_coord], dim=0)
-            elif num_valid > self.max_tokens:
-                # If more than max_tokens, truncate to max_tokens to maintain shape
-                selected_feats = selected_feats[:self.max_tokens]
-                selected_coords = selected_coords[:self.max_tokens]
-                num_valid = self.max_tokens
+        # No time sorting - let 4D RoPE handle spatial-temporal relationships
+        tokens = token_feats
+        centroids = cents
+        masks = validK
 
-            # Create mask for valid tokens (True for actual tokens, False for padding)
-            mask = torch.zeros((self.max_tokens,), device=features.device, dtype=torch.bool)
-            mask[:min(num_valid, self.max_tokens)] = True
+        # Zero out padded positions
+        tokens = tokens * masks.unsqueeze(-1)
+        centroids = centroids * masks.unsqueeze(-1)
 
-            tokens_list.append(selected_feats)
-            centroids_list.append(selected_coords)
-            mask_list.append(mask)
-
-        # Stack results for all batch elements
-        tokens = torch.stack(tokens_list, dim=0)       # [B, max_tokens, token_dim]
-        centroids = torch.stack(centroids_list, dim=0) # [B, max_tokens, 4]
-        mask = torch.stack(mask_list, dim=0)           # [B, max_tokens]
-
-        return tokens, centroids, mask
+        return tokens.to(dtype_f), centroids.to(dtype_p), masks
+    
