@@ -92,6 +92,7 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
 
     k_neighbors = model_opts.get("k_neighbors", 8)
     tokenizer_kwargs = model_opts.get("tokenizer_kwargs")
+    drop_path_rate = model_opts.get("drop_path_rate", 0.0)
 
     token_dim = model_opts["token_dim"]
     num_heads = model_opts["num_heads"]
@@ -109,6 +110,7 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         num_heads=num_heads,
         hidden_dim=model_opts["hidden_dim"],
         dropout=model_opts["dropout"],
+        drop_path_rate=drop_path_rate,
         output_dim=output_dim,
         k_neighbors=k_neighbors,
         tokenizer_kwargs=tokenizer_kwargs,

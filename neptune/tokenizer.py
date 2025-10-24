@@ -19,7 +19,8 @@ class FPSTokenizer(nn.Module):
                  max_tokens: int = 128,
                  token_dim: int = 768,
                  mlp_layers: List[int] = [256, 512, 768],
-                 k_neighbors: int = 16):
+                 k_neighbors: int = 16,
+                 dropout: float = 0.0):
         super().__init__()
         self.max_tokens = max_tokens
         self.token_dim = token_dim
@@ -29,7 +30,7 @@ class FPSTokenizer(nn.Module):
         mlp1 = []
         in_dim = feature_dim
         for out_dim in mlp_layers:
-            mlp1 += [nn.Linear(in_dim, out_dim), nn.GELU()]
+            mlp1 += [nn.Linear(in_dim, out_dim), nn.GELU(), nn.Dropout(dropout)]
             in_dim = out_dim
         mlp1 += [nn.Linear(in_dim, token_dim)]
         self.mlp1 = nn.Sequential(*mlp1)
@@ -38,6 +39,7 @@ class FPSTokenizer(nn.Module):
         self.mlp2 = nn.Sequential(
             nn.Linear(token_dim, token_dim),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(token_dim, token_dim)
         )
 

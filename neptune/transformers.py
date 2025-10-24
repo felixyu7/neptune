@@ -3,6 +3,23 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import RMSNorm  # Assume availability (PyTorch >= 2.1)
 
+
+class DropPath(nn.Module):
+    """Per-sample stochastic depth."""
+
+    def __init__(self, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(drop_prob)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep_prob = 1.0 - self.drop_prob
+        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+        binary_tensor = random_tensor.floor()
+        return x.div(keep_prob) * binary_tensor
+
 class RoPE4D(nn.Module):
     """
     4D Rotary Position Embedding for (x, y, z, t) coordinates.
@@ -149,7 +166,8 @@ class SwiGLU(nn.Module):
 
 class NeptuneTransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1,
-                 layer_norm_eps=1e-5, bias=True, rope_scales=(1.0, 1.0, 1.0, 1.0), rope_base=10000):
+                 layer_norm_eps=1e-5, bias=True, rope_scales=(1.0, 1.0, 1.0, 1.0),
+                 rope_base=10000, drop_path_rate=0.0):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
@@ -186,6 +204,9 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         # Dropout
         self.dropout = nn.Dropout(dropout)
         self.attn_dropout = dropout
+        self.drop_path1 = DropPath(drop_path_rate)
+        self.drop_path2 = DropPath(drop_path_rate)
+        self.drop_path_rate = drop_path_rate
 
     def _initialize_weights(self):
         """Initialize weights using modern industry-standard practices."""
@@ -233,12 +254,12 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         attn_output = self.out_proj(attn_output)
 
         # Residual connection with LayerScale
-        x = x + self.dropout(self.gamma_1 * attn_output)
+        x = x + self.drop_path1(self.dropout(self.gamma_1 * attn_output))
 
         # FFN block with pre-norm
         x_norm = self.norm2(x)
         ff_output = self.ffn(x_norm)
-        x = x + self.gamma_2 * ff_output
+        x = x + self.drop_path2(self.gamma_2 * ff_output)
 
         return x
     
@@ -253,16 +274,22 @@ class NeptuneTransformerEncoderLayer(nn.Module):
 
 
 class NeptuneTransformerEncoder(nn.Module):
-    def __init__(self, encoder_layer, num_layers, norm=None):
+    def __init__(self, encoder_layer, num_layers, norm=None, drop_path_rate=0.0):
         super().__init__()
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+        if num_layers == 1:
+            drop_rates = [drop_path_rate]
+        else:
+            drop_rates = [drop_path_rate * float(i) / (num_layers - 1) for i in range(num_layers)]
         # Create separate instances for each layer to avoid weight sharing
         self.layers = nn.ModuleList([
-            self._get_cloned_layer(encoder_layer) for _ in range(num_layers)
+            self._get_cloned_layer(encoder_layer, drop_path_rate=drop_rates[i]) for i in range(num_layers)
         ])
         self.num_layers = num_layers
         self.norm = norm
 
-    def _get_cloned_layer(self, module):
+    def _get_cloned_layer(self, module, drop_path_rate=0.0):
         """Create a new layer with the same parameters"""
         if isinstance(module, NeptuneTransformerEncoderLayer):
             return NeptuneTransformerEncoderLayer(
@@ -274,6 +301,7 @@ class NeptuneTransformerEncoder(nn.Module):
                 bias=module.bias,
                 rope_scales=module.rope_scales,
                 rope_base=module.rope_base,
+                drop_path_rate=drop_path_rate,
             )
         else:
             import copy
