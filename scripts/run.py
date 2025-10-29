@@ -87,6 +87,8 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         output_dim = 3
     elif task == "energy_reco":
         output_dim = 2 if loss_name == "gaussian_nll" else 1
+    elif task == "starting_classification":
+        output_dim = 1
     else:
         raise ValueError(f"Unsupported downstream_task '{task}'")
 
@@ -149,6 +151,17 @@ def build_loss_function(model_opts: Dict[str, Any]):
         if loss_name == "mse":
             return lambda preds, labels: F.mse_loss(preds[:, 0], labels[:, 0])
 
+    if task == "starting_classification":
+        if loss_name != "bce":
+            raise ValueError("starting_classification currently supports only the 'bce' loss")
+
+        def loss_fn(preds, labels):
+            logits = preds.view(-1)
+            targets = labels[..., -1].reshape(-1).float()
+            return F.binary_cross_entropy_with_logits(logits, targets)
+
+        return loss_fn
+
     raise ValueError(f"Unsupported task/loss combination: {task}/{loss_name}")
 
 
@@ -169,6 +182,19 @@ def build_metric_function(task: str):
         def metric_fn(preds, labels):
             energy_errors = torch.abs(preds[:, 0] - labels[:, 0])
             return {"mean_energy_error": energy_errors.mean().item()}
+        return metric_fn
+    if task == "starting_classification":
+        def metric_fn(preds, labels):
+            logits = preds.view(-1)
+            targets = labels[..., -1].reshape(-1)
+            probs = torch.sigmoid(logits)
+            preds_binary = (probs >= 0.5).float()
+            accuracy = (preds_binary == targets).float().mean().item()
+            return {
+                "accuracy": accuracy,
+                "positive_rate": preds_binary.mean().item(),
+                "mean_probability": probs.mean().item(),
+            }
         return metric_fn
 
     return None
@@ -191,13 +217,18 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.cfg_file)
     normalize_config(cfg)
+    model_opts = cfg["model_options"]
+
+    if model_opts.get("downstream_task") == "starting_classification":
+        cfg["task"] = "starting_classification"
+        cfg.setdefault("data_options", {})
+        cfg["data_options"]["task"] = "starting_classification"
 
     device = select_device(cfg)
     print(f"Using device: {device}")
 
     train_loader, val_loader = create_dataloaders(cfg)
 
-    model_opts = cfg["model_options"]
     model = build_model(model_opts, device)
     loss_fn = build_loss_function(model_opts)
     metric_fn = build_metric_function(model_opts["downstream_task"])
