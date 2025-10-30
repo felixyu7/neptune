@@ -22,6 +22,7 @@ from ml_common.losses import (
     angular_distance_loss,
     gaussian_nll_loss,
     von_mises_fisher_loss,
+    FocalLoss,
 )
 from ml_common.training import Trainer
 from neptune import NeptuneModel
@@ -41,7 +42,7 @@ def load_config(cfg_path: str) -> Dict[str, Any]:
 
 def normalize_config(cfg: Dict[str, Any]) -> None:
     dataloader = cfg.get("dataloader")
-    allowed_dataloaders = {"mmap", "kaggle", "i3"}
+    allowed_dataloaders = {"mmap", "kaggle", "i3", "magnemite"}
     if dataloader not in allowed_dataloaders:
         raise ValueError(f"dataloader must be one of {sorted(allowed_dataloaders)}, got {dataloader}")
 
@@ -88,7 +89,7 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     elif task == "energy_reco":
         output_dim = 2 if loss_name == "gaussian_nll" else 1
     elif task == "multiclassification":
-        output_dim = model_opts["n_classes"]  # Support for multiclassification from magnemite
+        output_dim = model_opts['n_classes']
     else:
         raise ValueError(f"Unsupported downstream_task '{task}'")
 
@@ -154,6 +155,8 @@ def build_loss_function(model_opts: Dict[str, Any]):
             return lambda preds, labels: F.cross_entropy(preds, labels.long())
         if loss_name == "nll":
             return lambda preds, labels: F.nll_loss(F.log_softmax(preds, dim=1), labels.long())
+        if loss_name == "focal_loss":
+            return  lambda preds, labels: FocalLoss(preds, labels[:, 4].long(), n_classes=model_opts['n_classes'])
 
     raise ValueError(f"Unsupported task/loss combination: {task}/{loss_name}")
 
@@ -216,6 +219,7 @@ def main() -> None:
     metric_fn = build_metric_function(model_opts["downstream_task"])
 
     use_wandb = False if args.no_wandb else setup_wandb(cfg)
+
     trainer = Trainer(
         model=model,
         device=device,
