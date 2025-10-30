@@ -19,7 +19,8 @@ class FPSTokenizer(nn.Module):
                  max_tokens: int = 128,
                  token_dim: int = 768,
                  mlp_layers: List[int] = [256, 512, 768],
-                 k_neighbors: int = 16):
+                 k_neighbors: int = 16,
+                 dropout: float = 0.0):
         super().__init__()
         self.max_tokens = max_tokens
         self.token_dim = token_dim
@@ -29,7 +30,7 @@ class FPSTokenizer(nn.Module):
         mlp1 = []
         in_dim = feature_dim
         for out_dim in mlp_layers:
-            mlp1 += [nn.Linear(in_dim, out_dim), nn.GELU()]
+            mlp1 += [nn.Linear(in_dim, out_dim), nn.GELU(), nn.Dropout(dropout)]
             in_dim = out_dim
         mlp1 += [nn.Linear(in_dim, token_dim)]
         self.mlp1 = nn.Sequential(*mlp1)
@@ -38,6 +39,7 @@ class FPSTokenizer(nn.Module):
         self.mlp2 = nn.Sequential(
             nn.Linear(token_dim, token_dim),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(token_dim, token_dim)
         )
 
@@ -174,27 +176,33 @@ class FPSTokenizer(nn.Module):
             Fp_large = Fp[large_batch]
             valid_large = valid_mask[large_batch]
 
-            # Determine validity of each neighbor
-            valid_expanded = valid_large.unsqueeze(1).expand(-1, knn_idx.size(1), -1)
-            knn_valid = valid_expanded.gather(dim=2, index=knn_idx)  # [B_large, K, k]
+            B_large = Fp_large.size(0)
+            if B_large > 0:
+                Nmax_local = Fp_large.size(1)
+                K_local = knn_idx.size(1)
+                k_local = knn_idx.size(2)
 
-            # Gather neighbor features
-            Fp_expanded = Fp_large.unsqueeze(1).expand(-1, knn_idx.size(1), -1, -1)  # [B_large, K, Nmax, T]
-            knn_idx_T = knn_idx.unsqueeze(-1).expand(-1, -1, -1, self.token_dim)
-            neigh_feats = Fp_expanded.gather(dim=2, index=knn_idx_T)  # [B_large, K, k, T]
+                base_offsets = torch.arange(B_large, device=device, dtype=knn_idx.dtype)
+                base_offsets = (base_offsets * Nmax_local).view(-1, 1, 1)
+                flat_knn_idx = (knn_idx + base_offsets).reshape(-1)
 
-            # Max-pool across neighbors
-            neg_inf = torch.tensor(float('-inf'), device=device, dtype=neigh_feats.dtype)
-            masked_neigh = neigh_feats.masked_fill(~knn_valid.unsqueeze(-1), neg_inf)
-            pooled = masked_neigh.max(dim=2).values  # [B_large, K, T]
-            pooled = torch.where(torch.isfinite(pooled), pooled, torch.zeros_like(pooled))
+                Fp_flat = Fp_large.reshape(B_large * Nmax_local, self.token_dim)
+                neigh_feats = Fp_flat.index_select(0, flat_knn_idx).reshape(B_large, K_local, k_local, self.token_dim)
 
-            token_feats[large_batch] = pooled
+                valid_flat = valid_large.reshape(B_large * Nmax_local)
+                knn_valid = valid_flat.index_select(0, flat_knn_idx).reshape(B_large, K_local, k_local)
+
+                # Max-pool across neighbors
+                neg_inf = torch.tensor(float('-inf'), device=device, dtype=neigh_feats.dtype)
+                masked_neigh = neigh_feats.masked_fill(~knn_valid.unsqueeze(-1), neg_inf)
+                pooled = masked_neigh.max(dim=2).values  # [B_large, K, T]
+                pooled = torch.where(torch.isfinite(pooled), pooled, torch.zeros_like(pooled))
+
+                token_feats[large_batch] = pooled
 
         # MLP 2: Always apply token refinement (consistent depth)
         token_feats = self.mlp2(token_feats)  # [B, max_tokens, token_dim]
 
-        # No time sorting - let 4D RoPE handle spatial-temporal relationships
         tokens = token_feats
         centroids = cents
         masks = validK
@@ -204,4 +212,3 @@ class FPSTokenizer(nn.Module):
         centroids = centroids * masks.unsqueeze(-1)
 
         return tokens.to(dtype_f), centroids.to(dtype_p), masks
-    

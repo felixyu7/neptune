@@ -24,6 +24,7 @@ class PointTransformerEncoder(nn.Module):
         num_heads=12,
         hidden_dim=3072,
         dropout=0.1,
+        drop_path_rate=0.0,
     ):
         super().__init__()
         self.token_dim = token_dim
@@ -33,17 +34,21 @@ class PointTransformerEncoder(nn.Module):
             nhead=num_heads,
             dim_feedforward=hidden_dim,
             dropout=dropout,
+            drop_path_rate=0.0,
         )
         self.centroid_mlp = nn.Sequential(
             nn.Linear(4, token_dim // 2),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(token_dim // 2, token_dim),
             nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(token_dim, token_dim),
         )
         self.layers = NeptuneTransformerEncoder(
             enc_layer,
             num_layers=num_layers,
+            drop_path_rate=drop_path_rate,
         )
         self.norm = RMSNorm(token_dim)
 
@@ -75,6 +80,7 @@ class NeptuneModel(nn.Module):
         num_heads: int = 12,
         hidden_dim: int = 3072,
         dropout: float = 0.1,
+        drop_path_rate: float = 0.0,
         output_dim: int = 3,
         k_neighbors: int = 8,   # only for fps
         tokenizer_kwargs: Optional[Dict[str, Any]] = None,
@@ -83,12 +89,15 @@ class NeptuneModel(nn.Module):
         tokenizer_cfg: Dict[str, Any] = dict(tokenizer_kwargs or {})
         mlp_layers_cfg = tokenizer_cfg.pop("mlp_layers", [256, 512, 768])
         
+        tokenizer_dropout = tokenizer_cfg.pop("dropout", dropout)
+
         self.tokenizer = FPSTokenizer(
             feature_dim=in_channels,
             max_tokens=num_patches,
             token_dim=token_dim,
             mlp_layers=mlp_layers_cfg,
             k_neighbors=k_neighbors,
+            dropout=tokenizer_dropout,
             **tokenizer_cfg,
         )
 
@@ -98,6 +107,7 @@ class NeptuneModel(nn.Module):
             num_heads=num_heads,
             hidden_dim=hidden_dim,
             dropout=dropout,
+            drop_path_rate=drop_path_rate,
         )
         self.head = nn.Sequential(
             nn.Linear(token_dim, token_dim), nn.GELU(), nn.Dropout(dropout),

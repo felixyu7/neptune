@@ -95,6 +95,7 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
 
     k_neighbors = model_opts.get("k_neighbors", 8)
     tokenizer_kwargs = model_opts.get("tokenizer_kwargs")
+    drop_path_rate = model_opts.get("drop_path_rate", 0.0)
 
     token_dim = model_opts["token_dim"]
     num_heads = model_opts["num_heads"]
@@ -112,6 +113,7 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         num_heads=num_heads,
         hidden_dim=model_opts["hidden_dim"],
         dropout=model_opts["dropout"],
+        drop_path_rate=drop_path_rate,
         output_dim=output_dim,
         k_neighbors=k_neighbors,
         tokenizer_kwargs=tokenizer_kwargs,
@@ -179,6 +181,19 @@ def build_metric_function(task: str):
             energy_errors = torch.abs(preds[:, 0] - labels[:, 0])
             return {"mean_energy_error": energy_errors.mean().item()}
         return metric_fn
+    if task == "starting_classification":
+        def metric_fn(preds, labels):
+            logits = preds.view(-1)
+            targets = labels[..., -1].reshape(-1)
+            probs = torch.sigmoid(logits)
+            preds_binary = (probs >= 0.5).float()
+            accuracy = (preds_binary == targets).float().mean().item()
+            return {
+                "accuracy": accuracy,
+                "positive_rate": preds_binary.mean().item(),
+                "mean_probability": probs.mean().item(),
+            }
+        return metric_fn
 
     if task == "multiclassification":
         def metric_fn(preds, labels):
@@ -207,13 +222,18 @@ def main() -> None:
     args = parse_args()
     cfg = load_config(args.cfg_file)
     normalize_config(cfg)
+    model_opts = cfg["model_options"]
+
+    if model_opts.get("downstream_task") == "starting_classification":
+        cfg["task"] = "starting_classification"
+        cfg.setdefault("data_options", {})
+        cfg["data_options"]["task"] = "starting_classification"
 
     device = select_device(cfg)
     print(f"Using device: {device}")
 
     train_loader, val_loader = create_dataloaders(cfg)
 
-    model_opts = cfg["model_options"]
     model = build_model(model_opts, device)
     loss_fn = build_loss_function(model_opts)
     metric_fn = build_metric_function(model_opts["downstream_task"])
