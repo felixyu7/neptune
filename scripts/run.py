@@ -88,8 +88,10 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         output_dim = 3
     elif task == "energy_reco":
         output_dim = 2 if loss_name == "gaussian_nll" else 1
-    elif task == "multiclassification":
+    elif task == "mag_classification":
         output_dim = model_opts['n_classes']
+    elif task == "mag_length_reco":
+        output_dim = 2 if loss_name == "gaussian_nll" else 1
     else:
         raise ValueError(f"Unsupported downstream_task '{task}'")
 
@@ -152,13 +154,52 @@ def build_loss_function(model_opts: Dict[str, Any]):
         if loss_name == "mse":
             return lambda preds, labels: F.mse_loss(preds[:, 0], labels[:, 0])
 
-    if task == "multiclassification":
+    if task == "mag_classification":
         if loss_name == "cross_entropy":
-            return lambda preds, labels: F.cross_entropy(preds, labels.long())
+            return lambda preds, labels: F.cross_entropy(preds, labels[:, 4].long())
         if loss_name == "nll":
-            return lambda preds, labels: F.nll_loss(F.log_softmax(preds, dim=1), labels.long())
+            return lambda preds, labels: F.nll_loss(F.log_softmax(preds, dim=1), labels[:, 4].long())
         if loss_name == "focal_loss":
             return  lambda preds, labels: FocalLoss(preds, labels[:, 4].long(), n_classes=model_opts['n_classes'])
+
+    if task == "mag_length_reco":
+        # Get config options for background handling
+        bg_length = model_opts.get("background_length", 0.0)  # Target length for backgrounds
+        signal_weight = model_opts.get("signal_weight", 1.0)
+        background_weight = model_opts.get("background_weight", 1.0)
+
+        def weighted_length_loss(preds, labels):
+            interaction = labels[:, 4]  # 0=signal, else=background
+            true_length = labels[:, 5]
+
+            # Set background lengths to epsilon
+            is_signal = (interaction == 0)
+            target_length = torch.where(
+                is_signal,
+                true_length,
+                torch.tensor(bg_length, device=true_length.device, dtype=true_length.dtype)
+            )
+
+            # Apply weights
+            weights = torch.where(
+                is_signal,
+                torch.tensor(signal_weight, device=true_length.device),
+                torch.tensor(background_weight, device=true_length.device)
+            )
+
+            if loss_name == "gaussian_nll":
+                # Weighted Gaussian NLL
+                nll = gaussian_nll_loss(preds[:, 0], preds[:, 1], target_length, reduction='none')
+                main_loss =  (weights * nll).mean()
+            elif loss_name == "mse":
+                # Weighted MSE
+                mse = F.mse_loss(preds[:, 0], target_length, reduction='none')
+                main_loss = (weights * mse).mean()
+            bg_penalty = torch.relu(preds[~is_signal]).mean() * 0.1
+            total_loss = main_loss + bg_penalty
+            return total_loss
+
+        return weighted_length_loss
 
     raise ValueError(f"Unsupported task/loss combination: {task}/{loss_name}")
 
@@ -194,15 +235,81 @@ def build_metric_function(task: str):
                 "mean_probability": probs.mean().item(),
             }
         return metric_fn
-
-    if task == "multiclassification":
+    if task == "mag_classification":
         def metric_fn(preds, labels):
-            _, predicted = torch.max(preds.data, 1)
-            accuracy = (predicted == labels).float().mean()
-            return {"accuracy": accuracy.item()}
+            logits = preds
+            targets = labels[..., 4].reshape(-1)
+            probs = torch.softmax(logits, dim=1)
+            preds_classes = torch.argmax(probs, dim=1)
+            accuracy = (preds_classes == targets).float().mean().item()
+            return {
+                "accuracy": accuracy,
+                "positive_rate": (preds_classes > 0).float().mean().item(),
+                "mean_probability": probs.mean().item(),
+            }
+        return metric_fn
+
+    if task == "mag_length_reco":
+        def metric_fn(preds, labels):
+            pred_length = preds[:, 0]
+            true_length = labels[:, 5]
+            interaction = labels[:, 4]
+
+            # Separate signal and background
+            is_signal = (interaction == 0)
+            is_background = ~is_signal
+
+            metrics = {}
+
+            # Overall metrics
+            length_errors = torch.abs(pred_length - true_length)
+            metrics["mean_length_error"] = length_errors.mean().item()
+
+            # Signal-specific metrics
+            if is_signal.any():
+                signal_errors = length_errors[is_signal]
+                metrics["signal_mean_error"] = signal_errors.mean().item()
+                metrics["signal_median_error"] = torch.median(signal_errors).item()
+                metrics["signal_relative_error"] = (signal_errors / (true_length[is_signal] + 1e-6)).mean().item()
+
+            # Background-specific metrics (should be close to 0)
+            if is_background.any():
+                bg_preds = pred_length[is_background]
+                metrics["background_mean_pred"] = bg_preds.mean().item()
+                metrics["background_median_pred"] = torch.median(bg_preds).item()
+                metrics["background_false_positive_rate"] = (bg_preds > 10.0).float().mean().item()  # % predicting >10m
+
+            # Uncertainty metrics (if using Gaussian NLL)
+            if preds.shape[1] > 1:
+                uncertainties = preds[:, 1]
+                metrics["mean_uncertainty"] = uncertainties.mean().item()
+                if is_signal.any():
+                    metrics["signal_uncertainty"] = uncertainties[is_signal].mean().item()
+                if is_background.any():
+                    metrics["background_uncertainty"] = uncertainties[is_background].mean().item()
+
+            return metrics
         return metric_fn
 
     return None
+
+
+class LimitedDataLoader:
+    """Wrapper to limit number of batches from a dataloader"""
+    def __init__(self, dataloader, max_batches=None):
+        self.dataloader = dataloader
+        self.max_batches = max_batches
+
+    def __iter__(self):
+        for i, batch in enumerate(self.dataloader):
+            if self.max_batches is not None and i >= self.max_batches:
+                break
+            yield batch
+
+    def __len__(self):
+        if self.max_batches is None:
+            return len(self.dataloader)
+        return min(self.max_batches, len(self.dataloader))
 
 
 def prepare_batch(
@@ -233,6 +340,17 @@ def main() -> None:
     print(f"Using device: {device}")
 
     train_loader, val_loader = create_dataloaders(cfg)
+
+    # Optional: Limit number of batches for debugging
+    max_train_batches = cfg.get("training_options", {}).get("max_train_batches", None)
+    max_val_batches = cfg.get("training_options", {}).get("max_val_batches", None)
+
+    if max_train_batches is not None:
+        print(f"Limiting training to {max_train_batches} batches")
+        train_loader = LimitedDataLoader(train_loader, max_train_batches)
+    if max_val_batches is not None:
+        print(f"Limiting validation to {max_val_batches} batches")
+        val_loader = LimitedDataLoader(val_loader, max_val_batches)
 
     model = build_model(model_opts, device)
     loss_fn = build_loss_function(model_opts)
