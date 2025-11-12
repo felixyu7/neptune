@@ -55,7 +55,7 @@ loss.backward()
 
 Neptune assumes `coords` is an `[N, 4]` tensor with time in the fourth column.
 
-For full training runs, the CLI entry point `scripts/run.py` uses shared tooling from [ml-common](https://github.com/felixyu7/ml-common) for dataloaders, losses, and the trainer:
+For full training runs, the CLI entry point `scripts/run.py` uses shared tooling from [ml-common](https://github.com/felixyu7/ml-common) for dataloaders, losses, and the trainer. Use `git submodule init` followed by `git submodule update` to update the [ml-common](https://github.com/felixyu7/ml-common) submodule in the repo. Then, run by providing a config file:
 
 ```bash
 python scripts/run.py -c scripts/configs/prometheus_angular_reco.cfg
