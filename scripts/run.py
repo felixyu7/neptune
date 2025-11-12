@@ -10,11 +10,15 @@ import torch.nn.functional as F
 import yaml
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(ROOT))
+if str(ROOT) not in sys.path:
+    sys.path.append(str(ROOT))
 
-ML_COMMON_ROOT = ROOT.parent / "ml-common"
-if ML_COMMON_ROOT.exists():
-    sys.path.append(str(ML_COMMON_ROOT))
+ML_COMMON_SUBMODULE = ROOT / "ml_common"
+ML_COMMON_PACKAGE = ML_COMMON_SUBMODULE / "ml_common" / "__init__.py"
+if ML_COMMON_PACKAGE.exists():
+    submodule_path = str(ML_COMMON_SUBMODULE)
+    if submodule_path not in sys.path:
+        sys.path.append(submodule_path)
 
 from ml_common.dataloaders import create_dataloaders
 from ml_common.losses import (
