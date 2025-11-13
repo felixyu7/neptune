@@ -93,6 +93,10 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         output_dim = 2 if loss_name == "gaussian_nll" else 1
     elif task == "starting_classification":
         output_dim = 1
+    elif task == "morphology_classification":
+        output_dim = 6
+    elif task == "track_cascade_classification":
+        output_dim = 1
     else:
         raise ValueError(f"Unsupported downstream_task '{task}'")
 
@@ -166,6 +170,27 @@ def build_loss_function(model_opts: Dict[str, Any]):
 
         return loss_fn
 
+    if task == "morphology_classification":
+        if loss_name != "cross_entropy":
+            raise ValueError("morphology_classification currently supports only the 'cross_entropy' loss")
+
+        def loss_fn(preds, labels):
+            targets = labels[:, 4].long()
+            return F.cross_entropy(preds, targets)
+
+        return loss_fn
+
+    if task == "track_cascade_classification":
+        if loss_name != "bce":
+            raise ValueError("track_cascade_classification currently supports only the 'bce' loss")
+
+        def loss_fn(preds, labels):
+            logits = preds.view(-1)
+            targets = (labels[:, 4] == 0).float()
+            return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=torch.tensor(10.0))
+
+        return loss_fn
+
     raise ValueError(f"Unsupported task/loss combination: {task}/{loss_name}")
 
 
@@ -194,11 +219,26 @@ def build_metric_function(task: str):
             probs = torch.sigmoid(logits)
             preds_binary = (probs >= 0.5).float()
             accuracy = (preds_binary == targets).float().mean().item()
-            return {
-                "accuracy": accuracy,
-                "positive_rate": preds_binary.mean().item(),
-                "mean_probability": probs.mean().item(),
-            }
+            return {"accuracy": accuracy}
+        return metric_fn
+
+    if task == "morphology_classification":
+        def metric_fn(preds, labels):
+            targets = labels[:, 4].long()
+            probs = torch.softmax(preds, dim=1)
+            pred_classes = probs.argmax(dim=1)
+            accuracy = (pred_classes == targets).float().mean().item()
+            return {"accuracy": accuracy}
+        return metric_fn
+
+    if task == "track_cascade_classification":
+        def metric_fn(preds, labels):
+            logits = preds.view(-1)
+            targets = (labels[:, 4] == 0).float()
+            probs = torch.sigmoid(logits)
+            preds_binary = (probs >= 0.5).float()
+            accuracy = (preds_binary == targets).float().mean().item()
+            return {"accuracy": accuracy}
         return metric_fn
 
     return None
