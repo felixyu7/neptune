@@ -16,9 +16,17 @@ Example usage:
     >>> features = torch.randn(1024, 6)
     >>> batch_ids = torch.zeros(1024, dtype=torch.long)
     >>> output = model(coords, features, batch_ids)
+
+For GPU-only workloads with variable-length sequences (PyTorch 2.10+, CUDA A100+):
+    >>> from neptune import NeptuneVarlenModel
+    >>> model = NeptuneVarlenModel(
+    ...     in_channels=6,
+    ...     token_dim=768,
+    ...     output_dim=3
+    ... ).cuda()
 """
 
-from .model import NeptuneModel
+from .model import NeptuneModel, NeptuneVarlenModel
 
 __version__ = "0.1.0"
-__all__ = ["NeptuneModel"]
+__all__ = ["NeptuneModel", "NeptuneVarlenModel"]

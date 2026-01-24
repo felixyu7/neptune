@@ -28,7 +28,7 @@ from ml_common.losses import (
     von_mises_fisher_loss,
 )
 from ml_common.training import Trainer
-from neptune import NeptuneModel
+from neptune import NeptuneModel, NeptuneVarlenModel
 
 
 def parse_args() -> argparse.Namespace:
@@ -100,8 +100,6 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     else:
         raise ValueError(f"Unsupported downstream_task '{task}'")
 
-    k_neighbors = model_opts.get("k_neighbors", 8)
-    tokenizer_kwargs = model_opts.get("tokenizer_kwargs")
     drop_path_rate = model_opts.get("drop_path_rate", 0.0)
 
     token_dim = model_opts["token_dim"]
@@ -112,19 +110,52 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
             "and produce a head_dim divisible by 8 for 4D RoPE."
         )
 
-    model = NeptuneModel(
-        in_channels=model_opts["in_channels"],
-        num_patches=model_opts["num_patches"],
-        token_dim=token_dim,
-        num_layers=model_opts["num_layers"],
-        num_heads=num_heads,
-        hidden_dim=model_opts["hidden_dim"],
-        dropout=model_opts["dropout"],
-        drop_path_rate=drop_path_rate,
-        output_dim=output_dim,
-        k_neighbors=k_neighbors,
-        tokenizer_kwargs=tokenizer_kwargs,
-    )
+    model_type = model_opts.get("model_type", "neptune").lower()
+
+    if model_type == "neptune_varlen":
+        # Validate GPU requirement for varlen model
+        if device.type != "cuda":
+            raise ValueError(
+                "NeptuneVarlenModel requires CUDA GPU. "
+                "Set accelerator: 'gpu' or use model_type: 'neptune'"
+            )
+
+        # Get MLP layers config (from tokenizer_kwargs for consistency)
+        mlp_layers = [256, 512, 768]
+        tokenizer_kwargs = model_opts.get("tokenizer_kwargs")
+        if tokenizer_kwargs:
+            mlp_layers = tokenizer_kwargs.get("mlp_layers", mlp_layers)
+
+        model = NeptuneVarlenModel(
+            in_channels=model_opts["in_channels"],
+            token_dim=token_dim,
+            num_layers=model_opts["num_layers"],
+            num_heads=num_heads,
+            hidden_dim=model_opts["hidden_dim"],
+            dropout=model_opts["dropout"],
+            drop_path_rate=drop_path_rate,
+            output_dim=output_dim,
+            mlp_layers=mlp_layers,
+        )
+    else:
+        # Default: standard Neptune model
+        k_neighbors = model_opts.get("k_neighbors", 8)
+        tokenizer_kwargs = model_opts.get("tokenizer_kwargs")
+
+        model = NeptuneModel(
+            in_channels=model_opts["in_channels"],
+            num_patches=model_opts["num_patches"],
+            token_dim=token_dim,
+            num_layers=model_opts["num_layers"],
+            num_heads=num_heads,
+            hidden_dim=model_opts["hidden_dim"],
+            dropout=model_opts["dropout"],
+            drop_path_rate=drop_path_rate,
+            output_dim=output_dim,
+            k_neighbors=k_neighbors,
+            tokenizer_kwargs=tokenizer_kwargs,
+        )
+
     return model.to(device)
 
 

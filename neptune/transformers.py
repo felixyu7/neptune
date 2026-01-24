@@ -141,6 +141,124 @@ class RoPE4D(nn.Module):
         return x_real.to(original_dtype)
 
 
+class RoPE4DVarlen(nn.Module):
+    """
+    4D Rotary Position Embedding for packed/varlen format.
+
+    Same frequency schedule as RoPE4D, but operates on packed tensors
+    where coords are [total_tokens, 4] instead of [B, S, 4].
+
+    Requirements:
+        - dim >= 8 (need at least one 2x2 plane per axis)
+    """
+
+    def __init__(self, dim, scales=(1.0, 1.0, 1.0, 1.0), base=10000):
+        """
+        Args:
+            dim: Head dimension (must be even and >= 8 for valid 4D RoPE)
+            scales: (s_x, s_y, s_z, s_t) scaling factors for coordinate axes
+            base: Base for log-spaced frequency schedule
+        """
+        super().__init__()
+        assert dim % 2 == 0, f"RoPE4DVarlen dim must be even (got {dim})"
+        assert dim >= 8, f"RoPE4DVarlen requires dim >= 8 for 4 axes (got {dim})"
+        self.dim = dim
+        self.scales = scales
+        self.base = base
+
+        # Divide dim into M = dim/2 planes
+        num_planes = dim // 2
+
+        # Allocate at least one plane per axis first (ensures linear independence)
+        base_allocation = [1, 1, 1, 1]
+        remaining = num_planes - 4
+
+        # Distribute remaining planes round-robin
+        for i in range(remaining):
+            base_allocation[i % 4] += 1
+
+        self.num_planes_per_axis = base_allocation
+
+        # Build log-spaced frequencies for each axis
+        self.register_buffer("freqs_x", self._build_freqs(self.num_planes_per_axis[0], scales[0]))
+        self.register_buffer("freqs_y", self._build_freqs(self.num_planes_per_axis[1], scales[1]))
+        self.register_buffer("freqs_z", self._build_freqs(self.num_planes_per_axis[2], scales[2]))
+        self.register_buffer("freqs_t", self._build_freqs(self.num_planes_per_axis[3], scales[3]))
+
+    def _build_freqs(self, num_bands, scale):
+        """Build log-spaced frequency bands: omega_min * rho^(l/(L-1))."""
+        if num_bands == 0:
+            return torch.zeros(0)
+        if num_bands == 1:
+            return torch.tensor([1.0 / self.base]) * scale
+
+        exponents = torch.arange(num_bands, dtype=torch.float32) / (num_bands - 1)
+        freqs = (1.0 / self.base) * (self.base ** exponents)
+        return freqs * scale
+
+    def forward(self, x, coords):
+        """
+        Apply 4D rotations to Q or K in packed format.
+
+        Args:
+            x: (total_tokens, num_heads, head_dim) - varlen format for Q/K
+            coords: (total_tokens, 4) - packed coordinates (x, y, z, t)
+        Returns:
+            Rotated tensor (total_tokens, num_heads, head_dim)
+        """
+        N, H, D = x.shape
+        original_dtype = x.dtype
+
+        # Reshape to planes: (N, H, M, 2) where M = D/2
+        x_planes = x.float().reshape(N, H, D // 2, 2)
+        x_complex = torch.view_as_complex(x_planes.contiguous())  # (N, H, M)
+
+        # Extract coordinates
+        coords = coords.float()
+        x_c, y_c, z_c, t_c = coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]
+
+        plane_idx = 0
+
+        # Rotate planes for x-axis
+        if self.num_planes_per_axis[0] > 0:
+            angles = x_c.unsqueeze(-1) * self.freqs_x  # (N, L_x)
+            angles = angles.unsqueeze(1)  # (N, 1, L_x) broadcast over heads
+            rot = torch.polar(torch.ones_like(angles), angles)
+            end = plane_idx + self.num_planes_per_axis[0]
+            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
+            plane_idx = end
+
+        # Rotate planes for y-axis
+        if self.num_planes_per_axis[1] > 0:
+            angles = y_c.unsqueeze(-1) * self.freqs_y
+            angles = angles.unsqueeze(1)
+            rot = torch.polar(torch.ones_like(angles), angles)
+            end = plane_idx + self.num_planes_per_axis[1]
+            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
+            plane_idx = end
+
+        # Rotate planes for z-axis
+        if self.num_planes_per_axis[2] > 0:
+            angles = z_c.unsqueeze(-1) * self.freqs_z
+            angles = angles.unsqueeze(1)
+            rot = torch.polar(torch.ones_like(angles), angles)
+            end = plane_idx + self.num_planes_per_axis[2]
+            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
+            plane_idx = end
+
+        # Rotate planes for t-axis
+        if self.num_planes_per_axis[3] > 0:
+            angles = t_c.unsqueeze(-1) * self.freqs_t
+            angles = angles.unsqueeze(1)
+            rot = torch.polar(torch.ones_like(angles), angles)
+            end = plane_idx + self.num_planes_per_axis[3]
+            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
+
+        # Convert back to real representation
+        x_real = torch.view_as_real(x_complex).reshape(N, H, D)
+        return x_real.to(original_dtype)
+
+
 class SwiGLU(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.1, bias=True):
         super().__init__()
@@ -316,4 +434,176 @@ class NeptuneTransformerEncoder(nn.Module):
         if self.norm is not None:
             output = self.norm(output)
 
+        return output
+
+
+class VarlenTransformerEncoderLayer(nn.Module):
+    """
+    Transformer encoder layer using PyTorch 2.10's varlen_attn.
+
+    Operates on packed sequences [total_tokens, d_model] instead of
+    padded batches [B, S, d_model]. Requires CUDA A100+ and BF16/FP16.
+    """
+
+    def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1,
+                 layer_norm_eps=1e-5, bias=True, rope_scales=(1.0, 1.0, 1.0, 0.2),
+                 rope_base=10000, drop_path_rate=0.0):
+        super().__init__()
+        self.d_model = d_model
+        self.nhead = nhead
+        self.head_dim = d_model // nhead
+        assert d_model % nhead == 0, "d_model must be divisible by nhead"
+        assert self.head_dim % 2 == 0, f"head_dim must be even for RoPE4D (got {self.head_dim})"
+        assert self.head_dim >= 8, f"head_dim must be >= 8 for RoPE4D (got {self.head_dim})"
+
+        # Multi-head attention components
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=bias)
+        self.out_proj = nn.Linear(d_model, d_model, bias=bias)
+
+        self._initialize_weights()
+
+        # RMSNorm (supports packed format natively)
+        self.norm1 = RMSNorm(d_model, eps=layer_norm_eps)
+        self.norm2 = RMSNorm(d_model, eps=layer_norm_eps)
+
+        # SwiGLU FFN
+        self.ffn = SwiGLU(d_model, dim_feedforward, dropout, bias=bias)
+
+        # 4D RoPE for varlen format
+        self.rope = RoPE4DVarlen(dim=self.head_dim, scales=rope_scales, base=rope_base)
+
+        # LayerScale: learnable per-channel scaling for residual branches
+        self.gamma_1 = nn.Parameter(1e-5 * torch.ones(d_model))
+        self.gamma_2 = nn.Parameter(1e-5 * torch.ones(d_model))
+
+        # Store hyperparameters for cloning
+        self.layer_norm_eps = layer_norm_eps
+        self.bias = bias
+        self.rope_scales = rope_scales
+        self.rope_base = rope_base
+
+        # Dropout
+        self.dropout = nn.Dropout(dropout)
+        self.attn_dropout = dropout
+        self.drop_path1 = DropPath(drop_path_rate)
+        self.drop_path2 = DropPath(drop_path_rate)
+        self.drop_path_rate = drop_path_rate
+
+    def _initialize_weights(self):
+        """Initialize weights using modern industry-standard practices."""
+        nn.init.xavier_uniform_(self.qkv_proj.weight)
+        if self.qkv_proj.bias is not None:
+            nn.init.zeros_(self.qkv_proj.bias)
+
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, src, coords, cu_seqlens, max_seqlen):
+        """
+        Forward pass with varlen attention.
+
+        Args:
+            src: Packed input [total_tokens, d_model]
+            coords: Packed 4D coordinates [total_tokens, 4]
+            cu_seqlens: Cumulative sequence lengths [B+1]
+            max_seqlen: Maximum sequence length
+
+        Returns:
+            Output [total_tokens, d_model]
+        """
+        from torch.nn.attention.varlen import varlen_attn
+
+        N = src.size(0)
+        x = src
+
+        # Pre-norm
+        x_norm = self.norm1(x)
+
+        # QKV projection
+        qkv = self.qkv_proj(x_norm)  # [N, 3*d_model]
+        qkv = qkv.reshape(N, 3, self.nhead, self.head_dim)  # [N, 3, H, D]
+        q, k, v = qkv[:, 0], qkv[:, 1], qkv[:, 2]  # Each [N, H, D]
+
+        # Apply RoPE to Q and K
+        q = self.rope(q, coords)  # [N, H, D]
+        k = self.rope(k, coords)  # [N, H, D]
+
+        # varlen_attn expects (total_tokens, num_heads, head_dim)
+        attn_output = varlen_attn(
+            query=q,
+            key=k,
+            value=v,
+            cu_seq_q=cu_seqlens,
+            cu_seq_k=cu_seqlens,
+            max_q=max_seqlen,
+            max_k=max_seqlen,
+            is_causal=False
+        )  # [N, H, D]
+
+        # Reshape and project
+        attn_output = attn_output.reshape(N, self.d_model)  # [N, d_model]
+        attn_output = self.out_proj(attn_output)
+
+        # Residual with LayerScale
+        x = x + self.drop_path1(self.dropout(self.gamma_1 * attn_output))
+
+        # FFN block
+        x_norm = self.norm2(x)
+        ff_output = self.ffn(x_norm)
+        x = x + self.drop_path2(self.gamma_2 * ff_output)
+
+        return x
+
+
+class VarlenTransformerEncoder(nn.Module):
+    """Encoder stack for varlen attention layers."""
+
+    def __init__(self, encoder_layer, num_layers, drop_path_rate=0.0):
+        super().__init__()
+        if num_layers <= 0:
+            raise ValueError("num_layers must be positive")
+
+        # Stochastic depth schedule
+        if num_layers == 1:
+            drop_rates = [drop_path_rate]
+        else:
+            drop_rates = [drop_path_rate * float(i) / (num_layers - 1) for i in range(num_layers)]
+
+        self.layers = nn.ModuleList([
+            self._clone_layer(encoder_layer, drop_rates[i])
+            for i in range(num_layers)
+        ])
+        self.num_layers = num_layers
+
+    def _clone_layer(self, layer, drop_path_rate):
+        """Create a new layer with the same parameters."""
+        return VarlenTransformerEncoderLayer(
+            d_model=layer.d_model,
+            nhead=layer.nhead,
+            dim_feedforward=layer.ffn.w1.out_features,
+            dropout=layer.dropout.p,
+            layer_norm_eps=layer.layer_norm_eps,
+            bias=layer.bias,
+            rope_scales=layer.rope_scales,
+            rope_base=layer.rope_base,
+            drop_path_rate=drop_path_rate,
+        )
+
+    def forward(self, src, coords, cu_seqlens, max_seqlen):
+        """
+        Forward pass through all layers.
+
+        Args:
+            src: Packed input [total_tokens, d_model]
+            coords: Packed 4D coordinates [total_tokens, 4]
+            cu_seqlens: Cumulative sequence lengths [B+1]
+            max_seqlen: Maximum sequence length
+
+        Returns:
+            Output [total_tokens, d_model]
+        """
+        output = src
+        for layer in self.layers:
+            output = layer(output, coords, cu_seqlens, max_seqlen)
         return output
