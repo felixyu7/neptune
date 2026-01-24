@@ -166,7 +166,7 @@ class SwiGLU(nn.Module):
 
 class NeptuneTransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1,
-                 layer_norm_eps=1e-5, bias=True, rope_scales=(1.0, 1.0, 1.0, 1.0),
+                 layer_norm_eps=1e-5, bias=True, rope_scales=(1.0, 1.0, 1.0, 0.2),
                  rope_base=10000, drop_path_rate=0.0):
         super().__init__()
         self.d_model = d_model
