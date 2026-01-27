@@ -2,3 +2,7 @@ __pycache__
 *.egg*
 experiments
 build
+
+**__pycache__**
+
+scripts/jobs/slurm_logs

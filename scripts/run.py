@@ -195,8 +195,8 @@ def build_loss_function(model_opts: Dict[str, Any]):
                 # Weighted MSE
                 mse = F.mse_loss(preds[:, 0], target_length, reduction='none')
                 main_loss = (weights * mse).mean()
-            bg_penalty = torch.relu(preds[~is_signal]).mean() * 0.1
-            total_loss = main_loss + bg_penalty
+            #bg_penalty = (torch.relu(preds[~is_signal,0]) / torch.sqrt(1e-6 + torch.relu(preds[~is_signal,1]))).mean() # background penalty based on prediction and uncertainty
+            total_loss = main_loss# + bg_penalty
             return total_loss
 
         return weighted_length_loss
