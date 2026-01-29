@@ -22,13 +22,9 @@ if ML_COMMON_PACKAGE.exists():
 
 from ml_common.dataloaders import create_dataloaders
 from ml_common.losses import (
-    CombinedDirectionalLoss,
     angular_distance_loss,
     gaussian_nll_loss,
     von_mises_fisher_loss,
-    power_spherical_loss,
-    cosine_annealed_loss,
-    angular_huber_loss,
 )
 from ml_common.training import Trainer
 from neptune import NeptuneModel, NeptuneVarlenModel
@@ -91,7 +87,7 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     loss_name = model_opts["loss_fn"]
 
     if task == "angular_reco":
-        output_dim = 3
+        output_dim = 4
     elif task == "energy_reco":
         output_dim = 2 if loss_name == "gaussian_nll" else 1
     elif task == "starting_classification":
@@ -168,36 +164,15 @@ def build_loss_function(model_opts: Dict[str, Any]):
     loss_kwargs = model_opts.get("loss_kwargs", {})
 
     if task == "angular_reco":
+        # All angular_reco models output [B,4]: direction[:3] + kappa[3]
         if loss_name == "angular_distance":
             return lambda preds, labels: angular_distance_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+                preds[:, :3], F.normalize(labels[:, 1:4], p=2, dim=1)
             )
         if loss_name == "vmf":
             return lambda preds, labels: von_mises_fisher_loss(
                 preds, F.normalize(labels[:, 1:4], p=2, dim=1)
             )
-        if loss_name in ("power_spherical", "ps"):
-            return lambda preds, labels: power_spherical_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
-            )
-        if loss_name in ("cosine_annealed", "ca"):
-            return lambda preds, labels: cosine_annealed_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
-            )
-        if loss_name in ("angular_huber", "ah"):
-            return lambda preds, labels: angular_huber_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
-            )
-        if loss_name == "combined_vmf_angular":
-            mixed_loss = CombinedDirectionalLoss(**loss_kwargs)
-
-            def loss_fn(preds, labels):
-                targets = F.normalize(labels[:, 1:4], p=2, dim=1)
-                return mixed_loss(preds, targets)
-
-            loss_fn.set_epoch_progress = mixed_loss.set_epoch_progress  # type: ignore[attr-defined]
-            loss_fn.current_weights = mixed_loss.current_weights  # type: ignore[attr-defined]
-            return loss_fn
 
     if task == "energy_reco":
         if loss_name == "gaussian_nll":
@@ -244,7 +219,7 @@ def build_metric_function(task: str):
     if task == "angular_reco":
         def metric_fn(preds, labels):
             target_dirs = F.normalize(labels[:, 1:4], p=2, dim=1)
-            preds_norm = F.normalize(preds, p=2, dim=1)
+            preds_norm = F.normalize(preds[:, :3], p=2, dim=1)
             errors = angular_distance_loss(preds_norm, target_dirs, reduction="none")
             errors_rad = errors * torch.pi
             return {
