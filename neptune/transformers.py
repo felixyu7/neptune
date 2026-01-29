@@ -28,6 +28,9 @@ class RoPE4D(nn.Module):
     Each coordinate axis gets dedicated rotation planes, ensuring the four
     generators B_x, B_y, B_z, B_t are linearly independent.
 
+    Uses optimized real-arithmetic rotation instead of complex numbers for
+    better performance and to avoid input tensor mutation.
+
     Requirements:
         - dim >= 8 (need at least one 2x2 plane per axis)
         - scales should be chosen so max_angle < 2π for local injectivity
@@ -61,11 +64,17 @@ class RoPE4D(nn.Module):
 
         self.num_planes_per_axis = base_allocation
 
-        # Build log-spaced frequencies for each axis
-        self.register_buffer("freqs_x", self._build_freqs(self.num_planes_per_axis[0], scales[0]))
-        self.register_buffer("freqs_y", self._build_freqs(self.num_planes_per_axis[1], scales[1]))
-        self.register_buffer("freqs_z", self._build_freqs(self.num_planes_per_axis[2], scales[2]))
-        self.register_buffer("freqs_t", self._build_freqs(self.num_planes_per_axis[3], scales[3]))
+        # Build concatenated frequency vector for vectorized computation
+        all_freqs = []
+        for n_planes, scale in zip(base_allocation, scales):
+            all_freqs.append(self._build_freqs(n_planes, scale))
+        self.register_buffer("freqs", torch.cat(all_freqs))  # (D/2,)
+
+        # Build coordinate selection indices: coord_select[plane] = axis_index
+        coord_select = []
+        for axis_idx, n_planes in enumerate(base_allocation):
+            coord_select.extend([axis_idx] * n_planes)
+        self.register_buffer("coord_select", torch.tensor(coord_select, dtype=torch.long))
 
     def _build_freqs(self, num_bands, scale):
         """Build log-spaced frequency bands: omega_min * rho^(l/(L-1))."""
@@ -82,6 +91,9 @@ class RoPE4D(nn.Module):
         """
         Apply 4D rotations to Q or K based on spatial-temporal coordinates.
 
+        Uses real-arithmetic rotation: (a + bi)(cos θ + i sin θ)
+        = (a cos θ - b sin θ) + i(a sin θ + b cos θ)
+
         Args:
             x: (B, H, S, D) queries or keys
             coords: (B, S, 4) coordinates (x, y, z, t)
@@ -91,54 +103,33 @@ class RoPE4D(nn.Module):
         B, H, S, D = x.shape
         original_dtype = x.dtype
 
-        # Reshape to planes: (B, H, S, M, 2) where M = D/2
-        x_planes = x.float().reshape(B, H, S, D // 2, 2)
-        x_complex = torch.view_as_complex(x_planes.contiguous())  # (B, H, S, M)
+        # Work in float32 for numerical stability
+        x_f = x.float()
+        coords_f = coords.float()
 
-        # Extract coordinates
-        coords = coords.float()
-        x_c, y_c, z_c, t_c = coords[..., 0], coords[..., 1], coords[..., 2], coords[..., 3]
+        # Reshape to pairs: (B, H, S, D/2, 2) where [..., 0] is real, [..., 1] is imag
+        x_pairs = x_f.reshape(B, H, S, D // 2, 2)
+        x_real = x_pairs[..., 0]  # (B, H, S, D/2)
+        x_imag = x_pairs[..., 1]  # (B, H, S, D/2)
 
-        plane_idx = 0
+        # Gather coordinate for each plane using precomputed indices: (B, S, D/2)
+        coord_per_plane = coords_f.index_select(dim=-1, index=self.coord_select)
 
-        # Rotate planes for x-axis
-        if self.num_planes_per_axis[0] > 0:
-            angles = x_c.unsqueeze(-1) * self.freqs_x  # (B, S, L_x)
-            angles = angles.unsqueeze(1)  # (B, 1, S, L_x) broadcast over heads
-            rot = torch.polar(torch.ones_like(angles), angles)
-            end = plane_idx + self.num_planes_per_axis[0]
-            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
-            plane_idx = end
+        # Compute angles and expand for heads: (B, 1, S, D/2)
+        angles = (coord_per_plane * self.freqs).unsqueeze(1)
 
-        # Rotate planes for y-axis
-        if self.num_planes_per_axis[1] > 0:
-            angles = y_c.unsqueeze(-1) * self.freqs_y
-            angles = angles.unsqueeze(1)
-            rot = torch.polar(torch.ones_like(angles), angles)
-            end = plane_idx + self.num_planes_per_axis[1]
-            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
-            plane_idx = end
+        # Compute rotation coefficients
+        cos_a = torch.cos(angles)
+        sin_a = torch.sin(angles)
 
-        # Rotate planes for z-axis
-        if self.num_planes_per_axis[2] > 0:
-            angles = z_c.unsqueeze(-1) * self.freqs_z
-            angles = angles.unsqueeze(1)
-            rot = torch.polar(torch.ones_like(angles), angles)
-            end = plane_idx + self.num_planes_per_axis[2]
-            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
-            plane_idx = end
+        # Apply rotation: (a + bi)(cos + i·sin) = (a·cos - b·sin) + i(a·sin + b·cos)
+        out_real = x_real * cos_a - x_imag * sin_a
+        out_imag = x_real * sin_a + x_imag * cos_a
 
-        # Rotate planes for t-axis
-        if self.num_planes_per_axis[3] > 0:
-            angles = t_c.unsqueeze(-1) * self.freqs_t
-            angles = angles.unsqueeze(1)
-            rot = torch.polar(torch.ones_like(angles), angles)
-            end = plane_idx + self.num_planes_per_axis[3]
-            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
+        # Interleave back to (B, H, S, D)
+        x_out = torch.stack([out_real, out_imag], dim=-1).reshape(B, H, S, D)
 
-        # Convert back to real representation
-        x_real = torch.view_as_real(x_complex).reshape(B, H, S, D)
-        return x_real.to(original_dtype)
+        return x_out.to(original_dtype)
 
 
 class RoPE4DVarlen(nn.Module):
@@ -147,6 +138,9 @@ class RoPE4DVarlen(nn.Module):
 
     Same frequency schedule as RoPE4D, but operates on packed tensors
     where coords are [total_tokens, 4] instead of [B, S, 4].
+
+    Uses optimized real-arithmetic rotation instead of complex numbers for
+    better performance and to avoid input tensor mutation.
 
     Requirements:
         - dim >= 8 (need at least one 2x2 plane per axis)
@@ -179,11 +173,17 @@ class RoPE4DVarlen(nn.Module):
 
         self.num_planes_per_axis = base_allocation
 
-        # Build log-spaced frequencies for each axis
-        self.register_buffer("freqs_x", self._build_freqs(self.num_planes_per_axis[0], scales[0]))
-        self.register_buffer("freqs_y", self._build_freqs(self.num_planes_per_axis[1], scales[1]))
-        self.register_buffer("freqs_z", self._build_freqs(self.num_planes_per_axis[2], scales[2]))
-        self.register_buffer("freqs_t", self._build_freqs(self.num_planes_per_axis[3], scales[3]))
+        # Build concatenated frequency vector for vectorized computation
+        all_freqs = []
+        for n_planes, scale in zip(base_allocation, scales):
+            all_freqs.append(self._build_freqs(n_planes, scale))
+        self.register_buffer("freqs", torch.cat(all_freqs))  # (D/2,)
+
+        # Build coordinate selection indices: coord_select[plane] = axis_index
+        coord_select = []
+        for axis_idx, n_planes in enumerate(base_allocation):
+            coord_select.extend([axis_idx] * n_planes)
+        self.register_buffer("coord_select", torch.tensor(coord_select, dtype=torch.long))
 
     def _build_freqs(self, num_bands, scale):
         """Build log-spaced frequency bands: omega_min * rho^(l/(L-1))."""
@@ -200,6 +200,9 @@ class RoPE4DVarlen(nn.Module):
         """
         Apply 4D rotations to Q or K in packed format.
 
+        Uses real-arithmetic rotation: (a + bi)(cos θ + i sin θ)
+        = (a cos θ - b sin θ) + i(a sin θ + b cos θ)
+
         Args:
             x: (total_tokens, num_heads, head_dim) - varlen format for Q/K
             coords: (total_tokens, 4) - packed coordinates (x, y, z, t)
@@ -209,54 +212,33 @@ class RoPE4DVarlen(nn.Module):
         N, H, D = x.shape
         original_dtype = x.dtype
 
-        # Reshape to planes: (N, H, M, 2) where M = D/2
-        x_planes = x.float().reshape(N, H, D // 2, 2)
-        x_complex = torch.view_as_complex(x_planes.contiguous())  # (N, H, M)
+        # Work in float32 for numerical stability
+        x_f = x.float()
+        coords_f = coords.float()
 
-        # Extract coordinates
-        coords = coords.float()
-        x_c, y_c, z_c, t_c = coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]
+        # Reshape to pairs: (N, H, D/2, 2) where [..., 0] is real, [..., 1] is imag
+        x_pairs = x_f.reshape(N, H, D // 2, 2)
+        x_real = x_pairs[..., 0]  # (N, H, D/2)
+        x_imag = x_pairs[..., 1]  # (N, H, D/2)
 
-        plane_idx = 0
+        # Gather coordinate for each plane using precomputed indices: (N, D/2)
+        coord_per_plane = coords_f.index_select(dim=-1, index=self.coord_select)
 
-        # Rotate planes for x-axis
-        if self.num_planes_per_axis[0] > 0:
-            angles = x_c.unsqueeze(-1) * self.freqs_x  # (N, L_x)
-            angles = angles.unsqueeze(1)  # (N, 1, L_x) broadcast over heads
-            rot = torch.polar(torch.ones_like(angles), angles)
-            end = plane_idx + self.num_planes_per_axis[0]
-            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
-            plane_idx = end
+        # Compute angles and expand for heads: (N, 1, D/2)
+        angles = (coord_per_plane * self.freqs).unsqueeze(1)
 
-        # Rotate planes for y-axis
-        if self.num_planes_per_axis[1] > 0:
-            angles = y_c.unsqueeze(-1) * self.freqs_y
-            angles = angles.unsqueeze(1)
-            rot = torch.polar(torch.ones_like(angles), angles)
-            end = plane_idx + self.num_planes_per_axis[1]
-            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
-            plane_idx = end
+        # Compute rotation coefficients
+        cos_a = torch.cos(angles)
+        sin_a = torch.sin(angles)
 
-        # Rotate planes for z-axis
-        if self.num_planes_per_axis[2] > 0:
-            angles = z_c.unsqueeze(-1) * self.freqs_z
-            angles = angles.unsqueeze(1)
-            rot = torch.polar(torch.ones_like(angles), angles)
-            end = plane_idx + self.num_planes_per_axis[2]
-            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
-            plane_idx = end
+        # Apply rotation: (a + bi)(cos + i·sin) = (a·cos - b·sin) + i(a·sin + b·cos)
+        out_real = x_real * cos_a - x_imag * sin_a
+        out_imag = x_real * sin_a + x_imag * cos_a
 
-        # Rotate planes for t-axis
-        if self.num_planes_per_axis[3] > 0:
-            angles = t_c.unsqueeze(-1) * self.freqs_t
-            angles = angles.unsqueeze(1)
-            rot = torch.polar(torch.ones_like(angles), angles)
-            end = plane_idx + self.num_planes_per_axis[3]
-            x_complex[..., plane_idx:end] = x_complex[..., plane_idx:end] * rot
+        # Interleave back to (N, H, D)
+        x_out = torch.stack([out_real, out_imag], dim=-1).reshape(N, H, D)
 
-        # Convert back to real representation
-        x_real = torch.view_as_real(x_complex).reshape(N, H, D)
-        return x_real.to(original_dtype)
+        return x_out.to(original_dtype)
 
 
 class SwiGLU(nn.Module):

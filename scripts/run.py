@@ -26,6 +26,9 @@ from ml_common.losses import (
     angular_distance_loss,
     gaussian_nll_loss,
     von_mises_fisher_loss,
+    power_spherical_loss,
+    cosine_annealed_loss,
+    angular_huber_loss,
 )
 from ml_common.training import Trainer
 from neptune import NeptuneModel, NeptuneVarlenModel
@@ -171,6 +174,18 @@ def build_loss_function(model_opts: Dict[str, Any]):
             )
         if loss_name == "vmf":
             return lambda preds, labels: von_mises_fisher_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
+        if loss_name in ("power_spherical", "ps"):
+            return lambda preds, labels: power_spherical_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
+        if loss_name in ("cosine_annealed", "ca"):
+            return lambda preds, labels: cosine_annealed_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
+        if loss_name in ("angular_huber", "ah"):
+            return lambda preds, labels: angular_huber_loss(
                 preds, F.normalize(labels[:, 1:4], p=2, dim=1)
             )
         if loss_name == "combined_vmf_angular":
