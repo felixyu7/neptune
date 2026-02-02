@@ -133,7 +133,7 @@ class NeptuneModel(nn.Module):
         super().__init__()
         tokenizer_cfg: Dict[str, Any] = dict(tokenizer_kwargs or {})
         mlp_layers_cfg = tokenizer_cfg.pop("mlp_layers", [256, 512, 768])
-        
+
         tokenizer_dropout = tokenizer_cfg.pop("dropout", dropout)
 
         self.tokenizer = FPSTokenizer(
@@ -155,7 +155,9 @@ class NeptuneModel(nn.Module):
             drop_path_rate=drop_path_rate,
         )
         self.head = nn.Sequential(
-            nn.Linear(token_dim, token_dim), nn.GELU(), nn.Dropout(dropout),
+            nn.Linear(token_dim, token_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
             nn.Linear(token_dim, output_dim)
         )
 
@@ -316,7 +318,7 @@ class NeptuneVarlenModel(nn.Module):
             drop_path_rate=drop_path_rate,
         )
 
-        # Output head (same as original)
+        # Output head
         self.head = nn.Sequential(
             nn.Linear(token_dim, token_dim),
             nn.GELU(),

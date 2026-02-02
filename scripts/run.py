@@ -25,6 +25,8 @@ from ml_common.losses import (
     angular_distance_loss,
     gaussian_nll_loss,
     von_mises_fisher_loss,
+    iag_nll_loss,
+    esag_nll_loss,
 )
 from ml_common.training import Trainer
 from neptune import NeptuneModel, NeptuneVarlenModel
@@ -87,7 +89,8 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     loss_name = model_opts["loss_fn"]
 
     if task == "angular_reco":
-        output_dim = 4
+        # IAG: 3 (μ only), vMF: 4 (dir + κ), ESAG: 5 (μ + γ)
+        output_dim = {"iag": 3, "vmf": 4, "angular_distance": 4, "esag": 5}.get(loss_name, 4)
     elif task == "energy_reco":
         output_dim = 2 if loss_name == "gaussian_nll" else 1
     elif task == "starting_classification":
@@ -164,13 +167,20 @@ def build_loss_function(model_opts: Dict[str, Any]):
     loss_kwargs = model_opts.get("loss_kwargs", {})
 
     if task == "angular_reco":
-        # All angular_reco models output [B,4]: direction[:3] + kappa[3]
         if loss_name == "angular_distance":
             return lambda preds, labels: angular_distance_loss(
                 preds[:, :3], F.normalize(labels[:, 1:4], p=2, dim=1)
             )
         if loss_name == "vmf":
             return lambda preds, labels: von_mises_fisher_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
+        if loss_name == "iag":
+            return lambda preds, labels: iag_nll_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
+        if loss_name == "esag":
+            return lambda preds, labels: esag_nll_loss(
                 preds, F.normalize(labels[:, 1:4], p=2, dim=1)
             )
 
