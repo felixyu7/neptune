@@ -99,6 +99,8 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         output_dim = 6
     elif task == "track_cascade_classification":
         output_dim = 1
+    elif task == "neutrino_classification":
+        output_dim = 1
     else:
         raise ValueError(f"Unsupported downstream_task '{task}'")
 
@@ -229,6 +231,17 @@ def build_loss_function(model_opts: Dict[str, Any]):
 
         return loss_fn
 
+    if task == "neutrino_classification":
+        if loss_name != "bce":
+            raise ValueError("neutrino_classification supports only 'bce' loss")
+
+        def loss_fn(preds, labels):
+            logits = preds.view(-1)
+            targets = labels[..., -1].reshape(-1).float()
+            return F.binary_cross_entropy_with_logits(logits, targets)
+
+        return loss_fn
+
     raise ValueError(f"Unsupported task/loss combination: {task}/{loss_name}")
 
 
@@ -273,6 +286,16 @@ def build_metric_function(task: str):
         def metric_fn(preds, labels):
             logits = preds.view(-1)
             targets = (labels[:, 4] == 0).float()
+            probs = torch.sigmoid(logits)
+            preds_binary = (probs >= 0.5).float()
+            accuracy = (preds_binary == targets).float().mean().item()
+            return {"accuracy": accuracy}
+        return metric_fn
+
+    if task == "neutrino_classification":
+        def metric_fn(preds, labels):
+            logits = preds.view(-1)
+            targets = labels[..., -1].reshape(-1)
             probs = torch.sigmoid(logits)
             preds_binary = (probs >= 0.5).float()
             accuracy = (preds_binary == targets).float().mean().item()
