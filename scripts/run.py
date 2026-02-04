@@ -205,9 +205,16 @@ def build_loss_function(model_opts: Dict[str, Any]):
         if loss_name != "cross_entropy":
             raise ValueError("morphology_classification currently supports only the 'cross_entropy' loss")
 
+        # Class weights for imbalanced morphology classes (sqrt-scaled inverse frequency)
+        # 0: cascade, 1: starting track, 2: throughgoing track, 3: stopping track, 4: uncontained, 5: bundle
+        class_weights = loss_kwargs.get("class_weights")
+        if class_weights is not None:
+            class_weights = torch.tensor(class_weights, dtype=torch.float32)
+
         def loss_fn(preds, labels):
             targets = labels[:, 4].long()
-            return F.cross_entropy(preds, targets)
+            weight = class_weights.to(preds.device) if class_weights is not None else None
+            return F.cross_entropy(preds, targets, weight=weight)
 
         return loss_fn
 
