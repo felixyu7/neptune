@@ -27,6 +27,7 @@ from ml_common.losses import (
     von_mises_fisher_loss,
     iag_nll_loss,
     esag_nll_loss,
+    spherical_harmonic_loss,
 )
 from ml_common.training import Trainer
 from neptune import NeptuneModel, NeptuneVarlenModel
@@ -89,8 +90,12 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     loss_name = model_opts["loss_fn"]
 
     if task == "angular_reco":
-        # IAG: 3 (μ only), vMF: 4 (dir + κ), ESAG: 5 (μ + γ)
-        output_dim = {"iag": 3, "vmf": 4, "angular_distance": 4, "esag": 5}.get(loss_name, 4)
+        # IAG: 3 (μ only), vMF: 4 (dir + κ), ESAG: 5 (μ + γ), SH: (l_max+1)²
+        if loss_name == "sh":
+            l_max = model_opts.get("loss_kwargs", {}).get("l_max", 4)
+            output_dim = (l_max + 1) ** 2
+        else:
+            output_dim = {"iag": 3, "vmf": 4, "angular_distance": 4, "esag": 5}.get(loss_name, 4)
     elif task == "energy_reco":
         output_dim = 2 if loss_name == "gaussian_nll" else 1
     elif task == "starting_classification":
@@ -184,6 +189,13 @@ def build_loss_function(model_opts: Dict[str, Any]):
         if loss_name == "esag":
             return lambda preds, labels: esag_nll_loss(
                 preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
+        if loss_name == "sh":
+            sh_kwargs = {k: v for k, v in loss_kwargs.items() if k in
+                         ("l_max", "n_theta", "n_lambda", "grid_type")}
+            sh_kwargs.setdefault("l_max", 4)
+            return lambda preds, labels, _kw=sh_kwargs: spherical_harmonic_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1), **_kw
             )
 
     if task == "energy_reco":
