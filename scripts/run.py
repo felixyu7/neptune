@@ -21,13 +21,21 @@ if ML_COMMON_PACKAGE.exists():
         sys.path.append(submodule_path)
 
 from ml_common.dataloaders import create_dataloaders
+from directional_distributions import VMF, IAG, ESAG, GAG, SIPC, SESPC, GSPC, PowerSpherical, IPT, EPT, GPT
 from ml_common.losses import (
     angular_distance_loss,
     gaussian_nll_loss,
     von_mises_fisher_loss,
     iag_nll_loss,
     esag_nll_loss,
-    spherical_harmonic_loss,
+    gag_nll_loss,
+    sipc_nll_loss,
+    sespc_nll_loss,
+    gspc_nll_loss,
+    ps_nll_loss,
+    ipt_nll_loss,
+    ept_nll_loss,
+    gpt_nll_loss,
 )
 from ml_common.training import Trainer
 from neptune import NeptuneModel, NeptuneVarlenModel
@@ -90,12 +98,12 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     loss_name = model_opts["loss_fn"]
 
     if task == "angular_reco":
-        # IAG: 3 (μ only), vMF: 4 (dir + κ), ESAG: 5 (μ + γ), SH: (l_max+1)²
-        if loss_name == "sh":
-            l_max = model_opts.get("loss_kwargs", {}).get("l_max", 4)
-            output_dim = (l_max + 1) ** 2
-        else:
-            output_dim = {"iag": 3, "vmf": 4, "angular_distance": 4, "esag": 5}.get(loss_name, 4)
+        # IAG/vMF/SIPC: 3 (μ only), ESAG/SESPC: 5 (μ + shape), GAG/GSPC: 9
+        output_dim = {
+            "iag": 3, "vmf": 3, "sipc": 3, "ps": 3, "angular_distance": 4,
+            "esag": 5, "sespc": 5, "gag": 9, "gspc": 9,
+            "ipt": 3, "ept": 5, "gpt": 9,
+        }.get(loss_name, 4)
     elif task == "energy_reco":
         output_dim = 2 if loss_name == "gaussian_nll" else 1
     elif task == "starting_classification":
@@ -190,12 +198,37 @@ def build_loss_function(model_opts: Dict[str, Any]):
             return lambda preds, labels: esag_nll_loss(
                 preds, F.normalize(labels[:, 1:4], p=2, dim=1)
             )
-        if loss_name == "sh":
-            sh_kwargs = {k: v for k, v in loss_kwargs.items() if k in
-                         ("l_max", "n_theta", "n_lambda", "grid_type")}
-            sh_kwargs.setdefault("l_max", 4)
-            return lambda preds, labels, _kw=sh_kwargs: spherical_harmonic_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1), **_kw
+        if loss_name == "gag":
+            return lambda preds, labels: gag_nll_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
+        if loss_name == "sipc":
+            return lambda preds, labels: sipc_nll_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
+        if loss_name == "sespc":
+            return lambda preds, labels: sespc_nll_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
+        if loss_name == "gspc":
+            return lambda preds, labels: gspc_nll_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
+        if loss_name == "ps":
+            return lambda preds, labels: ps_nll_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
+        if loss_name == "ipt":
+            return lambda preds, labels: ipt_nll_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
+        if loss_name == "ept":
+            return lambda preds, labels: ept_nll_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
+        if loss_name == "gpt":
+            return lambda preds, labels: gpt_nll_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
             )
 
     if task == "energy_reco":
@@ -257,12 +290,44 @@ def build_loss_function(model_opts: Dict[str, Any]):
     raise ValueError(f"Unsupported task/loss combination: {task}/{loss_name}")
 
 
-def build_metric_function(task: str):
+def _mean_direction(preds, loss_name, loss_kwargs):
+    """Extract the mean direction from raw model predictions using the distribution classes."""
+    if loss_name == "vmf":
+        return VMF(preds).mean_direction
+    if loss_name == "iag":
+        return IAG(preds).mean_direction
+    if loss_name == "esag":
+        return ESAG(preds).mean_direction
+    if loss_name == "gag":
+        return GAG(preds).mean_direction
+    if loss_name == "sipc":
+        return SIPC(preds).mean_direction
+    if loss_name == "sespc":
+        return SESPC(preds).mean_direction
+    if loss_name == "gspc":
+        return GSPC(preds).mean_direction
+    if loss_name == "ps":
+        return PowerSpherical(preds).mean_direction
+    if loss_name == "ipt":
+        return IPT(preds).mean_direction
+    if loss_name == "ept":
+        return EPT(preds).mean_direction
+    if loss_name == "gpt":
+        return GPT(preds).mean_direction
+    # angular_distance or unknown: fall back to normalizing first 3 dims
+    return F.normalize(preds[:, :3], p=2, dim=1)
+
+
+def build_metric_function(model_opts: Dict[str, Any]):
+    task = model_opts["downstream_task"]
+    loss_name = model_opts["loss_fn"]
+    loss_kwargs = model_opts.get("loss_kwargs", {})
+
     if task == "angular_reco":
         def metric_fn(preds, labels):
             target_dirs = F.normalize(labels[:, 1:4], p=2, dim=1)
-            preds_norm = F.normalize(preds[:, :3], p=2, dim=1)
-            errors = angular_distance_loss(preds_norm, target_dirs, reduction="none")
+            pred_dirs = _mean_direction(preds, loss_name, loss_kwargs)
+            errors = angular_distance_loss(pred_dirs, target_dirs, reduction="none")
             errors_rad = errors * torch.pi
             return {
                 "mean_angular_error_deg": torch.rad2deg(errors_rad.mean()).item(),
@@ -348,7 +413,7 @@ def main() -> None:
 
     model = build_model(model_opts, device)
     loss_fn = build_loss_function(model_opts)
-    metric_fn = build_metric_function(model_opts["downstream_task"])
+    metric_fn = build_metric_function(model_opts)
 
     use_wandb = False if args.no_wandb else setup_wandb(cfg)
 
