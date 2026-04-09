@@ -158,6 +158,7 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         # Default: standard Neptune model
         k_neighbors = model_opts.get("k_neighbors", 8)
         tokenizer_kwargs = model_opts.get("tokenizer_kwargs")
+        pool_type = model_opts.get("pool_type", "mean")
 
         model = NeptuneModel(
             in_channels=model_opts["in_channels"],
@@ -171,6 +172,7 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
             output_dim=output_dim,
             k_neighbors=k_neighbors,
             tokenizer_kwargs=tokenizer_kwargs,
+            pool_type=pool_type,
         )
 
     return model.to(device)
@@ -277,15 +279,29 @@ def build_loss_function(model_opts: Dict[str, Any]):
         return loss_fn
 
     if task == "neutrino_classification":
-        if loss_name != "bce":
-            raise ValueError("neutrino_classification supports only 'bce' loss")
+        if loss_name == "bce":
+            def loss_fn(preds, labels):
+                logits = preds.view(-1)
+                targets = labels[..., -1].reshape(-1).float()
+                return F.binary_cross_entropy_with_logits(logits, targets)
+            return loss_fn
 
-        def loss_fn(preds, labels):
-            logits = preds.view(-1)
-            targets = labels[..., -1].reshape(-1).float()
-            return F.binary_cross_entropy_with_logits(logits, targets)
+        if loss_name == "focal":
+            gamma = loss_kwargs.get("gamma", 2.0)
+            alpha = loss_kwargs.get("alpha", 0.25)
 
-        return loss_fn
+            def loss_fn(preds, labels):
+                logits = preds.view(-1)
+                targets = labels[..., -1].reshape(-1).float()
+                bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+                p_t = torch.exp(-bce)
+                # alpha weighting: alpha for positives (signal), 1-alpha for negatives
+                alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+                focal_weight = alpha_t * (1 - p_t) ** gamma
+                return (focal_weight * bce).mean()
+            return loss_fn
+
+        raise ValueError(f"neutrino_classification supports 'bce' or 'focal' loss, got '{loss_name}'")
 
     raise ValueError(f"Unsupported task/loss combination: {task}/{loss_name}")
 
@@ -374,9 +390,36 @@ def build_metric_function(model_opts: Dict[str, Any]):
             logits = preds.view(-1)
             targets = labels[..., -1].reshape(-1)
             probs = torch.sigmoid(logits)
-            preds_binary = (probs >= 0.5).float()
-            accuracy = (preds_binary == targets).float().mean().item()
-            return {"accuracy": accuracy}
+
+            is_signal = targets == 1.0
+            is_bg = targets == 0.0
+            n_signal = is_signal.sum().item()
+            n_bg = is_bg.sum().item()
+
+            metrics = {}
+
+            # AUC-ROC (sort-based, no sklearn dependency)
+            if n_signal > 0 and n_bg > 0:
+                # Count concordant pairs via ranking
+                sorted_idx = torch.argsort(probs, descending=True)
+                sorted_targets = targets[sorted_idx]
+                # Accumulate: for each signal event, count how many bg events are ranked below it
+                bg_cumsum = (1 - sorted_targets).cumsum(0)
+                auc = (sorted_targets * bg_cumsum).sum().item() / (n_signal * n_bg)
+                metrics["auc_roc"] = auc
+
+            # Signal efficiency at fixed background rejection rates
+            if n_signal > 0 and n_bg > 0:
+                signal_probs = probs[is_signal].float()
+                bg_probs = probs[is_bg].float()
+                for bg_rej in [0.90, 0.99, 0.999]:
+                    # Threshold = quantile of bg distribution at (1 - bg_rej) from the top
+                    threshold = torch.quantile(bg_probs, bg_rej).item()
+                    sig_eff = (signal_probs > threshold).float().mean().item()
+                    label = f"sig_eff_at_{bg_rej:.3f}_bg_rej".replace(".", "")
+                    metrics[label] = sig_eff
+
+            return metrics
         return metric_fn
 
     return None

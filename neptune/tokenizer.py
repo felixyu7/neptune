@@ -20,11 +20,13 @@ class FPSTokenizer(nn.Module):
                  token_dim: int = 768,
                  mlp_layers: List[int] = [256, 512, 768],
                  k_neighbors: int = 16,
-                 dropout: float = 0.0):
+                 dropout: float = 0.0,
+                 knn_pool: str = "max"):
         super().__init__()
         self.max_tokens = max_tokens
         self.token_dim = token_dim
         self.k_neighbors = k_neighbors
+        self.knn_pool = knn_pool
 
         # MLP 1: Per-point feature extraction
         mlp1 = []
@@ -36,8 +38,10 @@ class FPSTokenizer(nn.Module):
         self.mlp1 = nn.Sequential(*mlp1)
 
         # MLP 2: Token refinement (always applied)
+        # Input dim doubles when using max+mean pooling
+        mlp2_in = 2 * token_dim if knn_pool == "max_mean" else token_dim
         self.mlp2 = nn.Sequential(
-            nn.Linear(token_dim, token_dim),
+            nn.Linear(mlp2_in, token_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(token_dim, token_dim)
@@ -164,12 +168,19 @@ class FPSTokenizer(nn.Module):
         cents = P.gather(dim=1, index=gather_idx_4)  # [B, max_tokens, 4]
 
         # Get features for each centroid
-        token_feats = torch.zeros(B, self.max_tokens, self.token_dim, device=device, dtype=Fp.dtype)
+        use_max_mean = self.knn_pool == "max_mean"
+        feat_dim = 2 * self.token_dim if use_max_mean else self.token_dim
+        token_feats = torch.zeros(B, self.max_tokens, feat_dim, device=device, dtype=Fp.dtype)
 
         # Small batches: direct gather (no pooling needed - transformer will mix)
         if small_batch.any():
             gather_idx_T = cent_idx[small_batch].unsqueeze(-1).expand(-1, -1, self.token_dim)
-            token_feats[small_batch] = Fp[small_batch].gather(dim=1, index=gather_idx_T)
+            gathered = Fp[small_batch].gather(dim=1, index=gather_idx_T)
+            if use_max_mean:
+                # Single point: max = mean = the point itself
+                token_feats[small_batch] = torch.cat([gathered, gathered], dim=-1)
+            else:
+                token_feats[small_batch] = gathered
 
         # Large batches: kNN pooling using neighbor indices from fused kernel
         if large_batch.any():
@@ -195,10 +206,16 @@ class FPSTokenizer(nn.Module):
                 # Max-pool across neighbors
                 neg_inf = torch.tensor(float('-inf'), device=device, dtype=neigh_feats.dtype)
                 masked_neigh = neigh_feats.masked_fill(~knn_valid.unsqueeze(-1), neg_inf)
-                pooled = masked_neigh.max(dim=2).values  # [B_large, K, T]
-                pooled = torch.where(torch.isfinite(pooled), pooled, torch.zeros_like(pooled))
+                max_pooled = masked_neigh.max(dim=2).values  # [B_large, K, T]
+                max_pooled = torch.where(torch.isfinite(max_pooled), max_pooled, torch.zeros_like(max_pooled))
 
-                token_feats[large_batch] = pooled
+                if use_max_mean:
+                    # Mean-pool across valid neighbors
+                    valid_f = knn_valid.unsqueeze(-1).to(dtype=neigh_feats.dtype, device=device)
+                    mean_pooled = (neigh_feats * valid_f).sum(dim=2) / valid_f.sum(dim=2).clamp(min=1)
+                    token_feats[large_batch] = torch.cat([max_pooled, mean_pooled.to(max_pooled.dtype)], dim=-1)
+                else:
+                    token_feats[large_batch] = max_pooled
 
         # MLP 2: Always apply token refinement (consistent depth)
         token_feats = self.mlp2(token_feats)  # [B, max_tokens, token_dim]

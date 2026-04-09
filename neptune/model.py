@@ -60,6 +60,35 @@ def packed_global_pool(x: Tensor, batch_ids: Tensor, num_batches: int) -> Tensor
     return summed / counts.unsqueeze(-1)
 
 
+class AttentionPool(nn.Module):
+    """Cross-attention pooling with a learned query."""
+
+    def __init__(self, dim: int):
+        super().__init__()
+        self.q = nn.Parameter(torch.randn(1, 1, dim) * (dim ** -0.5))
+        self.kv = nn.Linear(dim, 2 * dim, bias=False)
+        self.proj = nn.Linear(dim, dim)
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        """
+        Args:
+            x: [B, S, D] encoder output
+            mask: [B, S] bool (True = valid token)
+        Returns:
+            [B, D] global feature vector
+        """
+        B, S, D = x.shape
+        q = self.q.expand(B, -1, -1)                          # [B, 1, D]
+        k, v = self.kv(x).chunk(2, dim=-1)                    # each [B, S, D]
+
+        attn = torch.bmm(q, k.transpose(1, 2)) * (D ** -0.5) # [B, 1, S]
+        if mask is not None:
+            attn = attn.masked_fill(~mask.unsqueeze(1), float('-inf'))
+        attn = F.softmax(attn, dim=-1)
+        out = torch.bmm(attn, v).squeeze(1)                   # [B, D]
+        return self.proj(out)
+
+
 class PointTransformerEncoder(nn.Module):
     """Encoder wrapper with centroid-aware inputs."""
     def __init__(
@@ -70,9 +99,11 @@ class PointTransformerEncoder(nn.Module):
         hidden_dim=2048,
         dropout=0.1,
         drop_path_rate=0.0,
+        pool_type="mean",
     ):
         super().__init__()
         self.token_dim = token_dim
+        self.pool_type = pool_type
 
         enc_layer = NeptuneTransformerEncoderLayer(
             d_model=token_dim,
@@ -97,6 +128,9 @@ class PointTransformerEncoder(nn.Module):
         )
         self.norm = RMSNorm(token_dim)
 
+        if pool_type == "attention":
+            self.pool = AttentionPool(token_dim)
+
     def forward(self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor] = None) -> Tensor:
         # Run encoder with centroid-aware inputs
         attn_pad = (~masks) if masks is not None else None
@@ -105,6 +139,11 @@ class PointTransformerEncoder(nn.Module):
             centroid_emb = centroid_emb * masks.to(dtype=centroid_emb.dtype).unsqueeze(-1)
         x = self.layers(tokens + centroid_emb, centroids, src_key_padding_mask=attn_pad)
         x = self.norm(x)
+
+        if self.pool_type == "attention":
+            return self.pool(x, masks)
+
+        # Mean pooling (default)
         if masks is None:
             return x.mean(dim=1)
         weights = masks.to(dtype=x.dtype).unsqueeze(-1)
@@ -129,6 +168,7 @@ class NeptuneModel(nn.Module):
         output_dim: int = 3,
         k_neighbors: int = 8,   # only for fps
         tokenizer_kwargs: Optional[Dict[str, Any]] = None,
+        pool_type: str = "mean",
     ):
         super().__init__()
         tokenizer_cfg: Dict[str, Any] = dict(tokenizer_kwargs or {})
@@ -153,6 +193,7 @@ class NeptuneModel(nn.Module):
             hidden_dim=hidden_dim,
             dropout=dropout,
             drop_path_rate=drop_path_rate,
+            pool_type=pool_type,
         )
         self.head = nn.Sequential(
             nn.Linear(token_dim, token_dim),
