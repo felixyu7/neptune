@@ -18,7 +18,7 @@ Example usage:
     >>> output = model(coords, features, batch_ids)
 """
 
-from .model import NeptuneModel
+from .model import NeptuneModel, NeptuneMoEModel
 
 __version__ = "0.1.0"
-__all__ = ["NeptuneModel"]
+__all__ = ["NeptuneModel", "NeptuneMoEModel"]
