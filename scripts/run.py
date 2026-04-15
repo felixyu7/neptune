@@ -38,7 +38,7 @@ from ml_common.losses import (
     gpt_nll_loss,
 )
 from ml_common.training import Trainer
-from neptune import NeptuneModel, NeptuneMoEModel
+from neptune import NeptuneModel
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,88 +93,31 @@ def setup_wandb(cfg: Dict[str, Any]) -> bool:
     return True
 
 
-def _get_output_dim(task: str, loss_name: str) -> int:
-    """Determine output dimension from task and loss function."""
+def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Module:
+    task = model_opts["downstream_task"]
+    loss_name = model_opts["loss_fn"]
+
     if task == "angular_reco":
-        return {
+        # IAG/vMF/SIPC: 3 (μ only), ESAG/SESPC: 5 (μ + shape), GAG/GSPC: 9
+        output_dim = {
             "iag": 3, "vmf": 3, "sipc": 3, "ps": 3, "angular_distance": 4,
             "esag": 5, "sespc": 5, "gag": 9, "gspc": 9,
             "ipt": 3, "ept": 5, "gpt": 9,
         }.get(loss_name, 4)
-    if task == "energy_reco":
-        return 2 if loss_name == "gaussian_nll" else 1
-    if task == "starting_classification":
-        return 1
-    if task == "morphology_classification":
-        return 6
-    if task == "track_cascade_classification":
-        return 1
-    if task == "neutrino_classification":
-        return 1
-    raise ValueError(f"Unsupported downstream_task '{task}'")
+    elif task == "energy_reco":
+        output_dim = 2 if loss_name == "gaussian_nll" else 1
+    elif task == "starting_classification":
+        output_dim = 1
+    elif task == "morphology_classification":
+        output_dim = 6
+    elif task == "track_cascade_classification":
+        output_dim = 1
+    elif task == "neutrino_classification":
+        output_dim = 1
+    else:
+        raise ValueError(f"Unsupported downstream_task '{task}'")
 
-
-def _build_neptune_model(model_opts: Dict[str, Any], output_dim: int) -> NeptuneModel:
-    """Build a single NeptuneModel from config (without moving to device)."""
-    return NeptuneModel(
-        in_channels=model_opts["in_channels"],
-        num_patches=model_opts.get("num_patches", 128),
-        token_dim=model_opts["token_dim"],
-        num_layers=model_opts["num_layers"],
-        num_heads=model_opts["num_heads"],
-        hidden_dim=model_opts["hidden_dim"],
-        dropout=model_opts.get("dropout", 0.1),
-        drop_path_rate=model_opts.get("drop_path_rate", 0.0),
-        output_dim=output_dim,
-        k_neighbors=model_opts.get("k_neighbors", 8),
-        tokenizer_kwargs=model_opts.get("tokenizer_kwargs"),
-        pool_type=model_opts.get("pool_type", "mean"),
-    )
-
-
-def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Module:
-    task = model_opts["downstream_task"]
-    loss_name = model_opts["loss_fn"]
-    model_type = model_opts.get("model_type", "neptune").lower()
-
-    if model_type == "neptune_moe":
-        expert_cfgs = model_opts.get("expert_configs", {})
-        shared = {
-            "in_channels": model_opts["in_channels"],
-            "token_dim": model_opts["token_dim"],
-            "num_layers": model_opts["num_layers"],
-            "num_heads": model_opts["num_heads"],
-            "hidden_dim": model_opts["hidden_dim"],
-            "dropout": model_opts.get("dropout", 0.1),
-            "drop_path_rate": model_opts.get("drop_path_rate", 0.0),
-            "k_neighbors": model_opts.get("k_neighbors", 8),
-            "pool_type": model_opts.get("pool_type", "mean"),
-            "tokenizer_kwargs": model_opts.get("tokenizer_kwargs"),
-            "num_patches": model_opts.get("num_patches", 64),
-        }
-        dir_loss = model_opts.get("loss_kwargs", {}).get("dir_loss", "iag")
-        dir_dim = _get_output_dim("angular_reco", dir_loss)
-
-        def _expert(overrides, output_dim):
-            return _build_neptune_model({**shared, **overrides}, output_dim)
-
-        model = NeptuneMoEModel(
-            router=_expert(expert_cfgs.get("router", {}), 6),
-            energy_experts={
-                "contained": _expert(expert_cfgs.get("energy_contained", {}), 2),
-                "uncontained": _expert(expert_cfgs.get("energy_uncontained", {}), 2),
-            },
-            direction_experts={
-                "cascade": _expert(expert_cfgs.get("dir_cascade", {}), dir_dim),
-                "low_track": _expert(expert_cfgs.get("dir_low_track", {}), dir_dim),
-                "high_track": _expert(expert_cfgs.get("dir_high_track", {}), dir_dim),
-            },
-            energy_gate_threshold=model_opts.get("energy_gate_threshold", 10000.0),
-            noise_threshold=model_opts.get("noise_threshold", 0.8),
-        )
-        return model.to(device)
-
-    output_dim = _get_output_dim(task, loss_name)
+    drop_path_rate = model_opts.get("drop_path_rate", 0.0)
 
     token_dim = model_opts["token_dim"]
     num_heads = model_opts["num_heads"]
@@ -184,7 +127,25 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
             "and produce a head_dim divisible by 8 for 4D RoPE."
         )
 
-    model = _build_neptune_model(model_opts, output_dim)
+    k_neighbors = model_opts.get("k_neighbors", 8)
+    tokenizer_kwargs = model_opts.get("tokenizer_kwargs")
+    pool_type = model_opts.get("pool_type", "mean")
+
+    model = NeptuneModel(
+        in_channels=model_opts["in_channels"],
+        num_patches=model_opts["num_patches"],
+        token_dim=token_dim,
+        num_layers=model_opts["num_layers"],
+        num_heads=num_heads,
+        hidden_dim=model_opts["hidden_dim"],
+        dropout=model_opts["dropout"],
+        drop_path_rate=drop_path_rate,
+        output_dim=output_dim,
+        k_neighbors=k_neighbors,
+        tokenizer_kwargs=tokenizer_kwargs,
+        pool_type=pool_type,
+    )
+
     return model.to(device)
 
 
@@ -313,59 +274,6 @@ def build_loss_function(model_opts: Dict[str, Any]):
 
         raise ValueError(f"neutrino_classification supports 'bce' or 'focal' loss, got '{loss_name}'")
 
-    if task == "moe_reconstruction":
-        dir_loss_name = loss_kwargs.get("dir_loss", "iag")
-        dir_loss_map = {
-            "vmf": von_mises_fisher_loss, "iag": iag_nll_loss, "esag": esag_nll_loss,
-            "gag": gag_nll_loss, "sipc": sipc_nll_loss, "sespc": sespc_nll_loss,
-            "gspc": gspc_nll_loss, "ps": ps_nll_loss,
-            "ipt": ipt_nll_loss, "ept": ept_nll_loss, "gpt": gpt_nll_loss,
-        }
-        if dir_loss_name not in dir_loss_map:
-            raise ValueError(f"Unknown dir_loss '{dir_loss_name}'")
-
-        class MoELoss:
-            def __init__(self):
-                self._dir_loss_fn = dir_loss_map[dir_loss_name]
-                self.w_morph = loss_kwargs.get("w_morph", 1.0)
-                self.w_energy = loss_kwargs.get("w_energy", 1.0)
-                self.w_dir = loss_kwargs.get("w_dir", 1.0)
-                cw = loss_kwargs.get("class_weights")
-                self._cw = torch.tensor(cw, dtype=torch.float32) if cw else None
-                self.dir_dim = _get_output_dim("angular_reco", dir_loss_name)
-                self._components = {}
-
-            def __call__(self, preds, labels):
-                morph_logits = preds[:, :6]
-                energy_pred = preds[:, 6:8]
-                dir_pred = preds[:, 8:8+self.dir_dim]
-
-                cw = self._cw.to(preds.device) if self._cw is not None else None
-                morph_loss = F.cross_entropy(morph_logits, labels[:, 4].long(), weight=cw)
-
-                # Exclude noise events (uncontained=4) AND NaN preds (hard routing)
-                valid = (labels[:, 4].long() != 4) & ~torch.isnan(energy_pred[:, 0])
-                if valid.any():
-                    energy_loss = gaussian_nll_loss(
-                        energy_pred[valid, 0], energy_pred[valid, 1], labels[valid, 0])
-                    dir_loss = self._dir_loss_fn(
-                        dir_pred[valid], F.normalize(labels[valid, 1:4], p=2, dim=1))
-                else:
-                    energy_loss = torch.tensor(0.0, device=preds.device)
-                    dir_loss = torch.tensor(0.0, device=preds.device)
-
-                self._components = {
-                    'morph_loss': morph_loss.item(),
-                    'energy_loss': energy_loss.item(),
-                    'dir_loss': dir_loss.item(),
-                }
-                return self.w_morph * morph_loss + self.w_energy * energy_loss + self.w_dir * dir_loss
-
-            def current_weights(self):
-                return self._components, None
-
-        return MoELoss()
-
     raise ValueError(f"Unsupported task/loss combination: {task}/{loss_name}")
 
 
@@ -481,34 +389,6 @@ def build_metric_function(model_opts: Dict[str, Any]):
                     sig_eff = (signal_probs > threshold).float().mean().item()
                     label = f"sig_eff_at_{bg_rej:.3f}_bg_rej".replace(".", "")
                     metrics[label] = sig_eff
-
-            return metrics
-        return metric_fn
-
-    if task == "moe_reconstruction":
-        dir_loss_name = loss_kwargs.get("dir_loss", "iag")
-        dir_dim = _get_output_dim("angular_reco", dir_loss_name)
-
-        def metric_fn(preds, labels):
-            morph_logits = preds[:, :6]
-            energy_pred = preds[:, 6:8]
-            dir_pred = preds[:, 8:8+dir_dim]
-
-            morph_targets = labels[:, 4].long()
-            morph_acc = (morph_logits.argmax(dim=1) == morph_targets).float().mean().item()
-
-            metrics = {"morph_accuracy": morph_acc}
-
-            # Exclude noise labels and NaN predictions
-            valid = (morph_targets != 4) & ~torch.isnan(energy_pred[:, 0])
-            if valid.any():
-                metrics["mean_energy_error"] = torch.abs(
-                    energy_pred[valid, 0] - labels[valid, 0]).mean().item()
-                target_dirs = F.normalize(labels[valid, 1:4], p=2, dim=1)
-                pred_dirs = _mean_direction(dir_pred[valid], dir_loss_name, loss_kwargs)
-                errors_rad = angular_distance_loss(pred_dirs, target_dirs, reduction="none") * torch.pi
-                metrics["mean_angular_error_deg"] = torch.rad2deg(errors_rad.mean()).item()
-                metrics["median_angular_error_deg"] = torch.rad2deg(torch.median(errors_rad)).item()
 
             return metrics
         return metric_fn
