@@ -172,137 +172,17 @@ class NeptuneModel(nn.Module):
         return self.head(global_feat)
 
 
-class SharedBackbone(nn.Module):
-    """Shared point-cloud trunk: tokenizer + centroid embedding + N transformer layers.
-
-    Returns pre-pool token features for downstream expert heads. Coordinate
-    embedding is added once here; expert heads should not re-add it.
-    """
-
-    def __init__(
-        self,
-        in_channels: int = 6,
-        num_patches: int = 128,
-        token_dim: int = 256,
-        num_layers: int = 4,
-        num_heads: int = 4,
-        hidden_dim: int = 672,
-        dropout: float = 0.1,
-        drop_path_rate: float = 0.0,
-        k_neighbors: int = 8,
-        tokenizer_kwargs: Optional[Dict[str, Any]] = None,
-    ):
-        super().__init__()
-        tokenizer_cfg: Dict[str, Any] = dict(tokenizer_kwargs or {})
-        mlp_layers_cfg = tokenizer_cfg.pop("mlp_layers", [256, 512, 768])
-        tokenizer_dropout = tokenizer_cfg.pop("dropout", dropout)
-
-        self.tokenizer = FPSTokenizer(
-            feature_dim=in_channels,
-            max_tokens=num_patches,
-            token_dim=token_dim,
-            mlp_layers=mlp_layers_cfg,
-            k_neighbors=k_neighbors,
-            dropout=tokenizer_dropout,
-            **tokenizer_cfg,
-        )
-        self.centroid_mlp = nn.Sequential(
-            nn.Linear(4, token_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(token_dim // 2, token_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(token_dim, token_dim),
-        )
-        enc_layer = NeptuneTransformerEncoderLayer(
-            d_model=token_dim, nhead=num_heads, dim_feedforward=hidden_dim,
-            dropout=dropout, drop_path_rate=0.0,
-        )
-        self.layers = NeptuneTransformerEncoder(
-            enc_layer, num_layers=num_layers, drop_path_rate=drop_path_rate,
-        )
-
-    def forward(self, coords: Tensor, features: Tensor, batch_ids: Tensor):
-        spatial = coords[:, :3]
-        times = coords[:, 3].unsqueeze(-1)
-        tokens, centroids, masks = self.tokenizer(spatial, features, batch_ids, times)
-
-        attn_pad = (~masks) if masks is not None else None
-        centroid_emb = self.centroid_mlp(centroids.to(tokens.dtype))
-        if masks is not None:
-            centroid_emb = centroid_emb * masks.to(dtype=centroid_emb.dtype).unsqueeze(-1)
-        x = self.layers(tokens + centroid_emb, centroids, src_key_padding_mask=attn_pad)
-        return x, centroids, masks
-
-
-class ExpertHead(nn.Module):
-    """Specialized expert head: M transformer layers + RMSNorm + pool + output MLP.
-
-    Operates on pre-pool token features from a SharedBackbone. Does not re-add
-    coordinate embedding (already baked in by the backbone).
-    """
-
-    def __init__(
-        self,
-        token_dim: int,
-        num_layers: int,
-        num_heads: int,
-        hidden_dim: int,
-        output_dim: int,
-        dropout: float = 0.1,
-        drop_path_rate: float = 0.0,
-        pool_type: str = "mean",
-    ):
-        super().__init__()
-        self.pool_type = pool_type
-        enc_layer = NeptuneTransformerEncoderLayer(
-            d_model=token_dim, nhead=num_heads, dim_feedforward=hidden_dim,
-            dropout=dropout, drop_path_rate=0.0,
-        )
-        self.layers = NeptuneTransformerEncoder(
-            enc_layer, num_layers=num_layers, drop_path_rate=drop_path_rate,
-        )
-        self.norm = RMSNorm(token_dim)
-        if pool_type == "attention":
-            self.pool = AttentionPool(token_dim)
-        self.head = nn.Sequential(
-            nn.Linear(token_dim, token_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(token_dim, output_dim),
-        )
-
-    def forward(self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor]) -> Tensor:
-        attn_pad = (~masks) if masks is not None else None
-        x = self.layers(tokens, centroids, src_key_padding_mask=attn_pad)
-        x = self.norm(x)
-
-        if self.pool_type == "attention":
-            global_feat = self.pool(x, masks)
-        elif masks is None:
-            global_feat = x.mean(dim=1)
-        else:
-            weights = masks.to(dtype=x.dtype).unsqueeze(-1)
-            denom = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
-            global_feat = (x * weights).sum(dim=1) / denom.squeeze(1)
-
-        return self.head(global_feat)
-
-
 class NeptuneMoEModel(nn.Module):
     """
-    Physics-motivated mixture of experts with shared backbone + specialized heads.
+    Physics-motivated mixture of experts for IceCube event reconstruction.
 
-    All events pass through a shared backbone that extracts low-level features from
-    the full dataset. Specialized expert heads then do task-specific deeper processing.
+    Each expert is a full NeptuneModel with its own tokenizer, encoder, and head.
     Routing is supervised via morphology classification (ground-truth labels).
 
     Expert DAG:
-        Backbone (shared trunk, all events)
-        ├─ Morphology head (6-class router, supervised)
-        ├─ Energy: contained (cascade+starting) / uncontained (throughgoing+stopping+bundle)
-        └─ Direction: cascade / low-E track / high-E track
+        Router (morphology classifier, 6-class) → routing decisions
+        Energy: contained (cascade+starting) / uncontained (throughgoing+stopping+bundle)
+        Direction: cascade / low-E track / high-E track
         Noise events (uncontained=4) are excluded from energy/direction experts.
 
     Training: soft routing (all experts run, weighted by router probabilities).
@@ -311,6 +191,7 @@ class NeptuneMoEModel(nn.Module):
         Noise events (P(uncontained) > noise_threshold) get NaN energy/direction.
     """
 
+    # Morphology class groupings for routing
     CONTAINED_ENERGY = [0, 1]       # cascade, starting track
     UNCONTAINED_ENERGY = [2, 3, 5]  # throughgoing, stopping, bundle
     CASCADE_DIR = [0]               # cascade only
@@ -319,16 +200,14 @@ class NeptuneMoEModel(nn.Module):
 
     def __init__(
         self,
-        backbone: nn.Module,
-        morphology_head: nn.Module,
+        router: nn.Module,
         energy_experts: Dict[str, nn.Module],
         direction_experts: Dict[str, nn.Module],
         energy_gate_threshold: float = 10000.0,
         noise_threshold: float = 0.8,
     ):
         super().__init__()
-        self.backbone = backbone
-        self.morphology_head = morphology_head
+        self.router = router
         self.energy_experts = nn.ModuleDict(energy_experts)
         self.direction_experts = nn.ModuleDict(direction_experts)
         self.energy_gate_threshold = nn.Parameter(
@@ -342,98 +221,103 @@ class NeptuneMoEModel(nn.Module):
         self.hard_route = not mode
         return self
 
+    @staticmethod
+    def _subset_batch(
+        coords: Tensor, features: Tensor, batch_ids: Tensor, event_mask: Tensor
+    ) -> tuple:
+        """Extract points belonging to selected events, renumber batch_ids."""
+        point_mask = event_mask[batch_ids]
+        sub_coords = coords[point_mask]
+        sub_features = features[point_mask]
+        _, sub_batch_ids = torch.unique(batch_ids[point_mask], return_inverse=True)
+        return sub_coords, sub_features, sub_batch_ids
+
     def _soft_forward(
-        self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor]
+        self, coords: Tensor, features: Tensor, batch_ids: Tensor
     ) -> Tensor:
         """Soft routing: all experts process all events, outputs weighted by P(morph)."""
-        morph_logits = self.morphology_head(tokens, centroids, masks)
+        morph_logits = self.router(coords, features, batch_ids)
         morph_probs = F.softmax(morph_logits.float(), dim=-1).clamp(min=1e-6)
 
-        # Energy experts
+        # Energy experts — weighted by containment probability
         p_cont = morph_probs[:, self.CONTAINED_ENERGY].sum(-1, keepdim=True)
         p_uncont = morph_probs[:, self.UNCONTAINED_ENERGY].sum(-1, keepdim=True)
-        e_cont = self.energy_experts['contained'](tokens, centroids, masks)
-        e_uncont = self.energy_experts['uncontained'](tokens, centroids, masks)
+        e_cont = self.energy_experts['contained'](coords, features, batch_ids)
+        e_uncont = self.energy_experts['uncontained'](coords, features, batch_ids)
         energy_pred = p_cont * e_cont + p_uncont * e_uncont
 
-        # Direction experts (track sub-routing via predicted-energy gate)
+        # Direction experts — cascade vs track, track split by energy gate
         p_cas = morph_probs[:, self.CASCADE_DIR].sum(-1, keepdim=True)
         p_track = morph_probs[:, self.TRACK_DIR].sum(-1, keepdim=True)
         log_threshold = torch.log10(self.energy_gate_threshold)
         gate = torch.sigmoid(energy_pred[:, 0:1] - log_threshold)
 
-        d_cas = self.direction_experts['cascade'](tokens, centroids, masks)
-        d_low = self.direction_experts['low_track'](tokens, centroids, masks)
-        d_high = self.direction_experts['high_track'](tokens, centroids, masks)
+        d_cas = self.direction_experts['cascade'](coords, features, batch_ids)
+        d_low = self.direction_experts['low_track'](coords, features, batch_ids)
+        d_high = self.direction_experts['high_track'](coords, features, batch_ids)
         dir_pred = p_cas * d_cas + p_track * (1 - gate) * d_low + p_track * gate * d_high
 
         return torch.cat([morph_logits, energy_pred, dir_pred], dim=-1)
 
     def _hard_forward(
-        self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor]
+        self, coords: Tensor, features: Tensor, batch_ids: Tensor
     ) -> Tensor:
-        """Hard routing: only relevant expert path fires per event."""
-        B = tokens.size(0)
-        device = tokens.device
+        """Hard routing: only relevant expert path fires per event.
+        Noise events (P(uncontained) > noise_threshold) get NaN energy/direction."""
+        B = int(batch_ids.max().item()) + 1
+        device = coords.device
 
-        morph_logits = self.morphology_head(tokens, centroids, masks)
+        morph_logits = self.router(coords, features, batch_ids)
         morph_probs = F.softmax(morph_logits.float(), dim=-1)
         morph_class = morph_logits.argmax(dim=-1)
-        dtype = morph_logits.dtype  # match expert output dtype (may differ from tokens under autocast)
 
         e_dim = self.energy_experts['contained'].head[-1].out_features
         d_dim = self.direction_experts['cascade'].head[-1].out_features
+        dtype = morph_logits.dtype
+
         energy_pred = torch.full((B, e_dim), float('nan'), device=device, dtype=dtype)
         dir_pred = torch.full((B, d_dim), float('nan'), device=device, dtype=dtype)
 
+        # Skip noise events (P(uncontained) > threshold)
         noise = morph_probs[:, self.NOISE].sum(-1) > self.noise_threshold
 
-        def _run(expert, mask):
-            if mask.any():
-                return expert(tokens[mask], centroids[mask],
-                              masks[mask] if masks is not None else None)
-            return None
-
-        # Energy routing
+        # Energy routing (non-noise only)
         cont_mask = torch.isin(morph_class, torch.tensor(self.CONTAINED_ENERGY, device=device)) & ~noise
         uncont_mask = torch.isin(morph_class, torch.tensor(self.UNCONTAINED_ENERGY, device=device)) & ~noise
 
-        out = _run(self.energy_experts['contained'], cont_mask)
-        if out is not None:
-            energy_pred[cont_mask] = out
-        out = _run(self.energy_experts['uncontained'], uncont_mask)
-        if out is not None:
-            energy_pred[uncont_mask] = out
+        for mask, key in [(cont_mask, 'contained'), (uncont_mask, 'uncontained')]:
+            if mask.any():
+                sc, sf, sb = self._subset_batch(coords, features, batch_ids, mask)
+                energy_pred[mask] = self.energy_experts[key](sc, sf, sb)
 
-        # Direction routing
+        # Direction routing (non-noise only)
         cas_mask = torch.isin(morph_class, torch.tensor(self.CASCADE_DIR, device=device)) & ~noise
         track_mask = torch.isin(morph_class, torch.tensor(self.TRACK_DIR, device=device)) & ~noise
 
-        out = _run(self.direction_experts['cascade'], cas_mask)
-        if out is not None:
-            dir_pred[cas_mask] = out
+        if cas_mask.any():
+            sc, sf, sb = self._subset_batch(coords, features, batch_ids, cas_mask)
+            dir_pred[cas_mask] = self.direction_experts['cascade'](sc, sf, sb)
 
         if track_mask.any():
-            log_threshold = torch.log10(self.energy_gate_threshold)
-            track_idx = track_mask.nonzero(as_tuple=True)[0]
-            high_e = energy_pred[track_idx, 0] >= log_threshold
-            for sub, key in [(~high_e, 'low_track'), (high_e, 'high_track')]:
-                idx = track_idx[sub]
-                if idx.numel() > 0:
-                    sub_mask = torch.zeros(B, dtype=torch.bool, device=device)
-                    sub_mask[idx] = True
-                    dir_pred[idx] = self.direction_experts[key](
-                        tokens[sub_mask], centroids[sub_mask],
-                        masks[sub_mask] if masks is not None else None,
-                    )
+            track_energy = energy_pred[track_mask, 0]
+            low_e = track_energy < torch.log10(self.energy_gate_threshold)
+            high_e = ~low_e
+            track_indices = track_mask.nonzero(as_tuple=True)[0]
+
+            for sub_mask, key in [(low_e, 'low_track'), (high_e, 'high_track')]:
+                idx = track_indices[sub_mask]
+                if len(idx) > 0:
+                    event_mask = torch.zeros(B, dtype=torch.bool, device=device)
+                    event_mask[idx] = True
+                    sc, sf, sb = self._subset_batch(coords, features, batch_ids, event_mask)
+                    dir_pred[idx] = self.direction_experts[key](sc, sf, sb)
 
         return torch.cat([morph_logits, energy_pred, dir_pred], dim=-1)
 
     def forward(
         self, coords: Tensor, features: Tensor, batch_ids: Tensor
     ) -> Tensor:
-        tokens, centroids, masks = self.backbone(coords, features, batch_ids)
         if self.hard_route:
-            return self._hard_forward(tokens, centroids, masks)
-        return self._soft_forward(tokens, centroids, masks)
+            return self._hard_forward(coords, features, batch_ids)
+        return self._soft_forward(coords, features, batch_ids)
 

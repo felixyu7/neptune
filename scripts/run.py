@@ -39,7 +39,6 @@ from ml_common.losses import (
 )
 from ml_common.training import Trainer
 from neptune import NeptuneModel, NeptuneMoEModel
-from neptune.model import SharedBackbone, ExpertHead
 
 
 def parse_args() -> argparse.Namespace:
@@ -139,46 +138,36 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     model_type = model_opts.get("model_type", "neptune").lower()
 
     if model_type == "neptune_moe":
-        token_dim = model_opts["token_dim"]
-        num_heads = model_opts["num_heads"]
-        hidden_dim = model_opts["hidden_dim"]
-        dropout = model_opts.get("dropout", 0.1)
-        drop_path_rate = model_opts.get("drop_path_rate", 0.0)
-        pool_type = model_opts.get("pool_type", "mean")
-        backbone_layers = model_opts["num_layers"]
-        expert_layers = model_opts.get("expert_num_layers", backbone_layers)
-
-        backbone = SharedBackbone(
-            in_channels=model_opts["in_channels"],
-            num_patches=model_opts.get("num_patches", 128),
-            token_dim=token_dim,
-            num_layers=backbone_layers,
-            num_heads=num_heads,
-            hidden_dim=hidden_dim,
-            dropout=dropout,
-            drop_path_rate=drop_path_rate,
-            k_neighbors=model_opts.get("k_neighbors", 8),
-            tokenizer_kwargs=model_opts.get("tokenizer_kwargs"),
-        )
-
-        def _head(output_dim):
-            return ExpertHead(
-                token_dim=token_dim, num_layers=expert_layers, num_heads=num_heads,
-                hidden_dim=hidden_dim, output_dim=output_dim, dropout=dropout,
-                drop_path_rate=drop_path_rate, pool_type=pool_type,
-            )
-
+        expert_cfgs = model_opts.get("expert_configs", {})
+        shared = {
+            "in_channels": model_opts["in_channels"],
+            "token_dim": model_opts["token_dim"],
+            "num_layers": model_opts["num_layers"],
+            "num_heads": model_opts["num_heads"],
+            "hidden_dim": model_opts["hidden_dim"],
+            "dropout": model_opts.get("dropout", 0.1),
+            "drop_path_rate": model_opts.get("drop_path_rate", 0.0),
+            "k_neighbors": model_opts.get("k_neighbors", 8),
+            "pool_type": model_opts.get("pool_type", "mean"),
+            "tokenizer_kwargs": model_opts.get("tokenizer_kwargs"),
+            "num_patches": model_opts.get("num_patches", 64),
+        }
         dir_loss = model_opts.get("loss_kwargs", {}).get("dir_loss", "iag")
         dir_dim = _get_output_dim("angular_reco", dir_loss)
 
+        def _expert(overrides, output_dim):
+            return _build_neptune_model({**shared, **overrides}, output_dim)
+
         model = NeptuneMoEModel(
-            backbone=backbone,
-            morphology_head=_head(6),
-            energy_experts={"contained": _head(2), "uncontained": _head(2)},
+            router=_expert(expert_cfgs.get("router", {}), 6),
+            energy_experts={
+                "contained": _expert(expert_cfgs.get("energy_contained", {}), 2),
+                "uncontained": _expert(expert_cfgs.get("energy_uncontained", {}), 2),
+            },
             direction_experts={
-                "cascade": _head(dir_dim),
-                "low_track": _head(dir_dim),
-                "high_track": _head(dir_dim),
+                "cascade": _expert(expert_cfgs.get("dir_cascade", {}), dir_dim),
+                "low_track": _expert(expert_cfgs.get("dir_low_track", {}), dir_dim),
+                "high_track": _expert(expert_cfgs.get("dir_high_track", {}), dir_dim),
             },
             energy_gate_threshold=model_opts.get("energy_gate_threshold", 10000.0),
             noise_threshold=model_opts.get("noise_threshold", 0.8),
