@@ -87,7 +87,20 @@ class RoPE4D(nn.Module):
         freqs = (1.0 / self.base) * (self.base ** exponents)
         return freqs * scale
 
-    def forward(self, x, coords):
+    def compute_tables(self, coords):
+        """Precompute (cos, sin) rotation tables for a given centroid tensor.
+
+        Returns a pair of (B, 1, S, D/2) float32 tensors that can be passed to
+        `forward` to skip the per-call transcendental work. Every layer in
+        NeptuneTransformerEncoder sees the same centroids, so the encoder
+        computes these once and shares them across all layers.
+        """
+        coords_f = coords if coords.dtype == torch.float32 else coords.float()
+        coord_per_plane = coords_f.index_select(dim=-1, index=self.coord_select)
+        angles = (coord_per_plane * self.freqs).unsqueeze(1)  # (B, 1, S, D/2)
+        return torch.cos(angles), torch.sin(angles)
+
+    def forward(self, x, coords, tables=None):
         """
         Apply 4D rotations to Q or K based on spatial-temporal coordinates.
 
@@ -97,39 +110,29 @@ class RoPE4D(nn.Module):
         Args:
             x: (B, H, S, D) queries or keys
             coords: (B, S, 4) coordinates (x, y, z, t)
+            tables: optional precomputed (cos, sin) pair from compute_tables.
+                    Avoids recomputing the transcendentals for every layer/Q/K.
         Returns:
             Rotated tensor (B, H, S, D)
         """
         B, H, S, D = x.shape
         original_dtype = x.dtype
 
-        # Work in float32 for numerical stability
-        x_f = x.float()
-        coords_f = coords.float()
+        cos_a, sin_a = tables if tables is not None else self.compute_tables(coords)
 
-        # Reshape to pairs: (B, H, S, D/2, 2) where [..., 0] is real, [..., 1] is imag
+        x_f = x if x.dtype == torch.float32 else x.float()
         x_pairs = x_f.reshape(B, H, S, D // 2, 2)
         x_real = x_pairs[..., 0]  # (B, H, S, D/2)
         x_imag = x_pairs[..., 1]  # (B, H, S, D/2)
 
-        # Gather coordinate for each plane using precomputed indices: (B, S, D/2)
-        coord_per_plane = coords_f.index_select(dim=-1, index=self.coord_select)
+        # Write rotated pairs directly into a preallocated buffer — avoids the
+        # stack+reshape allocation in the hot path.
+        x_out = torch.empty_like(x_f)
+        out_pairs = x_out.view(B, H, S, D // 2, 2)
+        torch.sub(x_real * cos_a, x_imag * sin_a, out=out_pairs[..., 0])
+        torch.add(x_real * sin_a, x_imag * cos_a, out=out_pairs[..., 1])
 
-        # Compute angles and expand for heads: (B, 1, S, D/2)
-        angles = (coord_per_plane * self.freqs).unsqueeze(1)
-
-        # Compute rotation coefficients
-        cos_a = torch.cos(angles)
-        sin_a = torch.sin(angles)
-
-        # Apply rotation: (a + bi)(cos + i·sin) = (a·cos - b·sin) + i(a·sin + b·cos)
-        out_real = x_real * cos_a - x_imag * sin_a
-        out_imag = x_real * sin_a + x_imag * cos_a
-
-        # Interleave back to (B, H, S, D)
-        x_out = torch.stack([out_real, out_imag], dim=-1).reshape(B, H, S, D)
-
-        return x_out.to(original_dtype)
+        return x_out if original_dtype == torch.float32 else x_out.to(original_dtype)
 
 
 class SwiGLU(nn.Module):
@@ -211,7 +214,7 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         if self.out_proj.bias is not None:
             nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, src, centroids, src_key_padding_mask=None):
+    def forward(self, src, centroids, src_key_padding_mask=None, rope_tables=None):
         batch_size, seq_len, _ = src.shape
 
         # Self-attention block with pre-norm
@@ -225,8 +228,8 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         q, k, v = qkv[0], qkv[1], qkv[2]  # Each is (B, H, S, D)
 
         # Apply 4D RoPE to Q and K using spatial-temporal coordinates
-        q = self.rope(q, centroids)
-        k = self.rope(k, centroids)
+        q = self.rope(q, centroids, tables=rope_tables)
+        k = self.rope(k, centroids, tables=rope_tables)
 
         # Prepare attention mask
         attn_mask = self._prepare_attention_mask(src_key_padding_mask, q.device)
@@ -299,10 +302,19 @@ class NeptuneTransformerEncoder(nn.Module):
             return copy.deepcopy(module)
 
     def forward(self, src, centroids, src_key_padding_mask=None):
-        output = src
+        # All layers share the same (dim, scales, base) RoPE parameters and
+        # receive the same centroids, so the cos/sin tables are identical.
+        # Compute them once here and reuse across every Q/K call.
+        rope_tables = self.layers[0].rope.compute_tables(centroids) if self.layers else None
 
+        output = src
         for mod in self.layers:
-            output = mod(output, centroids, src_key_padding_mask=src_key_padding_mask)
+            output = mod(
+                output,
+                centroids,
+                src_key_padding_mask=src_key_padding_mask,
+                rope_tables=rope_tables,
+            )
 
         if self.norm is not None:
             output = self.norm(output)
