@@ -139,14 +139,25 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     model_type = model_opts.get("model_type", "neptune").lower()
 
     if model_type == "neptune_moe":
+        from neptune.model import (
+            SharedBackbone, ExpertHead, AttentionPool,
+            MoETransformerEncoder, NeptuneMoEModel,
+        )
+        from torch.nn import RMSNorm
+        import torch.nn as nn
+
         token_dim = model_opts["token_dim"]
         num_heads = model_opts["num_heads"]
         hidden_dim = model_opts["hidden_dim"]
         dropout = model_opts.get("dropout", 0.1)
         drop_path_rate = model_opts.get("drop_path_rate", 0.0)
         pool_type = model_opts.get("pool_type", "mean")
-        backbone_layers = model_opts["num_layers"]
-        expert_layers = model_opts.get("expert_num_layers", backbone_layers)
+        backbone_layers = model_opts.get("backbone_num_layers", model_opts["num_layers"])
+        router_layers = model_opts.get("router_num_layers", 2)
+        moe_num_layers = model_opts.get("moe_num_layers", 4)
+        num_routed_experts = model_opts.get("num_routed_experts", 6)
+        shared_hidden_dim = model_opts.get("shared_hidden_dim", hidden_dim)
+        routed_hidden_dim = model_opts.get("routed_hidden_dim", hidden_dim // 2)
 
         backbone = SharedBackbone(
             in_channels=model_opts["in_channels"],
@@ -161,27 +172,43 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
             tokenizer_kwargs=model_opts.get("tokenizer_kwargs"),
         )
 
-        def _head(output_dim):
-            return ExpertHead(
-                token_dim=token_dim, num_layers=expert_layers, num_heads=num_heads,
-                hidden_dim=hidden_dim, output_dim=output_dim, dropout=dropout,
-                drop_path_rate=drop_path_rate, pool_type=pool_type,
-            )
+        morph_router = ExpertHead(
+            token_dim=token_dim, num_layers=router_layers, num_heads=num_heads,
+            hidden_dim=hidden_dim, output_dim=6, dropout=dropout,
+            drop_path_rate=drop_path_rate, pool_type=pool_type,
+        )
+
+        expert_stack = MoETransformerEncoder(
+            d_model=token_dim, nhead=num_heads,
+            shared_hidden_dim=shared_hidden_dim,
+            routed_hidden_dim=routed_hidden_dim,
+            num_routed_experts=num_routed_experts,
+            num_layers=moe_num_layers,
+            dropout=dropout, drop_path_rate=drop_path_rate,
+        )
+
+        final_norm = RMSNorm(token_dim)
+        pool = AttentionPool(token_dim) if pool_type == "attention" else None
 
         dir_loss = model_opts.get("loss_kwargs", {}).get("dir_loss", "iag")
         dir_dim = _get_output_dim("angular_reco", dir_loss)
 
+        def _head(out_dim):
+            return nn.Sequential(
+                nn.Linear(token_dim, token_dim), nn.GELU(), nn.Dropout(dropout),
+                nn.Linear(token_dim, out_dim),
+            )
+
         model = NeptuneMoEModel(
             backbone=backbone,
-            morphology_head=_head(6),
-            energy_experts={"contained": _head(2), "uncontained": _head(2)},
-            direction_experts={
-                "cascade": _head(dir_dim),
-                "low_track": _head(dir_dim),
-                "high_track": _head(dir_dim),
-            },
-            energy_gate_threshold=model_opts.get("energy_gate_threshold", 10000.0),
-            noise_threshold=model_opts.get("noise_threshold", 0.8),
+            morph_router=morph_router,
+            expert_stack=expert_stack,
+            final_norm=final_norm,
+            pool=pool,
+            energy_head=_head(2),
+            dir_head=_head(dir_dim),
+            route_temperature=model_opts.get("route_temperature", 1.5),
+            detach_routing=model_opts.get("detach_routing", True),
         )
         return model.to(device)
 
