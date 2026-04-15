@@ -125,12 +125,9 @@ class RoPE4D(nn.Module):
         x_real = x_pairs[..., 0]  # (B, H, S, D/2)
         x_imag = x_pairs[..., 1]  # (B, H, S, D/2)
 
-        # Write rotated pairs directly into a preallocated buffer — avoids the
-        # stack+reshape allocation in the hot path.
-        x_out = torch.empty_like(x_f)
-        out_pairs = x_out.view(B, H, S, D // 2, 2)
-        torch.sub(x_real * cos_a, x_imag * sin_a, out=out_pairs[..., 0])
-        torch.add(x_real * sin_a, x_imag * cos_a, out=out_pairs[..., 1])
+        out_real = x_real * cos_a - x_imag * sin_a
+        out_imag = x_real * sin_a + x_imag * cos_a
+        x_out = torch.stack((out_real, out_imag), dim=-1).reshape(B, H, S, D)
 
         return x_out if original_dtype == torch.float32 else x_out.to(original_dtype)
 
