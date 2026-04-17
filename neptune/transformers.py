@@ -28,22 +28,12 @@ class RoPE4D(nn.Module):
     Each coordinate axis gets dedicated rotation planes, ensuring the four
     generators B_x, B_y, B_z, B_t are linearly independent.
 
-    Uses optimized real-arithmetic rotation instead of complex numbers for
-    better performance and to avoid input tensor mutation.
-
-    Requirements:
-        - dim >= 8 (need at least one 2x2 plane per axis)
-        - scales should be chosen so max_angle < 2π for local injectivity
-          Example: if x ∈ [0, X_max], ensure s_x * X_max * ω_max < 2π
+    Pair j rotates dims (j, D/2+j) using contiguous chunk+cat on the last
+    dim — each side of the rotation is a contiguous half, which is much
+    faster than a strided (2j, 2j+1) layout.
     """
 
     def __init__(self, dim, scales=(1.0, 1.0, 1.0, 1.0), base=10000):
-        """
-        Args:
-            dim: Head dimension (must be even and >= 8 for valid 4D RoPE)
-            scales: (s_x, s_y, s_z, s_t) scaling factors for coordinate axes
-            base: Base for log-spaced frequency schedule
-        """
         super().__init__()
         assert dim % 2 == 0, f"RoPE4D dim must be even (got {dim})"
         assert dim >= 8, f"RoPE4D requires dim >= 8 for 4 axes (got {dim})"
@@ -87,25 +77,33 @@ class RoPE4D(nn.Module):
         freqs = (1.0 / self.base) * (self.base ** exponents)
         return freqs * scale
 
-    def compute_tables(self, coords):
+    def compute_tables(self, coords, dtype=None):
         """Precompute (cos, sin) rotation tables for a given centroid tensor.
 
-        Returns a pair of (B, 1, S, D/2) float32 tensors that can be passed to
-        `forward` to skip the per-call transcendental work. Every layer in
-        NeptuneTransformerEncoder sees the same centroids, so the encoder
-        computes these once and shares them across all layers.
+        Returns a pair of (B, 1, S, D/2) tensors. Trig is always evaluated in
+        float32 for accuracy; if `dtype` is supplied (e.g. the model dtype),
+        the tables are cast to it once so per-layer rotation can stay in that
+        dtype and skip an fp32 round-trip.
+
+        Every layer in NeptuneTransformerEncoder sees the same centroids, so
+        the encoder computes these once and shares them across all layers.
         """
         coords_f = coords if coords.dtype == torch.float32 else coords.float()
         coord_per_plane = coords_f.index_select(dim=-1, index=self.coord_select)
         angles = (coord_per_plane * self.freqs).unsqueeze(1)  # (B, 1, S, D/2)
-        return torch.cos(angles), torch.sin(angles)
+        cos_a = torch.cos(angles)
+        sin_a = torch.sin(angles)
+        if dtype is not None and dtype != cos_a.dtype:
+            cos_a = cos_a.to(dtype)
+            sin_a = sin_a.to(dtype)
+        return cos_a, sin_a
 
     def forward(self, x, coords, tables=None):
         """
         Apply 4D rotations to Q or K based on spatial-temporal coordinates.
 
-        Uses real-arithmetic rotation: (a + bi)(cos θ + i sin θ)
-        = (a cos θ - b sin θ) + i(a sin θ + b cos θ)
+        Rotation: (a, b) -> (a cos θ - b sin θ, a sin θ + b cos θ) with
+        pair j = (j, D/2+j).
 
         Args:
             x: (B, H, S, D) queries or keys
@@ -115,21 +113,26 @@ class RoPE4D(nn.Module):
         Returns:
             Rotated tensor (B, H, S, D)
         """
-        B, H, S, D = x.shape
-        original_dtype = x.dtype
+        if tables is None:
+            tables = self.compute_tables(coords, dtype=x.dtype)
+        cos_a, sin_a = tables
 
-        cos_a, sin_a = tables if tables is not None else self.compute_tables(coords)
+        # Fast path: same-dtype tables — stay entirely in x's dtype.
+        if cos_a.dtype == x.dtype:
+            x1, x2 = x.chunk(2, dim=-1)
+            return torch.cat(
+                (x1 * cos_a - x2 * sin_a, x1 * sin_a + x2 * cos_a),
+                dim=-1,
+            )
 
+        # Mixed-dtype fallback: do the math in fp32, cast back.
         x_f = x if x.dtype == torch.float32 else x.float()
-        x_pairs = x_f.reshape(B, H, S, D // 2, 2)
-        x_real = x_pairs[..., 0]  # (B, H, S, D/2)
-        x_imag = x_pairs[..., 1]  # (B, H, S, D/2)
-
-        out_real = x_real * cos_a - x_imag * sin_a
-        out_imag = x_real * sin_a + x_imag * cos_a
-        x_out = torch.stack((out_real, out_imag), dim=-1).reshape(B, H, S, D)
-
-        return x_out if original_dtype == torch.float32 else x_out.to(original_dtype)
+        x1, x2 = x_f.chunk(2, dim=-1)
+        out = torch.cat(
+            (x1 * cos_a - x2 * sin_a, x1 * sin_a + x2 * cos_a),
+            dim=-1,
+        )
+        return out if out.dtype == x.dtype else out.to(x.dtype)
 
 
 class SwiGLU(nn.Module):
@@ -211,7 +214,8 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         if self.out_proj.bias is not None:
             nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, src, centroids, src_key_padding_mask=None, rope_tables=None):
+    def forward(self, src, centroids, src_key_padding_mask=None,
+                rope_tables=None, attn_mask=None):
         batch_size, seq_len, _ = src.shape
 
         # Self-attention block with pre-norm
@@ -228,8 +232,10 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         q = self.rope(q, centroids, tables=rope_tables)
         k = self.rope(k, centroids, tables=rope_tables)
 
-        # Prepare attention mask
-        attn_mask = self._prepare_attention_mask(src_key_padding_mask, q.device)
+        # Use the pre-built mask from the encoder when available; otherwise
+        # build one from the per-layer key-padding mask (single-layer callers).
+        if attn_mask is None:
+            attn_mask = self._prepare_attention_mask(src_key_padding_mask, q.device)
 
         # Apply attention
         attn_output = F.scaled_dot_product_attention(
@@ -301,16 +307,26 @@ class NeptuneTransformerEncoder(nn.Module):
     def forward(self, src, centroids, src_key_padding_mask=None):
         # All layers share the same (dim, scales, base) RoPE parameters and
         # receive the same centroids, so the cos/sin tables are identical.
-        # Compute them once here and reuse across every Q/K call.
-        rope_tables = self.layers[0].rope.compute_tables(centroids) if self.layers else None
+        # Pre-cast tables to src.dtype so per-layer rotation skips the fp32
+        # round-trip on bf16/fp16 paths.
+        first = self.layers[0] if self.layers else None
+        rope_tables = (
+            first.rope.compute_tables(centroids, dtype=src.dtype)
+            if first is not None else None
+        )
+        # Build the SDPA mask once instead of rebuilding it per layer.
+        attn_mask = (
+            first._prepare_attention_mask(src_key_padding_mask, src.device)
+            if first is not None else None
+        )
 
         output = src
         for mod in self.layers:
             output = mod(
                 output,
                 centroids,
-                src_key_padding_mask=src_key_padding_mask,
                 rope_tables=rope_tables,
+                attn_mask=attn_mask,
             )
 
         if self.norm is not None:
