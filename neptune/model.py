@@ -11,8 +11,8 @@ from typing import Optional, Dict, Any, List
 from .transformers import (
     NeptuneTransformerEncoder,
     NeptuneTransformerEncoderLayer,
+    RMSNorm,
 )
-from torch.nn import RMSNorm
 from .tokenizer import FPSTokenizer
 
 
