@@ -149,31 +149,6 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     return model.to(device)
 
 
-class BetaWarmupLoss:
-    """Linearly ramps β from 0 to beta_max over the first warmup_epochs for AG losses.
-
-    Trainer should call set_epoch(epoch) at the start of each epoch; if not, β stays at 0.
-    """
-
-    def __init__(self, loss_fn, warmup_epochs: int = 10, beta_max: float = 0.5):
-        self.loss_fn = loss_fn
-        self.warmup_epochs = warmup_epochs
-        self.beta_max = beta_max
-        self.current_epoch = 0
-
-    def set_epoch(self, epoch: int) -> None:
-        self.current_epoch = epoch
-
-    @property
-    def beta(self) -> float:
-        if self.warmup_epochs <= 0:
-            return self.beta_max
-        return self.beta_max * min(self.current_epoch / self.warmup_epochs, 1.0)
-
-    def __call__(self, preds, labels):
-        return self.loss_fn(preds, F.normalize(labels[:, 1:4], p=2, dim=1), beta=self.beta)
-
-
 def build_loss_function(model_opts: Dict[str, Any]):
     task = model_opts["downstream_task"]
     loss_name = model_opts["loss_fn"]
@@ -189,11 +164,17 @@ def build_loss_function(model_opts: Dict[str, Any]):
                 preds, F.normalize(labels[:, 1:4], p=2, dim=1)
             )
         if loss_name == "iag":
-            return BetaWarmupLoss(iag_nll_loss)
+            return lambda preds, labels: iag_nll_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
         if loss_name == "esag":
-            return BetaWarmupLoss(esag_nll_loss)
+            return lambda preds, labels: esag_nll_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
         if loss_name == "gag":
-            return BetaWarmupLoss(gag_nll_loss)
+            return lambda preds, labels: gag_nll_loss(
+                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
+            )
         if loss_name == "sipc":
             return lambda preds, labels: sipc_nll_loss(
                 preds, F.normalize(labels[:, 1:4], p=2, dim=1)
