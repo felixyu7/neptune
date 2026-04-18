@@ -1,7 +1,21 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn import RMSNorm  # Assume availability (PyTorch >= 2.1)
+
+
+class RMSNorm(nn.Module):
+    """Drop-in for nn.RMSNorm that casts weight to input dtype so the fused
+    bf16/fp16 kernel is used under autocast (stdlib keeps weight fp32 and
+    falls back to an unfused path)."""
+
+    def __init__(self, dim, eps=1e-5):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(dim))
+        self.eps = eps
+        self.normalized_shape = (dim,)
+
+    def forward(self, x):
+        return F.rms_norm(x, self.normalized_shape, self.weight.to(x.dtype), self.eps)
 
 
 class DropPath(nn.Module):
@@ -138,30 +152,26 @@ class RoPE4D(nn.Module):
 class SwiGLU(nn.Module):
     def __init__(self, dim, hidden_dim, dropout=0.1, bias=True):
         super().__init__()
-        self.w1 = nn.Linear(dim, hidden_dim, bias=bias)
+        self.w13 = nn.Linear(dim, 2 * hidden_dim, bias=bias)
         self.w2 = nn.Linear(hidden_dim, dim, bias=bias)
-        self.w3 = nn.Linear(dim, hidden_dim, bias=bias)
         self.dropout = nn.Dropout(dropout)
-
-        # Initialize with Xavier/Glorot for stable training
         self._initialize_weights()
 
     def _initialize_weights(self):
-        """Initialize SwiGLU weights using Xavier/Glorot initialization."""
-        for module in [self.w1, self.w2, self.w3]:
+        for module in (self.w13, self.w2):
             nn.init.xavier_uniform_(module.weight)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
 
     def forward(self, x):
-        # SwiGLU: SiLU(W1 @ x) ⊙ (W3 @ x), then W2
-        return self.dropout(self.w2(F.silu(self.w1(x)) * self.w3(x)))
+        a, b = self.w13(x).chunk(2, dim=-1)
+        return self.dropout(self.w2(F.silu(a) * b))
 
 
 class NeptuneTransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1,
-                 layer_norm_eps=1e-5, bias=True, rope_scales=(1.0, 1.0, 1.0, 0.2),
-                 rope_base=10000, drop_path_rate=0.0):
+                 layer_norm_eps=1e-5, bias=True, ff_bias=False, qk_norm=True,
+                 rope_scales=(1.0, 1.0, 1.0, 0.2), rope_base=10000, drop_path_rate=0.0):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
@@ -179,8 +189,14 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         self.norm1 = RMSNorm(d_model, eps=layer_norm_eps)
         self.norm2 = RMSNorm(d_model, eps=layer_norm_eps)
 
+        # Pre-RoPE QK-norm
+        self.qk_norm = qk_norm
+        if qk_norm:
+            self.q_norm = RMSNorm(self.head_dim, eps=layer_norm_eps)
+            self.k_norm = RMSNorm(self.head_dim, eps=layer_norm_eps)
+
         # SwiGLU FFN
-        self.ffn = SwiGLU(d_model, dim_feedforward, dropout, bias=bias)
+        self.ffn = SwiGLU(d_model, dim_feedforward, dropout, bias=ff_bias)
 
         # 4D RoPE
         self.rope = RoPE4D(dim=self.head_dim, scales=rope_scales, base=rope_base)
@@ -192,6 +208,7 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         # Store hyperparameters for cloning
         self.layer_norm_eps = layer_norm_eps
         self.bias = bias
+        self.ff_bias = ff_bias
         self.rope_scales = rope_scales
         self.rope_base = rope_base
 
@@ -227,6 +244,10 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         qkv = qkv.reshape(batch_size, seq_len, 3, self.nhead, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, H, S, D)
         q, k, v = qkv[0], qkv[1], qkv[2]  # Each is (B, H, S, D)
+
+        if self.qk_norm:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
 
         # Apply 4D RoPE to Q and K using spatial-temporal coordinates
         q = self.rope(q, centroids, tables=rope_tables)
@@ -292,10 +313,12 @@ class NeptuneTransformerEncoder(nn.Module):
             return NeptuneTransformerEncoderLayer(
                 d_model=module.d_model,
                 nhead=module.nhead,
-                dim_feedforward=module.ffn.w1.out_features,
+                dim_feedforward=module.ffn.w13.out_features // 2,
                 dropout=module.dropout.p,
                 layer_norm_eps=module.layer_norm_eps,
                 bias=module.bias,
+                ff_bias=module.ff_bias,
+                qk_norm=module.qk_norm,
                 rope_scales=module.rope_scales,
                 rope_base=module.rope_base,
                 drop_path_rate=drop_path_rate,
