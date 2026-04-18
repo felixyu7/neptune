@@ -179,10 +179,6 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         self.norm1 = RMSNorm(d_model, eps=layer_norm_eps)
         self.norm2 = RMSNorm(d_model, eps=layer_norm_eps)
 
-        # QK-Norm: per-head RMSNorm on Q and K (post-RoPE) for attention stability
-        self.q_norm = RMSNorm(self.head_dim, eps=layer_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=layer_norm_eps)
-
         # SwiGLU FFN
         self.ffn = SwiGLU(d_model, dim_feedforward, dropout, bias=bias)
 
@@ -235,9 +231,6 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         # Apply 4D RoPE to Q and K using spatial-temporal coordinates
         q = self.rope(q, centroids, tables=rope_tables)
         k = self.rope(k, centroids, tables=rope_tables)
-
-        q = self.q_norm(q)
-        k = self.k_norm(k)
 
         # Use the pre-built mask from the encoder when available; otherwise
         # build one from the per-layer key-padding mask (single-layer callers).
