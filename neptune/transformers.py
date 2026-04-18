@@ -1,21 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-class RMSNorm(nn.Module):
-    """Drop-in for nn.RMSNorm that casts weight to input dtype so the fused
-    bf16/fp16 kernel is used under autocast (stdlib RMSNorm keeps weight in
-    fp32 and falls back to an unfused path)."""
-
-    def __init__(self, dim, eps=1e-5):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(dim))
-        self.eps = eps
-        self.normalized_shape = (dim,)
-
-    def forward(self, x):
-        return F.rms_norm(x, self.normalized_shape, self.weight.to(x.dtype), self.eps)
+from torch.nn import RMSNorm  # Assume availability (PyTorch >= 2.1)
 
 
 class DropPath(nn.Module):
