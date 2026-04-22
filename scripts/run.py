@@ -20,8 +20,11 @@ ML_COMMON_SUBMODULE = ROOT / "ml_common"
 ML_COMMON_PACKAGE = ML_COMMON_SUBMODULE / "ml_common" / "__init__.py"
 if ML_COMMON_PACKAGE.exists():
     submodule_path = str(ML_COMMON_SUBMODULE)
-    if submodule_path not in sys.path:
-        sys.path.append(submodule_path)
+    if submodule_path in sys.path:
+        sys.path.remove(submodule_path)
+    # Prepend so the repo-local submodule wins over any pip-installed ml_common
+    # (avoids importing a stale global copy missing LargeWeightedRandomSampler, etc).
+    sys.path.insert(0, submodule_path)
 
 from ml_common.dataloaders import create_dataloaders
 from directional_distributions import VMF, IAG, ESAG, GAG, SIPC, SESPC, GSPC, PowerSpherical, IPT, EPT, GPT
@@ -416,12 +419,14 @@ def build_metric_function(model_opts: Dict[str, Any]):
 
             # Normalized partial AUC over FPR in [0, 1e-4]: primary
             # checkpoint-selection metric (smoother than single-point TPR).
+            # Always computable: roc_curve always emits a (fpr=0, tpr=0) point,
+            # so the trapezoid falls back to linear interpolation over [0, alpha_fpr]
+            # when the val bg count is too small to resolve the tail densely.
             alpha_fpr = 1e-4
             mask = fpr <= alpha_fpr
-            if mask.sum() >= 2:
-                fpr_tail = np.concatenate([fpr[mask], [alpha_fpr]])
-                tpr_tail = np.concatenate([tpr[mask], [np.interp(alpha_fpr, fpr, tpr)]])
-                metrics["pauc_fpr_le_1e-4"] = float(np.trapz(tpr_tail, fpr_tail) / alpha_fpr)
+            fpr_tail = np.concatenate([fpr[mask], [alpha_fpr]])
+            tpr_tail = np.concatenate([tpr[mask], [np.interp(alpha_fpr, fpr, tpr)]])
+            metrics["pauc_fpr_le_1e-4"] = float(np.trapz(tpr_tail, fpr_tail) / alpha_fpr)
 
             # Threshold at FPR=1e-4 (well-resolved diagnostic operating point).
             idx_4 = int(np.searchsorted(fpr, 1e-4))
