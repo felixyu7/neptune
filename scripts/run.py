@@ -1,13 +1,16 @@
 import argparse
 import importlib.util
+import math
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 import yaml
+from sklearn.metrics import f1_score, roc_curve
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -272,7 +275,29 @@ def build_loss_function(model_opts: Dict[str, Any]):
                 return (focal_weight * bce).mean()
             return loss_fn
 
-        raise ValueError(f"neutrino_classification supports 'bce' or 'focal' loss, got '{loss_name}'")
+        if loss_name == "pauc":
+            # Differentiable surrogate for partial AUC over FPR in [0, alpha]:
+            # softplus pairwise loss between all positives and the top-alpha fraction
+            # of in-batch negatives. Optimizes the tail region of the ROC directly.
+            alpha = loss_kwargs.get("alpha", 0.01)
+            margin = loss_kwargs.get("margin", 0.0)
+
+            def loss_fn(preds, labels):
+                logits = preds.view(-1)
+                targets = labels[..., -1].reshape(-1).float()
+                pos_scores = logits[targets > 0.5]
+                neg_scores = logits[targets <= 0.5]
+                if pos_scores.numel() == 0 or neg_scores.numel() == 0:
+                    return logits.sum() * 0.0
+                k = max(1, int(math.ceil(alpha * neg_scores.numel())))
+                tail_neg, _ = torch.topk(neg_scores, k)
+                diff = tail_neg.unsqueeze(0) - pos_scores.unsqueeze(1) + margin
+                return F.softplus(diff).mean()
+            return loss_fn
+
+        raise ValueError(
+            f"neutrino_classification supports 'bce', 'focal', or 'pauc' loss, got '{loss_name}'"
+        )
 
     raise ValueError(f"Unsupported task/loss combination: {task}/{loss_name}")
 
@@ -338,12 +363,25 @@ def build_metric_function(model_opts: Dict[str, Any]):
         return metric_fn
 
     if task == "morphology_classification":
+        # Class indices: 0=cascade, 1=starting, 2=throughgoing, 3=stopping, 4=uncontained, 5=bundle
+        starting_like = {0, 1}
+        n_classes = 6
+
         def metric_fn(preds, labels):
-            targets = labels[:, 4].long()
-            probs = torch.softmax(preds, dim=1)
-            pred_classes = probs.argmax(dim=1)
-            accuracy = (pred_classes == targets).float().mean().item()
-            return {"accuracy": accuracy}
+            targets = labels[:, 4].long().cpu().numpy()
+            pred_classes = preds.argmax(dim=1).cpu().numpy()
+
+            targets_sl = np.isin(targets, list(starting_like)).astype(np.int64)
+            preds_sl = np.isin(pred_classes, list(starting_like)).astype(np.int64)
+
+            return {
+                "accuracy": float((pred_classes == targets).mean()),
+                "macro_f1": float(f1_score(
+                    targets, pred_classes,
+                    labels=list(range(n_classes)), average="macro", zero_division=0.0,
+                )),
+                "starting_like_f1": float(f1_score(targets_sl, preds_sl, zero_division=0.0)),
+            }
         return metric_fn
 
     if task == "track_cascade_classification":
@@ -357,43 +395,62 @@ def build_metric_function(model_opts: Dict[str, Any]):
         return metric_fn
 
     if task == "neutrino_classification":
+        # Trainer aggregates preds/labels across all val batches and calls this
+        # once at epoch end, so metrics are computed on the full val set.
         def metric_fn(preds, labels):
-            logits = preds.view(-1)
-            targets = labels[..., -1].reshape(-1)
-            probs = torch.sigmoid(logits)
+            logits = preds.view(-1).float().cpu().numpy()
+            targets = labels[..., -1].reshape(-1).cpu().numpy().astype(np.int64)
+            probs = 1.0 / (1.0 + np.exp(-logits))
 
-            is_signal = targets == 1.0
-            is_bg = targets == 0.0
-            n_signal = is_signal.sum().item()
-            n_bg = is_bg.sum().item()
+            metrics: Dict[str, float] = {}
+            if not ((targets == 1).any() and (targets == 0).any()):
+                return metrics
 
-            metrics = {}
+            fpr, tpr, thr = roc_curve(targets, probs)
+            metrics["auc_roc"] = float(np.trapz(tpr, fpr))
 
-            # AUC-ROC (sort-based, no sklearn dependency)
-            if n_signal > 0 and n_bg > 0:
-                # Count concordant pairs via ranking
-                sorted_idx = torch.argsort(probs, descending=True)
-                sorted_targets = targets[sorted_idx]
-                # Accumulate: for each signal event, count how many bg events are ranked below it
-                bg_cumsum = (1 - sorted_targets).cumsum(0)
-                auc = (sorted_targets * bg_cumsum).sum().item() / (n_signal * n_bg)
-                metrics["auc_roc"] = auc
+            # TPR at target FPRs via ROC interpolation (matches BDT-side fix for
+            # tie-inflation artifact from threshold-based quantile computations).
+            for f in (1e-5, 1e-4, 1e-3):
+                metrics[f"tpr_at_fpr_{f:.0e}"] = float(np.interp(f, fpr, tpr))
 
-            # Signal efficiency at fixed background rejection rates
-            if n_signal > 0 and n_bg > 0:
-                signal_probs = probs[is_signal].float()
-                bg_probs = probs[is_bg].float()
-                for bg_rej in [0.90, 0.99, 0.999]:
-                    # Threshold = quantile of bg distribution at (1 - bg_rej) from the top
-                    threshold = torch.quantile(bg_probs, bg_rej).item()
-                    sig_eff = (signal_probs > threshold).float().mean().item()
-                    label = f"sig_eff_at_{bg_rej:.3f}_bg_rej".replace(".", "")
-                    metrics[label] = sig_eff
+            # Normalized partial AUC over FPR in [0, 1e-4]: primary
+            # checkpoint-selection metric (smoother than single-point TPR).
+            alpha_fpr = 1e-4
+            mask = fpr <= alpha_fpr
+            if mask.sum() >= 2:
+                fpr_tail = np.concatenate([fpr[mask], [alpha_fpr]])
+                tpr_tail = np.concatenate([tpr[mask], [np.interp(alpha_fpr, fpr, tpr)]])
+                metrics["pauc_fpr_le_1e-4"] = float(np.trapz(tpr_tail, fpr_tail) / alpha_fpr)
+
+            # Threshold at FPR=1e-4 (well-resolved diagnostic operating point).
+            idx_4 = int(np.searchsorted(fpr, 1e-4))
+            idx_4 = min(idx_4, len(thr) - 1)
+            metrics["threshold_at_fpr_1e-4"] = float(thr[idx_4])
+
+            # Poisson-floor check: raw count of bg events above the 1e-5 threshold.
+            # With ~9k CORSIKA val events the expectation is <1, so values 0/1
+            # flag that tpr_at_fpr_1e-5 is stats-limited rather than model-limited.
+            idx_5 = int(np.searchsorted(fpr, 1e-5))
+            idx_5 = min(idx_5, len(thr) - 1)
+            thr_5 = float(thr[idx_5])
+            metrics["n_bkg_passing_at_fpr_1e-5"] = int((probs[targets == 0] >= thr_5).sum())
 
             return metrics
         return metric_fn
 
     return None
+
+
+def build_best_metric_spec(task: str) -> Tuple[str, str]:
+    """Best-checkpoint selection key/mode per downstream task. Falls back to val_loss/min."""
+    specs = {
+        "neutrino_classification": ("val_pauc_fpr_le_1e-4", "max"),
+        "angular_reco": ("val_median_angular_error_deg", "min"),
+        "energy_reco": ("val_mean_energy_error", "min"),
+        "morphology_classification": ("val_macro_f1", "max"),
+    }
+    return specs.get(task, ("val_loss", "min"))
 
 
 def prepare_batch(
@@ -419,6 +476,10 @@ def main() -> None:
         cfg["task"] = "starting_classification"
         cfg.setdefault("data_options", {})
         cfg["data_options"]["task"] = "starting_classification"
+
+    best_key, best_mode = build_best_metric_spec(model_opts["downstream_task"])
+    cfg["training_options"]["best_metric_key"] = best_key
+    cfg["training_options"]["best_metric_mode"] = best_mode
 
     device = select_device(cfg)
     print(f"Using device: {device}")
