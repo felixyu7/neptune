@@ -55,11 +55,13 @@ loss.backward()
 
 Neptune assumes `coords` is an `[N, 4]` tensor with time in the fourth column.
 
-For full training runs, the CLI entry point `scripts/run.py` uses shared tooling from [ml-common](https://github.com/felixyu7/ml-common) for dataloaders, losses, and the trainer. Use `git submodule init` followed by `git submodule update` to update the [ml-common](https://github.com/felixyu7/ml-common) submodule in the repo. Then, run by providing a config file:
+For full training runs, the CLI entry point `scripts/run.py` uses shared tooling from [ml-common](https://github.com/felixyu7/ml-common) for dataloaders, losses, and the trainer. Run `git submodule update --init --recursive` to pull the [ml-common](https://github.com/felixyu7/ml-common) submodule. Then, run by providing a config file:
 
 ```bash
-python scripts/run.py -c scripts/configs/prometheus_angular_reco.cfg
+python scripts/run.py -c scripts/configs/what-1_angular_reco.cfg
 ```
+
+Released WhaT-1 configs covering the four reconstruction tasks live under `scripts/configs/` (`what-1_angular_reco.cfg`, `what-1_energy_reco.cfg`, `what-1_morphology_classification.cfg`, `what-1_neutrino_classification.cfg`).
 
 ## How it works
 
@@ -76,7 +78,8 @@ python scripts/run.py -c scripts/configs/prometheus_angular_reco.cfg
 - `num_layers`: transformer depth (default: 12)
 - `num_heads`: attention heads (default: 12)
 - `output_dim`: task output dim (default: 3)
-- `k_neighbors`: k for k-NN (default: 16)
+- `k_neighbors`: k for k-NN (default: 8)
+- `pool_type`: `"mean"` or `"attention"` (default: `"mean"`)
 - `tokenizer_kwargs`: optional dict forwarded to the tokenizer implementation
 
 ## Requirements
