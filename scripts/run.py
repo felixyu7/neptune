@@ -112,6 +112,8 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         }.get(loss_name, 4)
     elif task == "energy_reco":
         output_dim = 2 if loss_name == "gaussian_nll" else 1
+    elif task == "vertex_reco":
+        output_dim = 3
     elif task == "starting_classification":
         output_dim = 1
     elif task == "morphology_classification":
@@ -215,6 +217,19 @@ def build_loss_function(model_opts: Dict[str, Any]):
             return lambda preds, labels: gaussian_nll_loss(preds[:, 0], preds[:, 1], labels[:, 0])
         if loss_name == "mse":
             return lambda preds, labels: F.mse_loss(preds[:, 0], labels[:, 0])
+
+    if task == "vertex_reco":
+        if loss_name != "mse":
+            raise ValueError("vertex_reco currently supports only the 'mse' loss")
+
+        def loss_fn(preds, labels):
+            target = labels[:, 6:9] / 100.0
+            mask = torch.isfinite(target).all(dim=1)
+            if mask.sum() == 0:
+                return preds.sum() * 0.0
+            return F.mse_loss(preds[mask], target[mask])
+
+        return loss_fn
 
     if task == "starting_classification":
         if loss_name != "bce":
@@ -355,6 +370,20 @@ def build_metric_function(model_opts: Dict[str, Any]):
             energy_errors = torch.abs(preds[:, 0] - labels[:, 0])
             return {"mean_energy_error": energy_errors.mean().item()}
         return metric_fn
+
+    if task == "vertex_reco":
+        def metric_fn(preds, labels):
+            target = labels[:, 6:9]
+            mask = torch.isfinite(target).all(dim=1)
+            if mask.sum() == 0:
+                return {}
+            dist = torch.linalg.vector_norm(preds[mask] * 100.0 - target[mask], dim=1)
+            return {
+                "mean_vertex_error_m": dist.mean().item(),
+                "median_vertex_error_m": torch.median(dist).item(),
+            }
+        return metric_fn
+
     if task == "starting_classification":
         def metric_fn(preds, labels):
             logits = preds.view(-1)
@@ -453,6 +482,7 @@ def build_best_metric_spec(task: str) -> Tuple[str, str]:
         "neutrino_classification": ("val_pauc_fpr_le_1e-4", "max"),
         "angular_reco": ("val_median_angular_error_deg", "min"),
         "energy_reco": ("val_mean_energy_error", "min"),
+        "vertex_reco": ("val_median_vertex_error_m", "min"),
         "morphology_classification": ("val_macro_f1", "max"),
     }
     return specs.get(task, ("val_loss", "min"))
