@@ -139,6 +139,9 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     tokenizer_kwargs = model_opts.get("tokenizer_kwargs")
     pool_type = model_opts.get("pool_type", "mean")
 
+    # The encoder is auto-compiled inside NeptuneModel for faster train/inference
+    # (lazy; falls back to uncompiled on failure). Disable with
+    # `compile_encoder: false` or tune via `compile_options: {mode, dynamic}`.
     model = NeptuneModel(
         in_channels=model_opts["in_channels"],
         num_patches=model_opts["num_patches"],
@@ -152,6 +155,8 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         k_neighbors=k_neighbors,
         tokenizer_kwargs=tokenizer_kwargs,
         pool_type=pool_type,
+        compile_encoder=model_opts.get("compile_encoder", True),
+        compile_options=model_opts.get("compile_options"),
     )
 
     return model.to(device)
