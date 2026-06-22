@@ -228,7 +228,7 @@ def build_loss_function(model_opts: Dict[str, Any]):
             raise ValueError("vertex_reco currently supports only the 'mse' loss")
 
         def loss_fn(preds, labels):
-            target = labels[:, 6:9] / 100.0
+            target = labels[:, 6:9]  # detector-centered km (set in the dataloader)
             mask = torch.isfinite(target).all(dim=1)
             if mask.sum() == 0:
                 return preds.sum() * 0.0
@@ -378,11 +378,12 @@ def build_metric_function(model_opts: Dict[str, Any]):
 
     if task == "vertex_reco":
         def metric_fn(preds, labels):
-            target = labels[:, 6:9]
+            target = labels[:, 6:9]  # detector-centered km (set in the dataloader)
             mask = torch.isfinite(target).all(dim=1)
             if mask.sum() == 0:
                 return {}
-            dist = torch.linalg.vector_norm(preds[mask] * 100.0 - target[mask], dim=1)
+            # error reported in meters (km -> m); centering is translation-invariant
+            dist = torch.linalg.vector_norm(preds[mask] - target[mask], dim=1) * 1000.0
             return {
                 "mean_vertex_error_m": dist.mean().item(),
                 "median_vertex_error_m": torch.median(dist).item(),
