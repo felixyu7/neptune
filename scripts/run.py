@@ -104,11 +104,11 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     loss_name = model_opts["loss_fn"]
 
     if task == "angular_reco":
-        # IAG/vMF/SIPC: 3 (μ only), ESAG/SESPC: 5 (μ + shape), GAG/GSPC: 9
+        # IAG/vMF/SIPC: 3 (μ only), ESAG/SESPC: 5 (μ + shape), GAG/GSPC/GPT: 8
         output_dim = {
             "iag": 3, "vmf": 3, "sipc": 3, "ps": 3, "angular_distance": 4,
-            "esag": 5, "sespc": 5, "gag": 9, "gspc": 9,
-            "ipt": 3, "ept": 5, "gpt": 9,
+            "esag": 5, "sespc": 5, "gag": 8, "gspc": 8,
+            "ipt": 3, "ept": 5, "gpt": 8,
         }.get(loss_name, 4)
     elif task == "energy_reco":
         output_dim = 2 if loss_name == "gaussian_nll" else 1
