@@ -15,6 +15,7 @@ from .transformers import (
     RMSNorm,
 )
 from .tokenizer import FPSTokenizer
+from .packing import pack, build_block_mask, unpack, FLEX_AVAILABLE
 
 
 class AttentionPool(nn.Module):
@@ -57,10 +58,20 @@ class PointTransformerEncoder(nn.Module):
         dropout=0.1,
         drop_path_rate=0.0,
         pool_type="mean",
+        layerscale_init=1e-5,
+        attn_impl="auto",
     ):
         super().__init__()
         self.token_dim = token_dim
         self.pool_type = pool_type
+        # "auto": packed flex on CUDA, padded SDPA on CPU (B=1 there, nothing to
+        # pack). "padded": always padded. "packed": force packed where supported.
+        # Dense batches and overflow fall back to padded inside pack().
+        self.attn_impl = attn_impl
+        # The "auto" packed path is only safe once a compiled flex path is active;
+        # eager flex_attention materializes the full packed N×N and can OOM. Set
+        # True by compile_encoder() on success, cleared on failure/fallback.
+        self.packed_flex_ready = False
 
         enc_layer = NeptuneTransformerEncoderLayer(
             d_model=token_dim,
@@ -68,6 +79,7 @@ class PointTransformerEncoder(nn.Module):
             dim_feedforward=hidden_dim,
             dropout=dropout,
             drop_path_rate=0.0,
+            layerscale_init=layerscale_init,
         )
         self.centroid_mlp = nn.Sequential(
             nn.Linear(4, token_dim // 2),
@@ -88,13 +100,44 @@ class PointTransformerEncoder(nn.Module):
         if pool_type == "attention":
             self.pool = AttentionPool(token_dim)
 
-    def forward(self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor] = None) -> Tensor:
-        # Run encoder with centroid-aware inputs
+    def _use_packed(self, src: Tensor, masks: Optional[Tensor]) -> bool:
+        """Packed flex path is used only when it pays off and is supported."""
+        if masks is None or not FLEX_AVAILABLE or self.attn_impl == "padded":
+            return False
+        if self.attn_impl == "packed":
+            # flex_attention has no CPU backward; under grad on CPU it raises at
+            # the forward call. Fall back to padded there even when forced.
+            return src.is_cuda or not torch.is_grad_enabled()
+        # "auto": GPU packs only when the compiled flex path is active; CPU (B=1)
+        # and uncompiled/failed-compile runs stay on padded SDPA.
+        return src.is_cuda and self.packed_flex_ready
+
+    def _encode(self, src: Tensor, centroids: Tensor, masks: Optional[Tensor]) -> Tensor:
+        """Run the transformer stack, packed (block-diagonal flex) or padded.
+
+        Pack/unpack use data-dependent shapes and stay eager here; only
+        ``self.layers`` (the inner encoder) is compiled.
+        """
+        if self._use_packed(src, masks):
+            packed = pack(src, centroids, masks)
+            if packed is not None:  # None == empty/dense -> padded fallback below
+                packed_tokens, packed_centroids, doc_id, pack_idx = packed
+                block_mask = build_block_mask(doc_id, packed_tokens.shape[1])
+                B, S = masks.shape
+                # doc_id (= pack_idx // S) indexes original events 0..B-1, so
+                # num_docs=B lets DropPath sample one decision per event.
+                out = self.layers(packed_tokens, packed_centroids,
+                                  block_mask=block_mask, doc_id=doc_id, num_docs=B)
+                return unpack(out, pack_idx, B, S)
         attn_pad = (~masks) if masks is not None else None
+        return self.layers(src, centroids, src_key_padding_mask=attn_pad)
+
+    def forward(self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor] = None) -> Tensor:
+        # Run encoder with centroid-aware inputs (absolute position embedding)
         centroid_emb = self.centroid_mlp(centroids.to(tokens.dtype))
         if masks is not None:
             centroid_emb = centroid_emb * masks.to(dtype=centroid_emb.dtype).unsqueeze(-1)
-        x = self.layers(tokens + centroid_emb, centroids, src_key_padding_mask=attn_pad)
+        x = self._encode(tokens + centroid_emb, centroids, masks)
         x = self.norm(x)
 
         if self.pool_type == "attention":
@@ -126,6 +169,8 @@ class NeptuneModel(nn.Module):
         k_neighbors: int = 8,   # only for fps
         tokenizer_kwargs: Optional[Dict[str, Any]] = None,
         pool_type: str = "mean",
+        layerscale_init: float = 1e-5,
+        attn_impl: str = "auto",
         compile_encoder: bool = True,
         compile_options: Optional[Dict[str, Any]] = None,
     ):
@@ -153,6 +198,8 @@ class NeptuneModel(nn.Module):
             dropout=dropout,
             drop_path_rate=drop_path_rate,
             pool_type=pool_type,
+            layerscale_init=layerscale_init,
+            attn_impl=attn_impl,
         )
         self.head = nn.Sequential(
             nn.Linear(token_dim, token_dim),
@@ -199,24 +246,30 @@ class NeptuneModel(nn.Module):
                     "uncompiled encoder."
                 )
                 self.encoder_compiled = False
+                # Route "auto" back to padded SDPA: eager flex would OOM on
+                # large packed batches, so the retry must not stay on packed.
+                self.encoder.packed_flex_ready = False
                 try:
-                    self.encoder._compiled_call_impl = None  # revert to eager
+                    self.encoder.layers._compiled_call_impl = None  # revert to eager
                 except Exception:
                     pass
                 return self.encoder(tokens, centroids, masks)
         return self.encoder(tokens, centroids, masks)
 
-    def compile_encoder(self, mode: str = "default", dynamic: bool = False,
+    def compile_encoder(self, mode: str = "default", dynamic: bool = True,
                         **compile_kwargs: Any) -> bool:
-        """Compile the transformer encoder for faster train/inference.
+        """Compile the inner transformer stack for faster train/inference.
 
-        Only the encoder is compiled: it runs on static
-        ``[B, num_patches, token_dim]`` shapes and compiles cleanly, whereas the
-        FPS tokenizer uses a custom CUDA op plus data-dependent control flow that
-        forces graph breaks and recompiles. Compilation uses ``nn.Module.compile``
-        (in place), so ``state_dict`` keys are unchanged and existing checkpoints
-        stay loadable. Benchmarks show ~1.5x train/inference on GPU and ~1.2x on
-        CPU; see the perf report.
+        Only ``self.encoder.layers`` (the ``NeptuneTransformerEncoder`` layer
+        loop) is compiled. The surrounding ``PointTransformerEncoder`` stays eager
+        because pack/unpack use data-dependent shapes (``nonzero``), and the FPS
+        tokenizer uses a custom op plus data-dependent control flow — both would
+        force graph breaks. ``dynamic=True`` lets one graph serve the varying
+        packed length ``[1, N, D]`` and the varying padded batch ``[B, 128, D]``
+        without recompiling per shape. Compilation uses ``nn.Module.compile`` (in
+        place), so ``state_dict`` keys are unchanged and existing checkpoints stay
+        loadable. Benchmarks show ~1.5x train/inference on GPU and ~1.2x on CPU;
+        see the perf report.
 
         Compilation is *lazy*: ``torch.compile`` traces on the first forward, so
         it targets the model's final device (e.g. after ``.to('cuda')``) rather
@@ -231,7 +284,7 @@ class NeptuneModel(nn.Module):
             True if compilation was set up, False if torch.compile is unavailable
             in this build (the model then runs uncompiled, exactly as before).
         """
-        if not hasattr(torch, "compile") or not hasattr(self.encoder, "compile"):
+        if not hasattr(torch, "compile") or not hasattr(self.encoder.layers, "compile"):
             warnings.warn(
                 "torch.compile is unavailable in this PyTorch build; "
                 "running the Neptune encoder uncompiled."
@@ -239,7 +292,7 @@ class NeptuneModel(nn.Module):
             self._encoder_compile_guard = False
             return False
         try:
-            self.encoder.compile(mode=mode, dynamic=dynamic, **compile_kwargs)
+            self.encoder.layers.compile(mode=mode, dynamic=dynamic, **compile_kwargs)
         except Exception as exc:  # setup-time failure (rare; tracing is lazy)
             warnings.warn(
                 f"Neptune encoder torch.compile setup failed "
@@ -247,11 +300,12 @@ class NeptuneModel(nn.Module):
                 "encoder."
             )
             try:
-                self.encoder._compiled_call_impl = None
+                self.encoder.layers._compiled_call_impl = None
             except Exception:
                 pass
             self._encoder_compile_guard = False
             return False
         # Guard the first (lazy) compiled forward so a runtime failure falls back.
         self._encoder_compile_guard = True
+        self.encoder.packed_flex_ready = True
         return True

@@ -50,7 +50,7 @@ class FPSTokenizer(nn.Module):
     @staticmethod
     def _pack_flat_to_padded(points4: Tensor,  # [N,4]
                               feats: Tensor,   # [N,F]
-                              batch_idx: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+                              batch_idx: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, list]:
         """
         Convert flat lists to padded [B, Nmax, *] without Python loops.
         Returns:
@@ -58,17 +58,24 @@ class FPSTokenizer(nn.Module):
           padded_feats:   [B, Nmax, F]
           valid_mask:     [B, Nmax] (bool)
           counts:         [B] number of points per batch
+          counts_list:    per-event counts on the host (Python list)
+
+        A single ``counts.tolist()`` host sync provides B, Nmax, and the
+        small/large split decisions, replacing the former per-use
+        ``.item()``/``.any()`` syncs (6 device syncs -> 1).
         """
         device = points4.device
-        B = int(batch_idx.max().item()) + 1 if points4.numel() > 0 else 0
-        if B == 0:
+        if points4.numel() == 0:
             return (torch.zeros(0, 0, 4, device=device, dtype=points4.dtype),
                     torch.zeros(0, 0, feats.size(-1), device=device, dtype=feats.dtype),
                     torch.zeros(0, 0, device=device, dtype=torch.bool),
-                    torch.zeros(0, device=device, dtype=torch.long))
+                    torch.zeros(0, device=device, dtype=torch.long),
+                    [])
 
-        counts = torch.bincount(batch_idx, minlength=B)                     # [B]
-        Nmax = int(counts.max().item())
+        counts = torch.bincount(batch_idx)                                  # [B]
+        counts_list = counts.tolist()                                       # single host sync
+        B = len(counts_list)
+        Nmax = max(counts_list)
         N = points4.size(0)
 
         # Sort by batch so groups are contiguous
@@ -89,7 +96,7 @@ class FPSTokenizer(nn.Module):
 
         # Valid mask
         valid_mask = (torch.arange(Nmax, device=device)[None, :] < counts[:, None])  # [B,Nmax]
-        return padded_points4, padded_feats, valid_mask, counts
+        return padded_points4, padded_feats, valid_mask, counts, counts_list
 
     # ---------- main forward ----------
 
@@ -129,30 +136,36 @@ class FPSTokenizer(nn.Module):
         point_feats = self.mlp1(features)  # [N, token_dim]
 
         # Pack to padded [B, Nmax, *]
-        P, Fp, valid_mask, counts = self._pack_flat_to_padded(points4, point_feats, batch_idx)
+        P, Fp, valid_mask, counts, counts_list = self._pack_flat_to_padded(points4, point_feats, batch_idx)
         B, Nmax, _ = P.shape
 
-        # Identify small vs large batches
+        # Identify small vs large batches. The boolean tensors are used for
+        # indexing; the host-side `has_small`/`has_large` flags (derived from the
+        # already-synced counts_list) gate the Python branches below without
+        # incurring a fresh `.any()` device sync each time.
         small_batch = counts <= self.max_tokens
         large_batch = ~small_batch
+        has_small = any(c <= self.max_tokens for c in counts_list)
+        has_large = any(c > self.max_tokens for c in counts_list)
+        n_small = sum(c <= self.max_tokens for c in counts_list)  # host-side count for shapes
 
         # Initialize centroid indices and validity masks
         cent_idx = torch.zeros(B, self.max_tokens, device=device, dtype=torch.long)
         validK = torch.zeros(B, self.max_tokens, device=device, dtype=torch.bool)
 
         # Small batches: use all valid points (no FPS needed)
-        if small_batch.any():
+        if has_small:
             K_eff = min(Nmax, self.max_tokens)
-            idx_range = torch.arange(K_eff, device=device)[None, :].expand(small_batch.sum(), -1)
+            idx_range = torch.arange(K_eff, device=device)[None, :].expand(n_small, -1)
             if K_eff < self.max_tokens:
-                pad = torch.zeros(small_batch.sum(), self.max_tokens - K_eff, device=device, dtype=torch.long)
+                pad = torch.zeros(n_small, self.max_tokens - K_eff, device=device, dtype=torch.long)
                 idx_range = torch.cat([idx_range, pad], dim=1)
             cent_idx[small_batch] = idx_range
             counts_small = counts[small_batch].clamp(max=self.max_tokens)
             validK[small_batch] = torch.arange(self.max_tokens, device=device)[None, :] < counts_small[:, None]
 
         # Large batches: use fused FPS+kNN
-        if large_batch.any():
+        if has_large:
             k_global = min(self.k_neighbors, Nmax if Nmax > 0 else 1)
             fps_idx, knn_idx = farthest_point_sampling_with_knn(
                 P[large_batch],
@@ -173,7 +186,7 @@ class FPSTokenizer(nn.Module):
         token_feats = torch.zeros(B, self.max_tokens, feat_dim, device=device, dtype=Fp.dtype)
 
         # Small batches: direct gather (no pooling needed - transformer will mix)
-        if small_batch.any():
+        if has_small:
             gather_idx_T = cent_idx[small_batch].unsqueeze(-1).expand(-1, -1, self.token_dim)
             gathered = Fp[small_batch].gather(dim=1, index=gather_idx_T)
             if use_max_mean:
@@ -183,7 +196,7 @@ class FPSTokenizer(nn.Module):
                 token_feats[small_batch] = gathered
 
         # Large batches: kNN pooling using neighbor indices from fused kernel
-        if large_batch.any():
+        if has_large:
             Fp_large = Fp[large_batch]
             valid_large = valid_mask[large_batch]
 

@@ -1,6 +1,10 @@
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from .packing import flex_attention
 
 
 class RMSNorm(nn.Module):
@@ -25,14 +29,23 @@ class DropPath(nn.Module):
         super().__init__()
         self.drop_prob = float(drop_prob)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, doc_id: Optional[torch.Tensor] = None,
+                num_docs: Optional[int] = None) -> torch.Tensor:
         if self.drop_prob == 0.0 or not self.training:
             return x
         keep_prob = 1.0 - self.drop_prob
-        shape = (x.shape[0],) + (1,) * (x.ndim - 1)
-        random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
-        binary_tensor = random_tensor.floor()
-        return x.div(keep_prob) * binary_tensor
+        if doc_id is None:
+            # Padded path: one stochastic-depth decision per sample (batch dim).
+            shape = (x.shape[0],) + (1,) * (x.ndim - 1)
+            random_tensor = keep_prob + torch.rand(shape, dtype=x.dtype, device=x.device)
+            binary_tensor = random_tensor.floor()
+            return x.div(keep_prob) * binary_tensor
+        # Packed path: x is [1, N, D]. Sample one decision per original event,
+        # then gather to tokens by doc_id so every token from an event shares it
+        # — matching the per-event granularity of the padded path.
+        event_mask = (keep_prob + torch.rand((num_docs, 1), dtype=x.dtype, device=x.device)).floor().div(keep_prob)
+        token_mask = event_mask.index_select(0, doc_id).unsqueeze(0)  # [1, N, 1]
+        return x * token_mask
 
 class RoPE4D(nn.Module):
     """
@@ -171,7 +184,8 @@ class SwiGLU(nn.Module):
 class NeptuneTransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1,
                  layer_norm_eps=1e-5, bias=True, ff_bias=False, qk_norm=True,
-                 rope_scales=(1.0, 1.0, 1.0, 0.2), rope_base=10000, drop_path_rate=0.0):
+                 rope_scales=(1.0, 1.0, 1.0, 0.2), rope_base=10000, drop_path_rate=0.0,
+                 layerscale_init=1e-5):
         super().__init__()
         self.d_model = d_model
         self.nhead = nhead
@@ -202,8 +216,9 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         self.rope = RoPE4D(dim=self.head_dim, scales=rope_scales, base=rope_base)
 
         # LayerScale: learnable per-channel scaling for residual branches
-        self.gamma_1 = nn.Parameter(1e-5 * torch.ones(d_model))
-        self.gamma_2 = nn.Parameter(1e-5 * torch.ones(d_model))
+        self.layerscale_init = layerscale_init
+        self.gamma_1 = nn.Parameter(layerscale_init * torch.ones(d_model))
+        self.gamma_2 = nn.Parameter(layerscale_init * torch.ones(d_model))
 
         # Store hyperparameters for cloning
         self.layer_norm_eps = layer_norm_eps
@@ -231,8 +246,27 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         if self.out_proj.bias is not None:
             nn.init.zeros_(self.out_proj.bias)
 
+    def _attn(self, q, k, v, attn_mask, block_mask):
+        """Self-attention dispatch.
+
+        ``block_mask`` (a flex BlockMask) selects the packed/varlen path used on
+        GPU — block-diagonal attention over a single packed sequence. Otherwise
+        the standard padded SDPA path runs. Note: the flex path has no
+        attention-matrix dropout (flex_attention exposes none); the residual
+        dropout outside this call still applies on both paths.
+        """
+        if block_mask is not None:
+            return flex_attention(q, k, v, block_mask=block_mask)
+        return F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=self.attn_dropout if self.training else 0.0,
+            is_causal=False,
+        )
+
     def forward(self, src, centroids, src_key_padding_mask=None,
-                rope_tables=None, attn_mask=None):
+                rope_tables=None, attn_mask=None, block_mask=None,
+                doc_id=None, num_docs=None):
         batch_size, seq_len, _ = src.shape
 
         # Self-attention block with pre-norm
@@ -255,16 +289,12 @@ class NeptuneTransformerEncoderLayer(nn.Module):
 
         # Use the pre-built mask from the encoder when available; otherwise
         # build one from the per-layer key-padding mask (single-layer callers).
-        if attn_mask is None:
+        # Skipped entirely on the packed path, which masks via block_mask.
+        if attn_mask is None and block_mask is None:
             attn_mask = self._prepare_attention_mask(src_key_padding_mask, q.device)
 
-        # Apply attention
-        attn_output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            dropout_p=self.attn_dropout if self.training else 0.0,
-            is_causal=False
-        )
+        # Apply attention (padded SDPA or packed block-diagonal flex)
+        attn_output = self._attn(q, k, v, attn_mask, block_mask)
 
         # Reshape and project output
         attn_output = attn_output.transpose(1, 2)  # (B, S, H, D)
@@ -272,12 +302,12 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         attn_output = self.out_proj(attn_output)
 
         # Residual connection with LayerScale
-        x = x + self.drop_path1(self.dropout(self.gamma_1 * attn_output))
+        x = x + self.drop_path1(self.dropout(self.gamma_1 * attn_output), doc_id, num_docs)
 
         # FFN block with pre-norm
         x_norm = self.norm2(x)
         ff_output = self.ffn(x_norm)
-        x = x + self.drop_path2(self.gamma_2 * ff_output)
+        x = x + self.drop_path2(self.gamma_2 * ff_output, doc_id, num_docs)
 
         return x
     
@@ -322,12 +352,14 @@ class NeptuneTransformerEncoder(nn.Module):
                 rope_scales=module.rope_scales,
                 rope_base=module.rope_base,
                 drop_path_rate=drop_path_rate,
+                layerscale_init=module.layerscale_init,
             )
         else:
             import copy
             return copy.deepcopy(module)
 
-    def forward(self, src, centroids, src_key_padding_mask=None):
+    def forward(self, src, centroids, src_key_padding_mask=None, block_mask=None,
+                doc_id=None, num_docs=None):
         # All layers share the same (dim, scales, base) RoPE parameters and
         # receive the same centroids, so the cos/sin tables are identical.
         # Pre-cast tables to src.dtype so per-layer rotation skips the fp32
@@ -337,10 +369,11 @@ class NeptuneTransformerEncoder(nn.Module):
             first.rope.compute_tables(centroids, dtype=src.dtype)
             if first is not None else None
         )
-        # Build the SDPA mask once instead of rebuilding it per layer.
+        # Build the SDPA mask once instead of rebuilding it per layer. On the
+        # packed path attention is masked by block_mask, so no SDPA mask is built.
         attn_mask = (
             first._prepare_attention_mask(src_key_padding_mask, src.device)
-            if first is not None else None
+            if first is not None and block_mask is None else None
         )
 
         output = src
@@ -350,6 +383,9 @@ class NeptuneTransformerEncoder(nn.Module):
                 centroids,
                 rope_tables=rope_tables,
                 attn_mask=attn_mask,
+                block_mask=block_mask,
+                doc_id=doc_id,
+                num_docs=num_docs,
             )
 
         if self.norm is not None:

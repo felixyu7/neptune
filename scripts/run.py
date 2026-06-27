@@ -138,6 +138,8 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     k_neighbors = model_opts.get("k_neighbors", 8)
     tokenizer_kwargs = model_opts.get("tokenizer_kwargs")
     pool_type = model_opts.get("pool_type", "mean")
+    layerscale_init = model_opts.get("layerscale_init", 1e-5)
+    attn_impl = model_opts.get("attn_impl", "auto")
 
     # The encoder is auto-compiled inside NeptuneModel for faster train/inference
     # (lazy; falls back to uncompiled on failure). Disable with
@@ -155,6 +157,8 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         k_neighbors=k_neighbors,
         tokenizer_kwargs=tokenizer_kwargs,
         pool_type=pool_type,
+        layerscale_init=layerscale_init,
+        attn_impl=attn_impl,
         compile_encoder=model_opts.get("compile_encoder", True),
         compile_options=model_opts.get("compile_options"),
     )
