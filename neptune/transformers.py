@@ -47,6 +47,58 @@ class DropPath(nn.Module):
         token_mask = event_mask.index_select(0, doc_id).unsqueeze(0)  # [1, N, 1]
         return x * token_mask
 
+
+class FourierPositionEncoder(nn.Module):
+    """Absolute position encoding via log-spaced sinusoidal (Fourier) features.
+
+    Lifts the spatial coordinates (x, y, z) through sin/cos at multiple
+    log-spaced frequencies before a small MLP, mitigating the spectral bias of a
+    raw-coordinate MLP (Tancik et al. 2020 / NeRF) so the encoder can represent
+    sharp position dependence (boundaries, depth structure). Time is dropped:
+    events are time-centered so absolute t is ~meaningless, and relative time is
+    handled by RoPE in attention. It is a pure, deterministic function of
+    position (identical for MC and data) and runs eagerly outside the compiled
+    encoder, so there are no torch.compile/dynamic-shape concerns.
+    """
+
+    def __init__(self, token_dim, in_dim=3, num_bands=20, freq_min=3.0,
+                 freq_max=180.0, axis_scales=(1.0, 1.0, 1.0), dropout=0.1):
+        super().__init__()
+        assert num_bands >= 1, f"num_bands must be >= 1 (got {num_bands})"
+        assert len(axis_scales) == in_dim, (
+            f"axis_scales must have length in_dim={in_dim} (got {len(axis_scales)})"
+        )
+        self.in_dim = in_dim
+        self.num_bands = num_bands
+
+        # Log-spaced angular frequencies in [freq_min, freq_max] (rad per coord unit).
+        if num_bands == 1:
+            freqs = torch.tensor([float(freq_min)])
+        else:
+            exponents = torch.arange(num_bands, dtype=torch.float32) / (num_bands - 1)
+            freqs = float(freq_min) * (float(freq_max) / float(freq_min)) ** exponents
+        self.register_buffer("freqs", freqs)                                   # (num_bands,)
+        self.register_buffer("axis_scales",
+                             torch.tensor(axis_scales, dtype=torch.float32))   # (in_dim,)
+
+        feat_dim = in_dim * num_bands * 2  # sin + cos per (axis, band)
+        self.mlp = nn.Sequential(
+            nn.Linear(feat_dim, token_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(token_dim, token_dim),
+        )
+
+    def forward(self, coords):
+        # coords: (B, S, >=in_dim); use only the first in_dim axes (drops time).
+        # Trig in fp32 for accuracy; the MLP follows the surrounding autocast dtype.
+        xyz = coords[..., :self.in_dim].float()                            # (B, S, in_dim)
+        scaled = self.freqs.unsqueeze(0) * self.axis_scales.unsqueeze(1)   # (in_dim, num_bands)
+        ang = xyz.unsqueeze(-1) * scaled                                   # (B, S, in_dim, num_bands)
+        feats = torch.cat([ang.sin(), ang.cos()], dim=-1).flatten(-2)      # (B, S, in_dim*2*num_bands)
+        return self.mlp(feats)
+
+
 class RoPE4D(nn.Module):
     """
     4D Rotary Position Embedding for (x, y, z, t) coordinates.
@@ -184,7 +236,7 @@ class SwiGLU(nn.Module):
 class NeptuneTransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward, dropout=0.1,
                  layer_norm_eps=1e-5, bias=True, ff_bias=False, qk_norm=True,
-                 rope_scales=(1.0, 1.0, 1.0, 0.2), rope_base=10000, drop_path_rate=0.0,
+                 rope_scales=(180.0, 180.0, 180.0, 40.0), rope_base=60, drop_path_rate=0.0,
                  layerscale_init=1e-5):
         super().__init__()
         self.d_model = d_model

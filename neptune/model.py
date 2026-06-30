@@ -13,6 +13,7 @@ from .transformers import (
     NeptuneTransformerEncoder,
     NeptuneTransformerEncoderLayer,
     RMSNorm,
+    FourierPositionEncoder,
 )
 from .tokenizer import FPSTokenizer
 from .packing import pack, build_block_mask, unpack, FLEX_AVAILABLE
@@ -60,6 +61,12 @@ class PointTransformerEncoder(nn.Module):
         pool_type="mean",
         layerscale_init=1e-5,
         attn_impl="auto",
+        fourier_num_bands=20,
+        fourier_freq_min=3.0,
+        fourier_freq_max=180.0,
+        fourier_axis_scales=(1.0, 1.0, 1.0),
+        rope_scales=(180.0, 180.0, 180.0, 40.0),
+        rope_base=60,
     ):
         super().__init__()
         self.token_dim = token_dim
@@ -80,15 +87,21 @@ class PointTransformerEncoder(nn.Module):
             dropout=dropout,
             drop_path_rate=0.0,
             layerscale_init=layerscale_init,
+            rope_scales=rope_scales,
+            rope_base=rope_base,
         )
-        self.centroid_mlp = nn.Sequential(
-            nn.Linear(4, token_dim // 2),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(token_dim // 2, token_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(token_dim, token_dim),
+        # Absolute position encoding: log-spaced Fourier (sinusoidal) features on
+        # (x,y,z). Time is dropped — events are time-centered, so absolute t is
+        # ~meaningless and RoPE handles relative time. The full 4D centroids are
+        # passed in; the encoder slices off time internally.
+        self.abs_pos_encoder = FourierPositionEncoder(
+            token_dim,
+            in_dim=3,
+            num_bands=fourier_num_bands,
+            freq_min=fourier_freq_min,
+            freq_max=fourier_freq_max,
+            axis_scales=fourier_axis_scales,
+            dropout=dropout,
         )
         self.layers = NeptuneTransformerEncoder(
             enc_layer,
@@ -134,7 +147,7 @@ class PointTransformerEncoder(nn.Module):
 
     def forward(self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor] = None) -> Tensor:
         # Run encoder with centroid-aware inputs (absolute position embedding)
-        centroid_emb = self.centroid_mlp(centroids.to(tokens.dtype))
+        centroid_emb = self.abs_pos_encoder(centroids.to(tokens.dtype))
         if masks is not None:
             centroid_emb = centroid_emb * masks.to(dtype=centroid_emb.dtype).unsqueeze(-1)
         x = self._encode(tokens + centroid_emb, centroids, masks)
@@ -171,6 +184,12 @@ class NeptuneModel(nn.Module):
         pool_type: str = "mean",
         layerscale_init: float = 1e-5,
         attn_impl: str = "auto",
+        fourier_num_bands: int = 20,
+        fourier_freq_min: float = 3.0,
+        fourier_freq_max: float = 180.0,
+        fourier_axis_scales: tuple = (1.0, 1.0, 1.0),
+        rope_scales: tuple = (180.0, 180.0, 180.0, 40.0),
+        rope_base: int = 60,
         compile_encoder: bool = True,
         compile_options: Optional[Dict[str, Any]] = None,
     ):
@@ -200,6 +219,12 @@ class NeptuneModel(nn.Module):
             pool_type=pool_type,
             layerscale_init=layerscale_init,
             attn_impl=attn_impl,
+            fourier_num_bands=fourier_num_bands,
+            fourier_freq_min=fourier_freq_min,
+            fourier_freq_max=fourier_freq_max,
+            fourier_axis_scales=fourier_axis_scales,
+            rope_scales=rope_scales,
+            rope_base=rope_base,
         )
         self.head = nn.Sequential(
             nn.Linear(token_dim, token_dim),

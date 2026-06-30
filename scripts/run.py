@@ -72,11 +72,6 @@ def normalize_config(cfg: Dict[str, Any]) -> None:
         raise ValueError(f"precision must be one of {sorted(allowed_precisions)}, got {precision}")
     training_opts["precision"] = precision
 
-    schedule = training_opts.pop("lr_schedule", None)
-    if schedule is not None and "T_max" not in training_opts:
-        if isinstance(schedule, (list, tuple)) and len(schedule) > 1:
-            training_opts["T_max"] = schedule[1]
-
 
 def select_device(cfg: Dict[str, Any]) -> torch.device:
     accelerator = cfg.get("accelerator", "cpu").lower()
@@ -141,6 +136,14 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     layerscale_init = model_opts.get("layerscale_init", 1e-5)
     attn_impl = model_opts.get("attn_impl", "auto")
 
+    # Positional-encoding knobs (geometry-derived defaults live in the model).
+    fourier_num_bands = model_opts.get("fourier_num_bands", 20)
+    fourier_freq_min = model_opts.get("fourier_freq_min", 3.0)
+    fourier_freq_max = model_opts.get("fourier_freq_max", 180.0)
+    fourier_axis_scales = tuple(model_opts.get("fourier_axis_scales", (1.0, 1.0, 1.0)))
+    rope_base = model_opts.get("rope_base", 60)
+    rope_scales = tuple(model_opts.get("rope_scales", (180.0, 180.0, 180.0, 40.0)))
+
     # The encoder is auto-compiled inside NeptuneModel for faster train/inference
     # (lazy; falls back to uncompiled on failure). Disable with
     # `compile_encoder: false` or tune via `compile_options: {mode, dynamic}`.
@@ -159,6 +162,12 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         pool_type=pool_type,
         layerscale_init=layerscale_init,
         attn_impl=attn_impl,
+        fourier_num_bands=fourier_num_bands,
+        fourier_freq_min=fourier_freq_min,
+        fourier_freq_max=fourier_freq_max,
+        fourier_axis_scales=fourier_axis_scales,
+        rope_scales=rope_scales,
+        rope_base=rope_base,
         compile_encoder=model_opts.get("compile_encoder", True),
         compile_options=model_opts.get("compile_options"),
     )
