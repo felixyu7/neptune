@@ -449,7 +449,7 @@ def build_metric_function(model_opts: Dict[str, Any]):
                 return metrics
 
             fpr, tpr, thr = roc_curve(targets, probs)
-            metrics["auc_roc"] = float(np.trapz(tpr, fpr))
+            metrics["auc_roc"] = float(np.trapezoid(tpr, fpr))
 
             # TPR at target FPRs via ROC interpolation (matches BDT-side fix for
             # tie-inflation artifact from threshold-based quantile computations).
@@ -465,7 +465,7 @@ def build_metric_function(model_opts: Dict[str, Any]):
             mask = fpr <= alpha_fpr
             fpr_tail = np.concatenate([fpr[mask], [alpha_fpr]])
             tpr_tail = np.concatenate([tpr[mask], [np.interp(alpha_fpr, fpr, tpr)]])
-            metrics["pauc_fpr_le_1e-4"] = float(np.trapz(tpr_tail, fpr_tail) / alpha_fpr)
+            metrics["pauc_fpr_le_1e-4"] = float(np.trapezoid(tpr_tail, fpr_tail) / alpha_fpr)
 
             # Threshold at FPR=1e-4 (well-resolved diagnostic operating point).
             idx_4 = int(np.searchsorted(fpr, 1e-4))

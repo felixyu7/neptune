@@ -227,9 +227,10 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         self.rope_scales = rope_scales
         self.rope_base = rope_base
 
-        # Dropout
+        # Dropout (residual-branch only; attention-matrix dropout is intentionally
+        # unused — flex_attention can't express it, so dropping it keeps the
+        # packed and padded paths regularized identically).
         self.dropout = nn.Dropout(dropout)
-        self.attn_dropout = dropout
         self.drop_path1 = DropPath(drop_path_rate)
         self.drop_path2 = DropPath(drop_path_rate)
         self.drop_path_rate = drop_path_rate
@@ -251,16 +252,16 @@ class NeptuneTransformerEncoderLayer(nn.Module):
 
         ``block_mask`` (a flex BlockMask) selects the packed/varlen path used on
         GPU — block-diagonal attention over a single packed sequence. Otherwise
-        the standard padded SDPA path runs. Note: the flex path has no
-        attention-matrix dropout (flex_attention exposes none); the residual
-        dropout outside this call still applies on both paths.
+        the standard padded SDPA path runs. Attention-matrix dropout is not used
+        on either path (flex_attention can't express it), so the two paths stay
+        identically regularized; residual/FFN dropout and DropPath still apply.
         """
         if block_mask is not None:
             return flex_attention(q, k, v, block_mask=block_mask)
         return F.scaled_dot_product_attention(
             q, k, v,
             attn_mask=attn_mask,
-            dropout_p=self.attn_dropout if self.training else 0.0,
+            dropout_p=0.0,
             is_causal=False,
         )
 

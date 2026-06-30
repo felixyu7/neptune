@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any
 
 from .transformers import (
     NeptuneTransformerEncoder,
@@ -213,7 +213,6 @@ class NeptuneModel(nn.Module):
         # device, and falls back to the uncompiled encoder if it ever fails —
         # so any caller, including downstream inference pipelines, gets the
         # speedup for free with no code changes and no risk of a hard failure.
-        self._encoder_compile_guard = False
         self.encoder_compiled = False
         if compile_encoder:
             self.encoder_compiled = self.compile_encoder(**(compile_options or {}))
@@ -232,29 +231,34 @@ class NeptuneModel(nn.Module):
         return self.head(global_feat)
 
     def _run_encoder(self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor]) -> Tensor:
-        """Run the encoder, guarding the first compiled call so a backend
-        failure at runtime falls back to the uncompiled encoder instead of
-        crashing. The guard cost is paid only on the very first forward."""
-        if self._encoder_compile_guard:
-            self._encoder_compile_guard = False
+        """Run the encoder, guarding every compiled call so a backend failure at
+        runtime falls back to the uncompiled encoder instead of crashing.
+
+        The guard stays armed (not just on the first forward) because lazy +
+        dynamic compilation traces each distinct path on first use: a dense first
+        batch compiles the padded path, while the packed/flex path only compiles
+        when a later sparse batch hits it. Wrapping every call until the first
+        failure (after which compile is disabled, so the wrapper is skipped)
+        catches that deferred failure too. try/except is free on the happy path."""
+        if not self.encoder_compiled:
+            return self.encoder(tokens, centroids, masks)
+        try:
+            return self.encoder(tokens, centroids, masks)
+        except Exception as exc:  # compile/backend failure at runtime
+            warnings.warn(
+                f"Neptune encoder torch.compile failed at runtime "
+                f"({type(exc).__name__}: {exc}); falling back to the "
+                "uncompiled encoder."
+            )
+            self.encoder_compiled = False
+            # Route "auto" back to padded SDPA: eager flex would OOM on large
+            # packed batches, so the retry must not stay on packed.
+            self.encoder.packed_flex_ready = False
             try:
-                return self.encoder(tokens, centroids, masks)
-            except Exception as exc:  # compile/backend failure on first use
-                warnings.warn(
-                    f"Neptune encoder torch.compile failed at runtime "
-                    f"({type(exc).__name__}: {exc}); falling back to the "
-                    "uncompiled encoder."
-                )
-                self.encoder_compiled = False
-                # Route "auto" back to padded SDPA: eager flex would OOM on
-                # large packed batches, so the retry must not stay on packed.
-                self.encoder.packed_flex_ready = False
-                try:
-                    self.encoder.layers._compiled_call_impl = None  # revert to eager
-                except Exception:
-                    pass
-                return self.encoder(tokens, centroids, masks)
-        return self.encoder(tokens, centroids, masks)
+                self.encoder.layers._compiled_call_impl = None  # revert to eager
+            except Exception:
+                pass
+            return self.encoder(tokens, centroids, masks)
 
     def compile_encoder(self, mode: str = "default", dynamic: bool = True,
                         **compile_kwargs: Any) -> bool:
@@ -273,9 +277,9 @@ class NeptuneModel(nn.Module):
 
         Compilation is *lazy*: ``torch.compile`` traces on the first forward, so
         it targets the model's final device (e.g. after ``.to('cuda')``) rather
-        than the construction-time device. If that first compiled forward fails
-        (missing backend, lowering error, ...), the model transparently reverts
-        to the uncompiled encoder (see :meth:`_run_encoder`).
+        than the construction-time device. If any compiled forward fails at
+        runtime (missing backend, lowering error, ...), the model transparently
+        reverts to the uncompiled encoder (see :meth:`_run_encoder`).
 
         Called automatically from ``__init__`` (``compile_encoder=True``); may
         also be invoked manually.
@@ -289,7 +293,7 @@ class NeptuneModel(nn.Module):
                 "torch.compile is unavailable in this PyTorch build; "
                 "running the Neptune encoder uncompiled."
             )
-            self._encoder_compile_guard = False
+            self.encoder_compiled = False
             return False
         try:
             self.encoder.layers.compile(mode=mode, dynamic=dynamic, **compile_kwargs)
@@ -303,9 +307,10 @@ class NeptuneModel(nn.Module):
                 self.encoder.layers._compiled_call_impl = None
             except Exception:
                 pass
-            self._encoder_compile_guard = False
+            self.encoder_compiled = False
             return False
-        # Guard the first (lazy) compiled forward so a runtime failure falls back.
-        self._encoder_compile_guard = True
+        # _run_encoder guards every compiled forward so a lazy runtime failure
+        # (on either the padded or the packed/flex path) falls back to eager.
+        self.encoder_compiled = True
         self.encoder.packed_flex_ready = True
         return True

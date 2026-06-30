@@ -18,11 +18,13 @@ class FPSTokenizer(nn.Module):
                  feature_dim: int,
                  max_tokens: int = 128,
                  token_dim: int = 768,
-                 mlp_layers: List[int] = [256, 512, 768],
+                 mlp_layers: Optional[List[int]] = None,
                  k_neighbors: int = 16,
                  dropout: float = 0.0,
                  knn_pool: str = "max"):
         super().__init__()
+        if mlp_layers is None:
+            mlp_layers = [256, 512, 768]
         self.max_tokens = max_tokens
         self.token_dim = token_dim
         self.k_neighbors = k_neighbors
@@ -167,11 +169,16 @@ class FPSTokenizer(nn.Module):
         # Large batches: use fused FPS+kNN
         if has_large:
             k_global = min(self.k_neighbors, Nmax if Nmax > 0 else 1)
+            # random_start gates FPS augmentation on train mode: training draws a
+            # random seed point per call (augmentation), eval/inference uses a
+            # deterministic start so the same event always tokenizes identically
+            # (reproducible reco + stable val metrics for checkpoint selection).
             fps_idx, knn_idx = farthest_point_sampling_with_knn(
                 P[large_batch],
                 valid_mask[large_batch],
                 self.max_tokens,
-                k_global
+                k_global,
+                random_start=self.training,
             )
             cent_idx[large_batch] = fps_idx
             validK[large_batch] = torch.ones_like(fps_idx, dtype=torch.bool)

@@ -29,6 +29,15 @@ except Exception:  # pragma: no cover - older torch without flex_attention
     flex_attention = None
     FLEX_AVAILABLE = False
 
+# Compile create_block_mask once and reuse, the form the PyTorch team now
+# recommends in place of the deprecated ``_compile=True`` flag (slated for
+# removal). torch.compile is lazy + caches the artifact, so per-step block-mask
+# construction stays ~50x faster than eager (which otherwise dominates packing
+# overhead).
+_compiled_create_block_mask = (
+    torch.compile(create_block_mask) if FLEX_AVAILABLE else None
+)
+
 # Pack only when the batch is at most this full. Packing trades padded-token
 # Linear work for a less efficient attention kernel (block-diagonal flex vs the
 # padded path's batched flash): it wins below ~80% occupancy and loses a few %
@@ -72,11 +81,8 @@ def build_block_mask(doc_id: Tensor, n: int):
     def mask_mod(b, h, q_idx, kv_idx):
         return doc_id[q_idx] == doc_id[kv_idx]
 
-    # _compile=True fuses the mask construction (~50x faster than eager, which
-    # otherwise dominates per-step packing overhead).
-    return create_block_mask(
-        mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=n,
-        device=doc_id.device, _compile=True,
+    return _compiled_create_block_mask(
+        mask_mod, B=None, H=None, Q_LEN=n, KV_LEN=n, device=doc_id.device,
     )
 
 
