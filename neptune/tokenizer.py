@@ -21,7 +21,10 @@ class FPSTokenizer(nn.Module):
                  mlp_layers: Optional[List[int]] = None,
                  k_neighbors: int = 16,
                  dropout: float = 0.0,
-                 knn_pool: str = "max"):
+                 knn_pool: str = "max",
+                 rel_pos_hidden: int = 64,
+                 charge_weighted_mean: bool = True,
+                 charge_col: int = 0):
         super().__init__()
         if mlp_layers is None:
             mlp_layers = [256, 512, 768]
@@ -29,6 +32,8 @@ class FPSTokenizer(nn.Module):
         self.token_dim = token_dim
         self.k_neighbors = k_neighbors
         self.knn_pool = knn_pool
+        self.charge_weighted_mean = charge_weighted_mean
+        self.charge_col = charge_col
 
         # MLP 1: Per-point feature extraction
         mlp1 = []
@@ -47,6 +52,17 @@ class FPSTokenizer(nn.Module):
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(token_dim, token_dim)
+        )
+
+        # Relative-geometry encoder: embeds each neighbor's (dx,dy,dz,dt) offset
+        # from its centroid and adds it to the neighbor feature before kNN
+        # pooling, so a token encodes local cluster shape (otherwise lost in a
+        # pure feature max/mean). Cheap: a small MLP on the 4D offset, run only on
+        # the large-event kNN path.
+        self.rel_encoder = nn.Sequential(
+            nn.Linear(4, rel_pos_hidden),
+            nn.GELU(),
+            nn.Linear(rel_pos_hidden, token_dim),
         )
 
     @staticmethod
@@ -90,7 +106,10 @@ class FPSTokenizer(nn.Module):
         offsets = torch.cumsum(counts, dim=0) - counts                      # [B]
         pos_sorted = torch.arange(N, device=device) - offsets[b_sorted]     # [N]
 
-        # Allocate and scatter
+        # Allocate and scatter. Padding must stay zero: FPS reads these coords
+        # (masked by valid_mask, but non-finite garbage would still corrupt the
+        # distance reduction) and the small-event path gathers padded feature
+        # slots via cent_idx, so `empty` here is NOT safe.
         padded_points4 = torch.zeros(B, Nmax, 4, device=device, dtype=points4.dtype)
         padded_feats   = torch.zeros(B, Nmax, feats.size(-1), device=device, dtype=feats.dtype)
         padded_points4[b_sorted, pos_sorted] = p_sorted
@@ -137,8 +156,15 @@ class FPSTokenizer(nn.Module):
         # MLP 1: Per-point feature extraction
         point_feats = self.mlp1(features)  # [N, token_dim]
 
+        # Carry a per-DOM charge weight (col `charge_col`, already log1p-scaled and
+        # >= 0) through packing as one extra channel so kNN pooling can weight by
+        # charge; split back off after padding.
+        charge_w = features[:, self.charge_col:self.charge_col + 1]   # [N, 1]
+        feats_aug = torch.cat([point_feats, charge_w], dim=-1)        # [N, token_dim+1]
+
         # Pack to padded [B, Nmax, *]
-        P, Fp, valid_mask, counts, counts_list = self._pack_flat_to_padded(points4, point_feats, batch_idx)
+        P, Fp_aug, valid_mask, counts, counts_list = self._pack_flat_to_padded(points4, feats_aug, batch_idx)
+        Fp = Fp_aug[..., :self.token_dim]
         B, Nmax, _ = P.shape
 
         # Identify small vs large batches. The boolean tensors are used for
@@ -151,9 +177,11 @@ class FPSTokenizer(nn.Module):
         has_large = any(c > self.max_tokens for c in counts_list)
         n_small = sum(c <= self.max_tokens for c in counts_list)  # host-side count for shapes
 
-        # Initialize centroid indices and validity masks
-        cent_idx = torch.zeros(B, self.max_tokens, device=device, dtype=torch.long)
-        validK = torch.zeros(B, self.max_tokens, device=device, dtype=torch.bool)
+        # Centroid indices and validity masks. Every row is written across all
+        # max_tokens slots by the small- or large-batch branch below
+        # (small ∪ large = all B), so `empty` is safe and skips a zero-fill.
+        cent_idx = torch.empty(B, self.max_tokens, device=device, dtype=torch.long)
+        validK = torch.empty(B, self.max_tokens, device=device, dtype=torch.bool)
 
         # Small batches: use all valid points (no FPS needed)
         if has_small:
@@ -190,7 +218,9 @@ class FPSTokenizer(nn.Module):
         # Get features for each centroid
         use_max_mean = self.knn_pool == "max_mean"
         feat_dim = 2 * self.token_dim if use_max_mean else self.token_dim
-        token_feats = torch.zeros(B, self.max_tokens, feat_dim, device=device, dtype=Fp.dtype)
+        # Written for all rows/slots by the small+large branches below (each writes
+        # its rows across the full max_tokens width), so `empty` is safe.
+        token_feats = torch.empty(B, self.max_tokens, feat_dim, device=device, dtype=Fp.dtype)
 
         # Small batches: direct gather (no pooling needed - transformer will mix)
         if has_small:
@@ -204,24 +234,37 @@ class FPSTokenizer(nn.Module):
 
         # Large batches: kNN pooling using neighbor indices from fused kernel
         if has_large:
-            Fp_large = Fp[large_batch]
+            # Gather the large-event subset once as the packed [features | charge]
+            # tensor, so neighbor features and charge come from a single gather.
+            Fp_aug_large = Fp_aug[large_batch]                 # [B_large, Nmax, D+1]
             valid_large = valid_mask[large_batch]
 
-            B_large = Fp_large.size(0)
+            B_large = Fp_aug_large.size(0)
             if B_large > 0:
-                Nmax_local = Fp_large.size(1)
+                Nmax_local = Fp_aug_large.size(1)
                 K_local = knn_idx.size(1)
                 k_local = knn_idx.size(2)
+                D1 = self.token_dim + 1
 
                 base_offsets = torch.arange(B_large, device=device, dtype=knn_idx.dtype)
                 base_offsets = (base_offsets * Nmax_local).view(-1, 1, 1)
                 flat_knn_idx = (knn_idx + base_offsets).reshape(-1)
 
-                Fp_flat = Fp_large.reshape(B_large * Nmax_local, self.token_dim)
-                neigh_feats = Fp_flat.index_select(0, flat_knn_idx).reshape(B_large, K_local, k_local, self.token_dim)
+                # Single fused gather of [features | charge] for every neighbor.
+                neigh_aug = Fp_aug_large.reshape(B_large * Nmax_local, D1).index_select(
+                    0, flat_knn_idx).reshape(B_large, K_local, k_local, D1)
+                neigh_feats = neigh_aug[..., :self.token_dim]
 
                 valid_flat = valid_large.reshape(B_large * Nmax_local)
                 knn_valid = valid_flat.index_select(0, flat_knn_idx).reshape(B_large, K_local, k_local)
+
+                # Relative-geometry encoding: add an embedding of each neighbor's
+                # (dx,dy,dz,dt) offset from its centroid before pooling. (Invalid
+                # neighbors are masked out below, so their offsets don't matter.)
+                P_flat = P[large_batch].reshape(B_large * Nmax_local, 4)
+                neigh_xyzt = P_flat.index_select(0, flat_knn_idx).reshape(B_large, K_local, k_local, 4)
+                rel = neigh_xyzt - cents[large_batch].unsqueeze(2)  # [B_large, K, k, 4]
+                neigh_feats = neigh_feats + self.rel_encoder(rel).to(neigh_feats.dtype)
 
                 # Max-pool across neighbors
                 neg_inf = torch.tensor(float('-inf'), device=device, dtype=neigh_feats.dtype)
@@ -230,9 +273,14 @@ class FPSTokenizer(nn.Module):
                 max_pooled = torch.where(torch.isfinite(max_pooled), max_pooled, torch.zeros_like(max_pooled))
 
                 if use_max_mean:
-                    # Mean-pool across valid neighbors
-                    valid_f = knn_valid.unsqueeze(-1).to(dtype=neigh_feats.dtype, device=device)
-                    mean_pooled = (neigh_feats * valid_f).sum(dim=2) / valid_f.sum(dim=2).clamp(min=1)
+                    # Charge-weighted mean across valid neighbors (uniform weights
+                    # when charge weighting is disabled).
+                    if self.charge_weighted_mean:
+                        knn_charge = neigh_aug[..., self.token_dim]   # [B_large, K, k]
+                        w = (knn_charge * knn_valid.to(knn_charge.dtype)).unsqueeze(-1).to(neigh_feats.dtype)
+                    else:
+                        w = knn_valid.unsqueeze(-1).to(neigh_feats.dtype)
+                    mean_pooled = (neigh_feats * w).sum(dim=2) / w.sum(dim=2).clamp(min=1e-6)
                     token_feats[large_batch] = torch.cat([max_pooled, mean_pooled.to(max_pooled.dtype)], dim=-1)
                 else:
                     token_feats[large_batch] = max_pooled
