@@ -3,16 +3,39 @@ import torch.nn as nn
 from torch import Tensor
 from typing import List, Tuple, Optional
 
-from torch_fps import farthest_point_sampling_with_knn
+from torch_fps import farthest_point_sampling, farthest_point_sampling_with_knn
+
 
 class FPSTokenizer(nn.Module):
     """
     GPU-native, vectorized FPS-based tokenizer for point clouds:
       - MLP 1: Per-point feature extraction
-      - If num_points <= max_tokens: use all points (no FPS, no kNN pooling)
-      - Else: FPS on 4D (x,y,z,t) to select centroids, then kNN pooling
+      - If num_points <= max_tokens: use all points (no FPS, no pooling)
+      - Else: FPS on 4D (x,y,z,t) to select centroids, then pool hits per token
+        by nearest-centroid (Voronoi) assignment — every hit contributes to
+        exactly one token, so no hit is ever dropped — or, in the legacy
+        ``assign_mode="knn"``, by k-nearest-neighbor gather around each centroid.
+      - Per-token summary scalars (multiplicity, total charge, time spread,
+        spatial RMS radius) are appended to the pooled features.
       - MLP 2: Token refinement (always applied for consistent depth)
+
+    The forward performs exactly one host sync (``counts.cpu().tolist()``) and
+    uses no data-dependent-shape ops (``nonzero``/boolean indexing): small and
+    large events are routed with precomputed index tensors, and only the large
+    subset is ever padded (to its own max length), so one bright event no longer
+    inflates the whole batch.
+
+    ``metric_time_scale`` weights the time axis in the FPS/assignment metric
+    only. Coordinates are in km and time in microseconds (see mmap dataloader);
+    at raw units the time axis carries ~99% of the 4D metric variance on real
+    events, so selection would cluster nearly purely by arrival time. The
+    default 0.3 km/us (light speed) balances space and time; 0.22 is the photon
+    group velocity in ice; 1.0 reproduces the legacy raw-unit metric. Returned
+    centroids, relative offsets, and summary scalars always stay in raw units —
+    the scale changes token membership, never the representation.
     """
+
+    N_EXTRA = 4  # multiplicity, total charge, time spread, RMS radius
 
     def __init__(self,
                  feature_dim: int,
@@ -24,16 +47,22 @@ class FPSTokenizer(nn.Module):
                  knn_pool: str = "max",
                  rel_pos_hidden: int = 64,
                  charge_weighted_mean: bool = True,
-                 charge_col: int = 0):
+                 charge_col: int = 0,
+                 assign_mode: str = "voronoi",
+                 metric_time_scale: float = 0.3):
         super().__init__()
         if mlp_layers is None:
             mlp_layers = [256, 512, 768]
+        if assign_mode not in ("voronoi", "knn"):
+            raise ValueError(f"assign_mode must be 'voronoi' or 'knn', got '{assign_mode}'")
         self.max_tokens = max_tokens
         self.token_dim = token_dim
         self.k_neighbors = k_neighbors
         self.knn_pool = knn_pool
         self.charge_weighted_mean = charge_weighted_mean
         self.charge_col = charge_col
+        self.assign_mode = assign_mode
+        self.metric_time_scale = metric_time_scale
 
         # MLP 1: Per-point feature extraction
         mlp1 = []
@@ -45,79 +74,49 @@ class FPSTokenizer(nn.Module):
         self.mlp1 = nn.Sequential(*mlp1)
 
         # MLP 2: Token refinement (always applied)
-        # Input dim doubles when using max+mean pooling
-        mlp2_in = 2 * token_dim if knn_pool == "max_mean" else token_dim
+        # Input dim doubles when using max+mean pooling; the per-token summary
+        # scalars are appended in both modes.
+        pooled_dim = 2 * token_dim if knn_pool == "max_mean" else token_dim
         self.mlp2 = nn.Sequential(
-            nn.Linear(mlp2_in, token_dim),
+            nn.Linear(pooled_dim + self.N_EXTRA, token_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(token_dim, token_dim)
         )
 
-        # Relative-geometry encoder: embeds each neighbor's (dx,dy,dz,dt) offset
-        # from its centroid and adds it to the neighbor feature before kNN
-        # pooling, so a token encodes local cluster shape (otherwise lost in a
-        # pure feature max/mean). Cheap: a small MLP on the 4D offset, run only on
-        # the large-event kNN path.
+        # Relative-geometry encoder: embeds each hit's (dx,dy,dz,dt) offset
+        # from its token centroid and adds it to the hit feature before pooling,
+        # so a token encodes local cluster shape (otherwise lost in a pure
+        # feature max/mean). Runs only on the large-event path.
         self.rel_encoder = nn.Sequential(
             nn.Linear(4, rel_pos_hidden),
             nn.GELU(),
             nn.Linear(rel_pos_hidden, token_dim),
         )
 
+        # Buffer (not a per-forward host tensor: that would cost a pageable
+        # H2D copy + stream sync every call).
+        self.register_buffer(
+            "metric_scale",
+            torch.tensor([1.0, 1.0, 1.0, float(metric_time_scale)]),
+            persistent=False)
+
     @staticmethod
-    def _pack_flat_to_padded(points4: Tensor,  # [N,4]
-                              feats: Tensor,   # [N,F]
-                              batch_idx: Tensor) -> Tuple[Tensor, Tensor, Tensor, Tensor, list]:
+    def _route_subset(rows_dev: Tensor, csub: Tensor, starts: Tensor,
+                      n_sub: int, device) -> Tuple[Tensor, Tensor, Tensor]:
+        """Index tensors routing a subset of events out of batch-sorted flat arrays.
+
+        Inputs are device slices of the single packed routing transfer (no
+        per-call H2D syncs, no nonzero):
+          seg:   [N_sub] subset-event id per hit
+          local: [N_sub] hit position within its event
+          src:   [N_sub] row into the batch-sorted flat arrays
         """
-        Convert flat lists to padded [B, Nmax, *] without Python loops.
-        Returns:
-          padded_points4: [B, Nmax, 4]
-          padded_feats:   [B, Nmax, F]
-          valid_mask:     [B, Nmax] (bool)
-          counts:         [B] number of points per batch
-          counts_list:    per-event counts on the host (Python list)
-
-        A single ``counts.tolist()`` host sync provides B, Nmax, and the
-        small/large split decisions, replacing the former per-use
-        ``.item()``/``.any()`` syncs (6 device syncs -> 1).
-        """
-        device = points4.device
-        if points4.numel() == 0:
-            return (torch.zeros(0, 0, 4, device=device, dtype=points4.dtype),
-                    torch.zeros(0, 0, feats.size(-1), device=device, dtype=feats.dtype),
-                    torch.zeros(0, 0, device=device, dtype=torch.bool),
-                    torch.zeros(0, device=device, dtype=torch.long),
-                    [])
-
-        counts = torch.bincount(batch_idx)                                  # [B]
-        counts_list = counts.tolist()                                       # single host sync
-        B = len(counts_list)
-        Nmax = max(counts_list)
-        N = points4.size(0)
-
-        # Sort by batch so groups are contiguous
-        sort_idx = torch.argsort(batch_idx, stable=True)
-        b_sorted  = batch_idx[sort_idx]                                     # [N]
-        p_sorted  = points4[sort_idx]                                       # [N,4]
-        f_sorted  = feats[sort_idx]                                         # [N,F]
-
-        # Position within each batch: pos = arange(N) - offsets[b_sorted]
-        offsets = torch.cumsum(counts, dim=0) - counts                      # [B]
-        pos_sorted = torch.arange(N, device=device) - offsets[b_sorted]     # [N]
-
-        # Allocate and scatter. Padding must stay zero: FPS reads these coords
-        # (masked by valid_mask, but non-finite garbage would still corrupt the
-        # distance reduction) and the small-event path gathers padded feature
-        # slots via cent_idx, so `empty` here is NOT safe.
-        padded_points4 = torch.zeros(B, Nmax, 4, device=device, dtype=points4.dtype)
-        padded_feats   = torch.zeros(B, Nmax, feats.size(-1), device=device, dtype=feats.dtype)
-        padded_points4[b_sorted, pos_sorted] = p_sorted
-        padded_feats[b_sorted, pos_sorted]   = f_sorted
-
-        # Valid mask
-        valid_mask = (torch.arange(Nmax, device=device)[None, :] < counts[:, None])  # [B,Nmax]
-        return padded_points4, padded_feats, valid_mask, counts, counts_list
+        seg = torch.repeat_interleave(
+            torch.arange(rows_dev.numel(), device=device), csub, output_size=n_sub)
+        local = torch.arange(n_sub, device=device) - (torch.cumsum(csub, 0) - csub)[seg]
+        src = starts[seg] + local
+        return seg, local, src
 
     # ---------- main forward ----------
 
@@ -142,158 +141,269 @@ class FPSTokenizer(nn.Module):
         device = coords.device
         dtype_p = coords.dtype
         dtype_f = features.dtype
+        K = self.max_tokens
+        T = self.token_dim
 
         if coords.numel() == 0:
-            empty_tokens    = torch.zeros((0, self.max_tokens, self.token_dim), device=device, dtype=features.dtype)
-            empty_centroids = torch.zeros((0, self.max_tokens, 4),              device=device, dtype=coords.dtype)
-            empty_masks     = torch.zeros((0, self.max_tokens),                 device=device, dtype=torch.bool)
+            empty_tokens    = torch.zeros((0, K, T), device=device, dtype=dtype_f)
+            empty_centroids = torch.zeros((0, K, 4), device=device, dtype=dtype_p)
+            empty_masks     = torch.zeros((0, K),    device=device, dtype=torch.bool)
             return empty_tokens, empty_centroids, empty_masks
 
         batch_idx = batch_ids.long()
-        xyz = coords[:, :3]
-        points4 = torch.cat([xyz, times], dim=-1)  # [N,4]
+        points4 = torch.cat([coords[:, :3], times], dim=-1)   # [N,4] raw units
+        point_feats = self.mlp1(features)                     # [N, T]
+        q = features[:, self.charge_col]                      # [N] log1p charge
 
-        # MLP 1: Per-point feature extraction
-        point_feats = self.mlp1(features)  # [N, token_dim]
+        # The single host sync: one D2H copy of the ids. (bincount on a CUDA
+        # tensor would itself sync — it reads max(batch_idx) on the host to
+        # size its output — so counting happens on the CPU copy instead.)
+        counts_list = torch.bincount(batch_idx.cpu()).tolist()
+        B = len(counts_list)
 
-        # Carry a per-DOM charge weight (col `charge_col`, already log1p-scaled and
-        # >= 0) through packing as one extra channel so kNN pooling can weight by
-        # charge; split back off after padding.
-        charge_w = features[:, self.charge_col:self.charge_col + 1]   # [N, 1]
-        feats_aug = torch.cat([point_feats, charge_w], dim=-1)        # [N, token_dim+1]
+        # Sort hits by batch so each event is a contiguous run.
+        sort_idx = torch.argsort(batch_idx, stable=True)
+        p_sorted = points4.index_select(0, sort_idx)
+        f_sorted = point_feats.index_select(0, sort_idx)
+        q_sorted = q.index_select(0, sort_idx)
 
-        # Pack to padded [B, Nmax, *]
-        P, Fp_aug, valid_mask, counts, counts_list = self._pack_flat_to_padded(points4, feats_aug, batch_idx)
-        Fp = Fp_aug[..., :self.token_dim]
-        B, Nmax, _ = P.shape
+        # Host-side split into small (<= K hits: every hit is a token) and
+        # large (> K: FPS + pooling) events. All routing below comes from these
+        # lists — no boolean indexing, no nonzero, no further syncs.
+        offsets: List[int] = [0] * B
+        acc = 0
+        for i, c in enumerate(counts_list):
+            offsets[i] = acc
+            acc += c
+        small_rows = [i for i, c in enumerate(counts_list) if c <= K]
+        large_rows = [i for i, c in enumerate(counts_list) if c > K]
+        counts_s = [counts_list[i] for i in small_rows]
+        counts_l = [counts_list[i] for i in large_rows]
+        B_s, B_l = len(small_rows), len(large_rows)
+        N_s, N_l = sum(counts_s), sum(counts_l)
 
-        # Identify small vs large batches. The boolean tensors are used for
-        # indexing; the host-side `has_small`/`has_large` flags (derived from the
-        # already-synced counts_list) gate the Python branches below without
-        # incurring a fresh `.any()` device sync each time.
-        small_batch = counts <= self.max_tokens
-        large_batch = ~small_batch
-        has_small = any(c <= self.max_tokens for c in counts_list)
-        has_large = any(c > self.max_tokens for c in counts_list)
-        n_small = sum(c <= self.max_tokens for c in counts_list)  # host-side count for shapes
+        # All routing metadata goes up in ONE pinned non-blocking H2D transfer;
+        # per-list torch.tensor(..., device=...) would each be a pageable copy
+        # plus a full stream sync.
+        routing_host = torch.tensor(
+            small_rows + counts_s + [offsets[r] for r in small_rows]
+            + large_rows + counts_l + [offsets[r] for r in large_rows],
+            dtype=torch.long)
+        if device.type == "cuda":
+            routing_host = routing_host.pin_memory()
+        routing = routing_host.to(device, non_blocking=True)
+        rows_s_dev, csub_s, starts_s = routing[:B_s], routing[B_s:2 * B_s], routing[2 * B_s:3 * B_s]
+        o = 3 * B_s
+        rows_l_dev, csub_l, starts_l_abs = (routing[o:o + B_l], routing[o + B_l:o + 2 * B_l],
+                                            routing[o + 2 * B_l:o + 3 * B_l])
 
-        # Centroid indices and validity masks. Every row is written across all
-        # max_tokens slots by the small- or large-batch branch below
-        # (small ∪ large = all B), so `empty` is safe and skips a zero-fill.
-        cent_idx = torch.empty(B, self.max_tokens, device=device, dtype=torch.long)
-        validK = torch.empty(B, self.max_tokens, device=device, dtype=torch.bool)
+        pooled_dim = 2 * T if self.knn_pool == "max_mean" else T
+        feat_dtype = point_feats.dtype  # autocast-aware compute dtype
 
-        # Small batches: use all valid points (no FPS needed)
-        if has_small:
-            K_eff = min(Nmax, self.max_tokens)
-            idx_range = torch.arange(K_eff, device=device)[None, :].expand(n_small, -1)
-            if K_eff < self.max_tokens:
-                pad = torch.zeros(n_small, self.max_tokens - K_eff, device=device, dtype=torch.long)
-                idx_range = torch.cat([idx_range, pad], dim=1)
-            cent_idx[small_batch] = idx_range
-            counts_small = counts[small_batch].clamp(max=self.max_tokens)
-            validK[small_batch] = torch.arange(self.max_tokens, device=device)[None, :] < counts_small[:, None]
+        pre = torch.zeros(B, K, pooled_dim + self.N_EXTRA, device=device, dtype=feat_dtype)
+        cents_out = torch.zeros(B, K, 4, device=device, dtype=dtype_p)
+        masks = torch.zeros(B, K, device=device, dtype=torch.bool)
 
-        # Large batches: use fused FPS+kNN
-        if has_large:
-            k_global = min(self.k_neighbors, Nmax if Nmax > 0 else 1)
+        # ---- small events: one hit per token, no padding, no pooling ----
+        if B_s > 0:
+            seg_s, local_s, src_s = self._route_subset(
+                rows_s_dev, csub_s, starts_s, N_s, device)
+            f_s = f_sorted.index_select(0, src_s)             # [N_s, T]
+            p_s = p_sorted.index_select(0, src_s)             # [N_s, 4]
+            q_s = q_sorted.index_select(0, src_s)             # [N_s]
+            dest = seg_s * K + local_s                        # unique: local < counts <= K
+
+            g = torch.cat([f_s, f_s], dim=-1) if self.knn_pool == "max_mean" else f_s
+            # Single point: multiplicity 1, its own charge, zero spreads.
+            zeros_s = torch.zeros_like(q_s)
+            ex_s = torch.stack(
+                [torch.full_like(q_s, 0.6931471805599453), q_s, zeros_s, zeros_s], dim=-1)
+            pre_s = torch.zeros(B_s * K, pooled_dim + self.N_EXTRA,
+                                device=device, dtype=feat_dtype)
+            pre_s.index_copy_(0, dest, torch.cat([g, ex_s.to(feat_dtype)], dim=-1))
+            cents_s = torch.zeros(B_s * K, 4, device=device, dtype=dtype_p)
+            cents_s.index_copy_(0, dest, p_s)
+
+            pre.index_copy_(0, rows_s_dev, pre_s.view(B_s, K, -1))
+            cents_out.index_copy_(0, rows_s_dev, cents_s.view(B_s, K, 4))
+            masks.index_copy_(
+                0, rows_s_dev,
+                torch.arange(K, device=device)[None, :] < csub_s[:, None])
+
+        # ---- large events: FPS centroids + per-token pooling ----
+        if B_l > 0:
+            Nmax_l = max(counts_l)
+            seg_l, local_l, src_l = self._route_subset(
+                rows_l_dev, csub_l, starts_l_abs, N_l, device)
+            f_l = f_sorted.index_select(0, src_l)             # [N_l, T]
+            p_l = p_sorted.index_select(0, src_l)             # [N_l, 4] raw
+            q_l = q_sorted.index_select(0, src_l)             # [N_l]
+            n_l = f_l.size(0)
+
+            # Metric copy for FPS/assignment: fp32, time axis scaled. Padding
+            # stays zero (finite) — the kernel masks it but must not see NaNs.
+            p_l_m = p_l.float() * self.metric_scale           # [N_l, 4]
+            P_pad_m = torch.zeros(B_l * Nmax_l, 4, device=device)
+            dest_pad = seg_l * Nmax_l + local_l
+            P_pad_m.index_copy_(0, dest_pad, p_l_m)
+            P_pad_m = P_pad_m.view(B_l, Nmax_l, 4)
+            valid_l = torch.arange(Nmax_l, device=device)[None, :] < csub_l[:, None]
+
             # random_start gates FPS augmentation on train mode: training draws a
             # random seed point per call (augmentation), eval/inference uses a
-            # deterministic start so the same event always tokenizes identically
-            # (reproducible reco + stable val metrics for checkpoint selection).
-            fps_idx, knn_idx = farthest_point_sampling_with_knn(
-                P[large_batch],
-                valid_mask[large_batch],
-                self.max_tokens,
-                k_global,
-                random_start=self.training,
-            )
-            cent_idx[large_batch] = fps_idx
-            validK[large_batch] = torch.ones_like(fps_idx, dtype=torch.bool)
+            # deterministic start so the same event always tokenizes identically.
+            # validate=False: counts > K holds by construction of the subset.
+            starts_l = torch.cumsum(csub_l, 0) - csub_l       # [B_l] into flat subset
 
-        # Gather centroids
-        gather_idx_4 = cent_idx.unsqueeze(-1).expand(-1, -1, 4)
-        cents = P.gather(dim=1, index=gather_idx_4)  # [B, max_tokens, 4]
+            if self.assign_mode == "voronoi":
+                fps_idx = farthest_point_sampling(
+                    P_pad_m, valid_l, K,
+                    random_start=self.training, validate=False)          # [B_l, K]
+                cent_flat = (starts_l[:, None] + fps_idx).reshape(-1)    # [B_l*K]
+                cents_raw = p_l.index_select(0, cent_flat)               # [B_l*K, 4]
+                cents_m = p_l_m.index_select(0, cent_flat).view(B_l, K, 4)
 
-        # Get features for each centroid
-        use_max_mean = self.knn_pool == "max_mean"
-        feat_dim = 2 * self.token_dim if use_max_mean else self.token_dim
-        # Written for all rows/slots by the small+large branches below (each writes
-        # its rows across the full max_tokens width), so `empty` is safe.
-        token_feats = torch.empty(B, self.max_tokens, feat_dim, device=device, dtype=Fp.dtype)
+                # Nearest-centroid assignment in the scaled metric: every hit
+                # joins exactly one token (coverage = 1 by construction).
+                d = (p_l_m.unsqueeze(1) - cents_m[seg_l]).pow(2).sum(-1)  # [N_l, K]
+                assign = d.argmin(dim=1)                                  # [N_l]
+                cell = seg_l * K + assign                                 # [N_l]
 
-        # Small batches: direct gather (no pooling needed - transformer will mix)
-        if has_small:
-            gather_idx_T = cent_idx[small_batch].unsqueeze(-1).expand(-1, -1, self.token_dim)
-            gathered = Fp[small_batch].gather(dim=1, index=gather_idx_T)
-            if use_max_mean:
-                # Single point: max = mean = the point itself
-                token_feats[small_batch] = torch.cat([gathered, gathered], dim=-1)
-            else:
-                token_feats[small_batch] = gathered
+                rel = p_l - cents_raw.index_select(0, cell)               # raw units
+                h = f_l + self.rel_encoder(rel).to(feat_dtype)            # [N_l, T]
 
-        # Large batches: kNN pooling using neighbor indices from fused kernel
-        if has_large:
-            # Gather the large-event subset once as the packed [features | charge]
-            # tensor, so neighbor features and charge come from a single gather.
-            Fp_aug_large = Fp_aug[large_batch]                 # [B_large, Nmax, D+1]
-            valid_large = valid_mask[large_batch]
+                cell_T = cell.unsqueeze(-1).expand(-1, T)
+                mx = torch.full((B_l * K, T), float("-inf"),
+                                device=device, dtype=h.dtype)
+                mx = mx.scatter_reduce(0, cell_T, h, reduce="amax", include_self=True)
+                mx = torch.where(torch.isfinite(mx), mx, torch.zeros_like(mx))
 
-            B_large = Fp_aug_large.size(0)
-            if B_large > 0:
-                Nmax_local = Fp_aug_large.size(1)
-                K_local = knn_idx.size(1)
-                k_local = knn_idx.size(2)
-                D1 = self.token_dim + 1
+                # fp32 accumulators for the weighted mean and summary scalars.
+                w = q_l.float() if self.charge_weighted_mean else torch.ones_like(q_l, dtype=torch.float32)
+                wsum = torch.zeros(B_l * K, device=device).scatter_add_(0, cell, w)
+                wsafe = wsum.clamp(min=1e-6)
 
-                base_offsets = torch.arange(B_large, device=device, dtype=knn_idx.dtype)
-                base_offsets = (base_offsets * Nmax_local).view(-1, 1, 1)
-                flat_knn_idx = (knn_idx + base_offsets).reshape(-1)
-
-                # Single fused gather of [features | charge] for every neighbor.
-                neigh_aug = Fp_aug_large.reshape(B_large * Nmax_local, D1).index_select(
-                    0, flat_knn_idx).reshape(B_large, K_local, k_local, D1)
-                neigh_feats = neigh_aug[..., :self.token_dim]
-
-                valid_flat = valid_large.reshape(B_large * Nmax_local)
-                knn_valid = valid_flat.index_select(0, flat_knn_idx).reshape(B_large, K_local, k_local)
-
-                # Relative-geometry encoding: add an embedding of each neighbor's
-                # (dx,dy,dz,dt) offset from its centroid before pooling. (Invalid
-                # neighbors are masked out below, so their offsets don't matter.)
-                P_flat = P[large_batch].reshape(B_large * Nmax_local, 4)
-                neigh_xyzt = P_flat.index_select(0, flat_knn_idx).reshape(B_large, K_local, k_local, 4)
-                rel = neigh_xyzt - cents[large_batch].unsqueeze(2)  # [B_large, K, k, 4]
-                neigh_feats = neigh_feats + self.rel_encoder(rel).to(neigh_feats.dtype)
-
-                # Max-pool across neighbors
-                neg_inf = torch.tensor(float('-inf'), device=device, dtype=neigh_feats.dtype)
-                masked_neigh = neigh_feats.masked_fill(~knn_valid.unsqueeze(-1), neg_inf)
-                max_pooled = masked_neigh.max(dim=2).values  # [B_large, K, T]
-                max_pooled = torch.where(torch.isfinite(max_pooled), max_pooled, torch.zeros_like(max_pooled))
-
-                if use_max_mean:
-                    # Charge-weighted mean across valid neighbors (uniform weights
-                    # when charge weighting is disabled).
-                    if self.charge_weighted_mean:
-                        knn_charge = neigh_aug[..., self.token_dim]   # [B_large, K, k]
-                        w = (knn_charge * knn_valid.to(knn_charge.dtype)).unsqueeze(-1).to(neigh_feats.dtype)
-                    else:
-                        w = knn_valid.unsqueeze(-1).to(neigh_feats.dtype)
-                    mean_pooled = (neigh_feats * w).sum(dim=2) / w.sum(dim=2).clamp(min=1e-6)
-                    token_feats[large_batch] = torch.cat([max_pooled, mean_pooled.to(max_pooled.dtype)], dim=-1)
+                if self.knn_pool == "max_mean":
+                    hw = h.float() * w[:, None]
+                    hsum = torch.zeros(B_l * K, T, device=device).scatter_add_(0, cell_T, hw)
+                    mean = (hsum / wsafe[:, None]).to(h.dtype)
+                    pooled_l = torch.cat([mx, mean], dim=-1)
                 else:
-                    token_feats[large_batch] = max_pooled
+                    pooled_l = mx
+
+                ones_h = torch.ones(n_l, device=device)
+                n_c = torch.zeros(B_l * K, device=device).scatter_add_(0, cell, ones_h)
+                mult = torch.log1p(n_c)
+                q_phys = torch.expm1(q_l.float().clamp(min=0))
+                Q = torch.log1p(torch.zeros(B_l * K, device=device)
+                                .scatter_add_(0, cell, q_phys))
+                dt = rel[:, 3].float()
+                m1 = torch.zeros(B_l * K, device=device).scatter_add_(0, cell, w * dt) / wsafe
+                m2 = torch.zeros(B_l * K, device=device).scatter_add_(0, cell, w * dt * dt) / wsafe
+                # clamp INSIDE the sqrt: single-hit cells have exactly-zero
+                # variance/radius and sqrt'(0)=inf would NaN the backward.
+                dt_std = (m2 - m1 * m1).clamp(min=1e-12).sqrt()
+                r2 = torch.zeros(B_l * K, device=device).scatter_add_(
+                    0, cell, rel[:, :3].float().pow(2).sum(-1))
+                rms = (r2 / n_c.clamp(min=1)).clamp(min=1e-12).sqrt()
+                ex_l = torch.stack([mult, Q, dt_std, rms], dim=-1)        # [B_l*K, 4]
+
+                pre_l = torch.cat([pooled_l, ex_l.to(feat_dtype)], dim=-1)
+                cents_l_out = cents_raw
+
+            else:  # assign_mode == "knn" (legacy A/B path)
+                pre_l, cents_l_out = self._knn_pool_large(
+                    P_pad_m, valid_l, p_l, f_l, q_l, starts_l,
+                    B_l, Nmax_l, dest_pad, feat_dtype)
+
+            pre.index_copy_(0, rows_l_dev, pre_l.view(B_l, K, -1))
+            cents_out.index_copy_(0, rows_l_dev, cents_l_out.view(B_l, K, 4).to(dtype_p))
+            masks.index_copy_(
+                0, rows_l_dev, torch.ones(B_l, K, device=device, dtype=torch.bool))
 
         # MLP 2: Always apply token refinement (consistent depth)
-        token_feats = self.mlp2(token_feats)  # [B, max_tokens, token_dim]
-
-        tokens = token_feats
-        centroids = cents
-        masks = validK
+        tokens = self.mlp2(pre)                               # [B, K, T]
 
         # Zero out padded positions
         tokens = tokens * masks.unsqueeze(-1)
-        centroids = centroids * masks.unsqueeze(-1)
+        cents_out = cents_out * masks.unsqueeze(-1)
 
-        return tokens.to(dtype_f), centroids.to(dtype_p), masks
+        return tokens.to(dtype_f), cents_out, masks
+
+    def _knn_pool_large(self, P_pad_m: Tensor, valid_l: Tensor, p_l: Tensor,
+                        f_l: Tensor, q_l: Tensor, starts_l: Tensor,
+                        B_l: int, Nmax_l: int, dest_pad: Tensor,
+                        feat_dtype) -> Tuple[Tensor, Tensor]:
+        """Legacy fused FPS+kNN pooling on the (already padded) large subset.
+
+        Mirrors the pre-Voronoi implementation exactly — same gather, relative
+        encoding, and masked max / charge-weighted mean — with the per-token
+        summary scalars computed from the kNN sets so the mlp2 contract matches
+        the voronoi path.
+        """
+        device = p_l.device
+        K = self.max_tokens
+        T = self.token_dim
+        k_global = min(self.k_neighbors, Nmax_l)
+
+        fps_idx, knn_idx = farthest_point_sampling_with_knn(
+            P_pad_m, valid_l, K, k_global,
+            random_start=self.training, validate=False)       # [B_l,K], [B_l,K,k]
+
+        cent_flat = (starts_l[:, None] + fps_idx).reshape(-1)
+        cents_raw = p_l.index_select(0, cent_flat)            # [B_l*K, 4]
+
+        # Padded [features | charge] and geometry for neighbor gathers.
+        Faug_pad = torch.zeros(B_l * Nmax_l, T + 1, device=device, dtype=feat_dtype)
+        Faug_pad.index_copy_(0, dest_pad, torch.cat(
+            [f_l, q_l.unsqueeze(-1).to(feat_dtype)], dim=-1))
+        P_pad_raw = torch.zeros(B_l * Nmax_l, 4, device=device, dtype=p_l.dtype)
+        P_pad_raw.index_copy_(0, dest_pad, p_l)
+
+        k_local = knn_idx.size(2)
+        base = (torch.arange(B_l, device=device, dtype=knn_idx.dtype) * Nmax_l)
+        flat_knn = (knn_idx + base.view(-1, 1, 1)).reshape(-1)
+
+        neigh_aug = Faug_pad.index_select(0, flat_knn).reshape(B_l, K, k_local, T + 1)
+        neigh_feats = neigh_aug[..., :T]
+        knn_valid = valid_l.reshape(-1).index_select(0, flat_knn).reshape(B_l, K, k_local)
+
+        neigh_xyzt = P_pad_raw.index_select(0, flat_knn).reshape(B_l, K, k_local, 4)
+        rel = neigh_xyzt - cents_raw.view(B_l, K, 1, 4)
+        neigh_feats = neigh_feats + self.rel_encoder(rel).to(neigh_feats.dtype)
+
+        masked = neigh_feats.masked_fill(~knn_valid.unsqueeze(-1), float("-inf"))
+        mx = masked.max(dim=2).values
+        mx = torch.where(torch.isfinite(mx), mx, torch.zeros_like(mx))
+
+        knn_charge = neigh_aug[..., T]                        # [B_l, K, k]
+        if self.charge_weighted_mean:
+            w = (knn_charge * knn_valid.to(knn_charge.dtype)).unsqueeze(-1)
+        else:
+            w = knn_valid.unsqueeze(-1).to(neigh_feats.dtype)
+        if self.knn_pool == "max_mean":
+            mean = (neigh_feats * w).sum(dim=2) / w.sum(dim=2).clamp(min=1e-6)
+            pooled = torch.cat([mx, mean.to(mx.dtype)], dim=-1)
+        else:
+            pooled = mx
+
+        # Summary scalars over the kNN sets (fp32), matching the voronoi
+        # definitions so mlp2 sees a consistent layout across modes.
+        vf = knn_valid.float()
+        n_c = vf.sum(dim=2)                                   # [B_l, K]
+        mult = torch.log1p(n_c)
+        Q = torch.log1p((torch.expm1(knn_charge.float().clamp(min=0)) * vf).sum(dim=2))
+        wq = (knn_charge.float() * vf) if self.charge_weighted_mean else vf
+        wsafe = wq.sum(dim=2).clamp(min=1e-6)
+        dt = rel[..., 3].float()
+        m1 = (wq * dt).sum(dim=2) / wsafe
+        m2 = (wq * dt * dt).sum(dim=2) / wsafe
+        # clamp INSIDE the sqrt: sqrt'(0)=inf would NaN the backward on
+        # single-neighbor tokens (see voronoi path).
+        dt_std = (m2 - m1 * m1).clamp(min=1e-12).sqrt()
+        r2 = (rel[..., :3].float().pow(2).sum(-1) * vf).sum(dim=2)
+        rms = (r2 / n_c.clamp(min=1)).clamp(min=1e-12).sqrt()
+        ex = torch.stack([mult, Q, dt_std, rms], dim=-1)      # [B_l, K, 4]
+
+        pre_l = torch.cat([pooled, ex.to(feat_dtype)], dim=-1).view(B_l * K, -1)
+        return pre_l, cents_raw

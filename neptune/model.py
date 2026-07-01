@@ -192,8 +192,11 @@ class NeptuneModel(nn.Module):
         rope_base: int = 60,
         compile_encoder: bool = True,
         compile_options: Optional[Dict[str, Any]] = None,
+        compile_strict: bool = False,
     ):
         super().__init__()
+        self.compile_strict = compile_strict
+        self.compile_fallback = False
         tokenizer_cfg: Dict[str, Any] = dict(tokenizer_kwargs or {})
         mlp_layers_cfg = tokenizer_cfg.pop("mlp_layers", [256, 512, 768])
 
@@ -226,8 +229,12 @@ class NeptuneModel(nn.Module):
             rope_scales=rope_scales,
             rope_base=rope_base,
         )
+        # +2: event-level scalars (log token multiplicity, log total charge)
+        # concatenated onto the pooled feature — both pooling modes normalize
+        # event size and total light yield away, yet they carry direct signal
+        # (energy above all).
         self.head = nn.Sequential(
-            nn.Linear(token_dim, token_dim),
+            nn.Linear(token_dim + 2, token_dim),
             nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(token_dim, output_dim)
@@ -253,7 +260,20 @@ class NeptuneModel(nn.Module):
 
         tokens, centroids, masks = self.tokenizer(spatial, features, batch_ids, times)
         global_feat = self._run_encoder(tokens, centroids, masks)
-        return self.head(global_feat)
+
+        # Event-level scalars the pooling normalizes away: valid-token
+        # multiplicity and total physical charge (feature charge_col is
+        # log1p-scaled per DOM; expm1-sum-log1p yields the event total).
+        B = tokens.size(0)
+        n_tok = masks.sum(dim=1).float()
+        q_phys = torch.expm1(
+            features[:, self.tokenizer.charge_col].float().clamp(min=0))
+        tot_q = torch.zeros(B, device=tokens.device).scatter_add_(
+            0, batch_ids.long(), q_phys)
+        extras = torch.stack(
+            [torch.log1p(n_tok), torch.log1p(tot_q)], dim=-1).to(global_feat.dtype)
+
+        return self.head(torch.cat([global_feat, extras], dim=-1))
 
     def _run_encoder(self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor]) -> Tensor:
         """Run the encoder, guarding every compiled call so a backend failure at
@@ -270,11 +290,21 @@ class NeptuneModel(nn.Module):
         try:
             return self.encoder(tokens, centroids, masks)
         except Exception as exc:  # compile/backend failure at runtime
-            warnings.warn(
+            if self.compile_strict:
+                # Production runs should die loudly rather than silently lose
+                # the compiled + packed paths (a 2-4x throughput regression).
+                raise
+            self.compile_fallback = True
+            msg = (
                 f"Neptune encoder torch.compile failed at runtime "
                 f"({type(exc).__name__}: {exc}); falling back to the "
-                "uncompiled encoder."
+                "uncompiled encoder + padded attention FOR THE REST OF THE "
+                "PROCESS (~2-4x slower). Set compile_strict=True to make this "
+                "fatal; model.compile_fallback / the 'encoder_compiled' metric "
+                "record the downgrade."
             )
+            warnings.warn(msg)
+            print(f"\n{'!' * 80}\n{msg}\n{'!' * 80}", flush=True)
             self.encoder_compiled = False
             # Route "auto" back to padded SDPA: eager flex would OOM on large
             # packed batches, so the retry must not stay on packed.

@@ -2,6 +2,7 @@ import argparse
 import importlib.util
 import math
 import os
+import random
 import sys
 from pathlib import Path
 from typing import Any, Dict, Tuple
@@ -170,6 +171,7 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         rope_base=rope_base,
         compile_encoder=model_opts.get("compile_encoder", True),
         compile_options=model_opts.get("compile_options"),
+        compile_strict=model_opts.get("compile_strict", False),
     )
 
     return model.to(device)
@@ -525,6 +527,13 @@ def main() -> None:
     cfg = load_config(args.cfg_file)
     normalize_config(cfg)
     model_opts = cfg["model_options"]
+
+    # Global seeding for reproducibility: model init, DOM dropout, and sampler
+    # draws. (The train/val split has its own independent `split_seed`.)
+    seed = int(cfg.get("seed", 42))
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
 
     if model_opts.get("downstream_task") == "starting_classification":
         cfg["task"] = "starting_classification"
