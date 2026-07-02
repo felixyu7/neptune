@@ -9,44 +9,41 @@ from torch_fps import farthest_point_sampling, farthest_point_sampling_with_knn
 class FPSTokenizer(nn.Module):
     """
     GPU-native, vectorized FPS-based tokenizer for point clouds:
-      - MLP 1: Per-point feature extraction
+      - MLP 1: per-point feature extraction
       - If num_points <= max_tokens: use all points (no FPS, no pooling)
       - Else: FPS on 4D (x,y,z,t) to select centroids, then pool hits per token
         by nearest-centroid (Voronoi) assignment — every hit contributes to
-        exactly one token, so no hit is ever dropped — or, in the legacy
+        exactly one token, so no hit is ever dropped — or, with
         ``assign_mode="knn"``, by k-nearest-neighbor gather around each centroid.
       - Per-token summary scalars (multiplicity, total charge, time spread,
         spatial RMS radius) are appended to the pooled features.
-      - MLP 2: Token refinement (always applied for consistent depth)
+      - MLP 2: token refinement (always applied for consistent depth)
 
     The forward performs exactly one host sync (``counts.cpu().tolist()``) and
     uses no data-dependent-shape ops (``nonzero``/boolean indexing): small and
     large events are routed with precomputed index tensors, and only the large
-    subset is ever padded (to its own max length), so one bright event no longer
-    inflates the whole batch.
+    subset is ever padded (to its own max length), so one bright event doesn't
+    inflate the whole batch.
 
     ``metric_time_scale`` weights the time axis in the FPS/assignment metric
     only. Coordinates are in km and time in microseconds (see mmap dataloader);
     at raw units the time axis carries ~99% of the 4D metric variance on real
     events, so selection would cluster nearly purely by arrival time. The
     default 0.3 km/us (light speed) balances space and time; 0.22 is the photon
-    group velocity in ice; 1.0 reproduces the legacy raw-unit metric. Returned
-    centroids, relative offsets, and summary scalars always stay in raw units —
-    the scale changes token membership, never the representation.
+    group velocity in ice; 1.0 leaves raw units. Returned centroids, relative
+    offsets, and summary scalars always stay in raw units — the scale changes
+    token membership, never the representation.
 
     ``lloyd_iters`` (voronoi mode only; ignored for knn) refines the FPS
     centroids with that many charge-weighted Lloyd (k-means) iterations in the
     scaled metric. FPS solves a k-center-style objective (equal cell *radius*),
     which over-compresses dense bright cores and wastes tokens on stray
     periphery hits; Lloyd refinement moves centroids toward the charge-weighted
-    vector-quantization optimum (measured: 2 iterations cut charge-weighted
-    within-cell quantization RMS by ~40% on real >64-DOM events). With
-    ``lloyd_iters > 0`` centroids become *virtual* points (charge-weighted cell
-    means in raw units, computed over the final membership) rather than hit
-    positions, so relative offsets are zero-mean per cell; cells can then be
-    empty (all-zero token with multiplicity scalar 0, mask stays True — same
-    contract as the coincident-centroid edge case). ``lloyd_iters=0``
-    reproduces the plain FPS-Voronoi behavior exactly.
+    vector-quantization optimum. With ``lloyd_iters > 0`` centroids become
+    virtual points (charge-weighted cell means in raw units over the final
+    membership) rather than hit positions, so relative offsets are zero-mean
+    per cell; cells can then be empty (all-zero token with multiplicity scalar
+    0, mask stays True — same contract as the coincident-centroid edge case).
     """
 
     N_EXTRA = 4  # multiplicity, total charge, time spread, RMS radius
@@ -56,7 +53,7 @@ class FPSTokenizer(nn.Module):
                  max_tokens: int = 128,
                  token_dim: int = 768,
                  mlp_layers: Optional[List[int]] = None,
-                 k_neighbors: int = 16,
+                 k_neighbors: int = 8,
                  dropout: float = 0.0,
                  knn_pool: str = "max",
                  rel_pos_hidden: int = 64,
@@ -359,7 +356,7 @@ class FPSTokenizer(nn.Module):
                 pre_l = torch.cat([pooled_l, ex_l.to(feat_dtype)], dim=-1)
                 cents_l_out = cents_raw
 
-            else:  # assign_mode == "knn" (legacy A/B path)
+            else:  # assign_mode == "knn"
                 pre_l, cents_l_out = self._knn_pool_large(
                     P_pad_m, valid_l, p_l, f_l, q_l, starts_l,
                     B_l, Nmax_l, dest_pad, feat_dtype)
@@ -382,12 +379,11 @@ class FPSTokenizer(nn.Module):
                         f_l: Tensor, q_l: Tensor, starts_l: Tensor,
                         B_l: int, Nmax_l: int, dest_pad: Tensor,
                         feat_dtype) -> Tuple[Tensor, Tensor]:
-        """Legacy fused FPS+kNN pooling on the (already padded) large subset.
+        """Fused FPS+kNN pooling on the (already padded) large subset.
 
-        Mirrors the pre-Voronoi implementation exactly — same gather, relative
-        encoding, and masked max / charge-weighted mean — with the per-token
-        summary scalars computed from the kNN sets so the mlp2 contract matches
-        the voronoi path.
+        Same relative encoding and masked max / charge-weighted mean as the
+        voronoi path, with the per-token summary scalars computed from the kNN
+        sets so the mlp2 contract matches across modes.
         """
         device = p_l.device
         K = self.max_tokens

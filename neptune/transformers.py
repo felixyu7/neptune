@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .packing import flex_attention
+from .utils import flex_attention
 
 
 class RMSNorm(nn.Module):
@@ -288,13 +288,10 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         self.drop_path_rate = drop_path_rate
 
     def _initialize_weights(self):
-        """Initialize weights using modern industry-standard practices."""
-        # Q, K, V projections: Xavier/Glorot initialization
+        """Xavier init for attention projections, zero biases."""
         nn.init.xavier_uniform_(self.qkv_proj.weight)
         if self.qkv_proj.bias is not None:
             nn.init.zeros_(self.qkv_proj.bias)
-        
-        # Output projection: Xavier/Glorot but may be scaled later for deep networks
         nn.init.xavier_uniform_(self.out_proj.weight)
         if self.out_proj.bias is not None:
             nn.init.zeros_(self.out_proj.bias)
@@ -445,5 +442,3 @@ class NeptuneTransformerEncoder(nn.Module):
             output = self.norm(output)
 
         return output
-
-

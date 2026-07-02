@@ -4,7 +4,7 @@ Neptune (a**N** **E**fficient **P**oint **T**ransformer for **U**ltrarelativisti
 
 ## Installation
 
-This repository now requires [torch-fps](https://github.com/felixyu7/torch-fps) for optimized FPS+kNN implementations. **Ensure gcc > 9 and < 14**. Then you can install this with
+This repository requires [torch-fps](https://github.com/felixyu7/torch-fps) for optimized FPS+kNN implementations. **Ensure gcc > 9 and < 14**. Then you can install this with
 
 ```bash
 pip install torch-fps
@@ -61,13 +61,19 @@ For full training runs, the CLI entry point `scripts/run.py` uses shared tooling
 python scripts/run.py -c scripts/configs/what-1_angular_reco.cfg
 ```
 
-Released WhaT-1 configs covering the four reconstruction tasks live under `scripts/configs/` (`what-1_angular_reco.cfg`, `what-1_energy_reco.cfg`, `what-1_morphology_classification.cfg`, `what-1_neutrino_classification.cfg`).
+Configs for the WhaT-1 and Prometheus tasks live under `scripts/configs/`.
+
+Run the test suite with
+
+```bash
+pytest tests/
+```
 
 ## How it works
 
-1. **Tokenization** – farthest-point sampling down to `num_patches` + k-NN aggregation.
-2. **Transformer encoder** – 4D RoPE-enabled (based on this [paper](https://arxiv.org/abs/2504.06308)) self-attention over tokens.
-3. **Pooling** – masked mean pool to obtain a global representation.
+1. **Tokenization** – farthest-point sampling down to `num_patches` centroids, then per-token pooling by nearest-centroid (Voronoi) assignment (or k-NN gather with `assign_mode="knn"`), with optional charge-weighted Lloyd refinement of the centroids.
+2. **Transformer encoder** – 4D RoPE-enabled (based on this [paper](https://arxiv.org/abs/2504.06308)) self-attention over tokens, plus a Fourier absolute position encoding. Compiled with `torch.compile` by default; sparse batches use a packed block-diagonal `flex_attention` path on GPU.
+3. **Pooling** – masked mean (or attention) pool to obtain a global representation.
 4. **Prediction head** – MLP for the downstream task.
 
 ## Parameters
@@ -78,9 +84,10 @@ Released WhaT-1 configs covering the four reconstruction tasks live under `scrip
 - `num_layers`: transformer depth (default: 12)
 - `num_heads`: attention heads (default: 12)
 - `output_dim`: task output dim (default: 3)
-- `k_neighbors`: k for k-NN (default: 8)
 - `pool_type`: `"mean"` or `"attention"` (default: `"mean"`)
-- `tokenizer_kwargs`: optional dict forwarded to the tokenizer implementation
+- `attn_impl`: `"auto"`, `"padded"`, or `"packed"` attention path (default: `"auto"`)
+- `compile_encoder`: compile the encoder with `torch.compile` (default: `True`)
+- `tokenizer_kwargs`: optional dict forwarded to the tokenizer (e.g. `assign_mode`, `lloyd_iters`, `knn_pool`, `k_neighbors`)
 
 ## Requirements
 

@@ -23,8 +23,7 @@ if ML_COMMON_PACKAGE.exists():
     submodule_path = str(ML_COMMON_SUBMODULE)
     if submodule_path in sys.path:
         sys.path.remove(submodule_path)
-    # Prepend so the repo-local submodule wins over any pip-installed ml_common
-    # (avoids importing a stale global copy missing LargeWeightedRandomSampler, etc).
+    # Prepend so the repo-local submodule wins over any pip-installed ml_common.
     sys.path.insert(0, submodule_path)
 
 from ml_common.dataloaders import create_dataloaders
@@ -131,7 +130,6 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
             "and produce a head_dim divisible by 8 for 4D RoPE."
         )
 
-    k_neighbors = model_opts.get("k_neighbors", 8)
     tokenizer_kwargs = model_opts.get("tokenizer_kwargs")
     pool_type = model_opts.get("pool_type", "mean")
     layerscale_init = model_opts.get("layerscale_init", 1e-5)
@@ -145,9 +143,8 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     rope_base = model_opts.get("rope_base", 60)
     rope_scales = tuple(model_opts.get("rope_scales", (180.0, 180.0, 180.0, 40.0)))
 
-    # The encoder is auto-compiled inside NeptuneModel for faster train/inference
-    # (lazy; falls back to uncompiled on failure). Disable with
-    # `compile_encoder: false` or tune via `compile_options: {mode, dynamic}`.
+    # Encoder is lazily auto-compiled inside NeptuneModel (falls back to
+    # uncompiled on failure); disable via `compile_encoder: false`.
     model = NeptuneModel(
         in_channels=model_opts["in_channels"],
         num_patches=model_opts["num_patches"],
@@ -158,7 +155,6 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         dropout=model_opts["dropout"],
         drop_path_rate=drop_path_rate,
         output_dim=output_dim,
-        k_neighbors=k_neighbors,
         tokenizer_kwargs=tokenizer_kwargs,
         pool_type=pool_type,
         layerscale_init=layerscale_init,
@@ -307,7 +303,7 @@ def build_loss_function(model_opts: Dict[str, Any]):
                 targets = labels[..., -1].reshape(-1).float()
                 bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
                 p_t = torch.exp(-bce)
-                # alpha weighting: alpha for positives (signal), 1-alpha for negatives
+                # alpha for positives (signal), 1-alpha for negatives
                 alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
                 focal_weight = alpha_t * (1 - p_t) ** gamma
                 return (focal_weight * bce).mean()
@@ -341,7 +337,7 @@ def build_loss_function(model_opts: Dict[str, Any]):
 
 
 def _mean_direction(preds, loss_name, loss_kwargs):
-    """Extract the mean direction from raw model predictions using the distribution classes."""
+    """Extract the mean direction from raw predictions via the distribution classes."""
     if loss_name == "vmf":
         return VMF(preds).mean_direction
     if loss_name == "iag":
@@ -462,16 +458,15 @@ def build_metric_function(model_opts: Dict[str, Any]):
             fpr, tpr, thr = roc_curve(targets, probs)
             metrics["auc_roc"] = float(np.trapezoid(tpr, fpr))
 
-            # TPR at target FPRs via ROC interpolation (matches BDT-side fix for
-            # tie-inflation artifact from threshold-based quantile computations).
+            # TPR at target FPRs via ROC interpolation (avoids tie-inflation
+            # from threshold-based quantile computations).
             for f in (1e-5, 1e-4, 1e-3):
                 metrics[f"tpr_at_fpr_{f:.0e}"] = float(np.interp(f, fpr, tpr))
 
             # Normalized partial AUC over FPR in [0, 1e-4]: primary
             # checkpoint-selection metric (smoother than single-point TPR).
-            # Always computable: roc_curve always emits a (fpr=0, tpr=0) point,
-            # so the trapezoid falls back to linear interpolation over [0, alpha_fpr]
-            # when the val bg count is too small to resolve the tail densely.
+            # roc_curve always emits (fpr=0, tpr=0), so this stays computable
+            # even when val bg is too small to resolve the tail densely.
             alpha_fpr = 1e-4
             mask = fpr <= alpha_fpr
             fpr_tail = np.concatenate([fpr[mask], [alpha_fpr]])

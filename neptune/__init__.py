@@ -1,8 +1,5 @@
 """
-Neptune: A transformer-based point cloud processing model for neutrino event reconstruction.
-
-This package provides a clean, pip-installable implementation of the Neptune model
-that can be easily integrated into any PyTorch workflow.
+Neptune: a transformer-based point cloud model for neutrino event reconstruction.
 
 Example usage:
     >>> from neptune import NeptuneModel

@@ -1,7 +1,4 @@
-# model.py
-"""
-Neptune neutrino event reconstruction.
-"""
+"""Neptune neutrino event reconstruction."""
 import warnings
 import torch
 import torch.nn as nn
@@ -16,7 +13,7 @@ from .transformers import (
     FourierPositionEncoder,
 )
 from .tokenizer import FPSTokenizer
-from .packing import pack, build_block_mask, unpack, FLEX_AVAILABLE
+from .utils import pack, build_block_mask, unpack, FLEX_AVAILABLE
 
 
 class AttentionPool(nn.Module):
@@ -90,10 +87,10 @@ class PointTransformerEncoder(nn.Module):
             rope_scales=rope_scales,
             rope_base=rope_base,
         )
-        # Absolute position encoding: log-spaced Fourier (sinusoidal) features on
-        # (x,y,z). Time is dropped — events are time-centered, so absolute t is
-        # ~meaningless and RoPE handles relative time. The full 4D centroids are
-        # passed in; the encoder slices off time internally.
+        # Absolute position encoding: log-spaced Fourier features on (x,y,z).
+        # Time is dropped — events are time-centered, so absolute t is
+        # ~meaningless and RoPE handles relative time. The encoder slices time
+        # off the 4D centroids internally.
         self.abs_pos_encoder = FourierPositionEncoder(
             token_dim,
             in_dim=3,
@@ -165,8 +162,9 @@ class PointTransformerEncoder(nn.Module):
 
 
 class NeptuneModel(nn.Module):
-    """
-      Note: coords are expected as [N, 4] = [x, y, z, t]
+    """Full Neptune model: tokenizer -> transformer encoder -> prediction head.
+
+    coords are expected as [N, 4] = [x, y, z, t].
     """
     def __init__(
         self,
@@ -179,7 +177,6 @@ class NeptuneModel(nn.Module):
         dropout: float = 0.1,
         drop_path_rate: float = 0.0,
         output_dim: int = 3,
-        k_neighbors: int = 8,   # only for fps
         tokenizer_kwargs: Optional[Dict[str, Any]] = None,
         pool_type: str = "mean",
         layerscale_init: float = 1e-5,
@@ -207,7 +204,6 @@ class NeptuneModel(nn.Module):
             max_tokens=num_patches,
             token_dim=token_dim,
             mlp_layers=mlp_layers_cfg,
-            k_neighbors=k_neighbors,
             dropout=tokenizer_dropout,
             **tokenizer_cfg,
         )
@@ -230,9 +226,9 @@ class NeptuneModel(nn.Module):
             rope_base=rope_base,
         )
         # +2: event-level scalars (log token multiplicity, log total charge)
-        # concatenated onto the pooled feature — both pooling modes normalize
-        # event size and total light yield away, yet they carry direct signal
-        # (energy above all).
+        # concatenated onto the pooled feature — pooling normalizes event size
+        # and total light yield away, yet both carry direct signal (energy
+        # above all).
         self.head = nn.Sequential(
             nn.Linear(token_dim + 2, token_dim),
             nn.GELU(),
@@ -240,11 +236,9 @@ class NeptuneModel(nn.Module):
             nn.Linear(token_dim, output_dim)
         )
 
-        # Auto-compile the encoder for faster train/inference. Compilation is
-        # lazy (deferred to the first forward) so it targets the model's final
-        # device, and falls back to the uncompiled encoder if it ever fails —
-        # so any caller, including downstream inference pipelines, gets the
-        # speedup for free with no code changes and no risk of a hard failure.
+        # Auto-compile the encoder. Compilation is lazy (deferred to the first
+        # forward) so it targets the model's final device, and falls back to
+        # the uncompiled encoder if it ever fails.
         self.encoder_compiled = False
         if compile_encoder:
             self.encoder_compiled = self.compile_encoder(**(compile_options or {}))
@@ -276,15 +270,13 @@ class NeptuneModel(nn.Module):
         return self.head(torch.cat([global_feat, extras], dim=-1))
 
     def _run_encoder(self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor]) -> Tensor:
-        """Run the encoder, guarding every compiled call so a backend failure at
-        runtime falls back to the uncompiled encoder instead of crashing.
+        """Run the encoder, guarding every compiled call so a runtime backend
+        failure falls back to the uncompiled encoder instead of crashing.
 
-        The guard stays armed (not just on the first forward) because lazy +
-        dynamic compilation traces each distinct path on first use: a dense first
-        batch compiles the padded path, while the packed/flex path only compiles
-        when a later sparse batch hits it. Wrapping every call until the first
-        failure (after which compile is disabled, so the wrapper is skipped)
-        catches that deferred failure too. try/except is free on the happy path."""
+        The guard stays armed beyond the first forward because lazy + dynamic
+        compilation traces each distinct path on first use (e.g. the packed/flex
+        path only compiles when a sparse batch first hits it). try/except is
+        free on the happy path."""
         if not self.encoder_compiled:
             return self.encoder(tokens, centroids, masks)
         try:
@@ -319,29 +311,22 @@ class NeptuneModel(nn.Module):
                         **compile_kwargs: Any) -> bool:
         """Compile the inner transformer stack for faster train/inference.
 
-        Only ``self.encoder.layers`` (the ``NeptuneTransformerEncoder`` layer
-        loop) is compiled. The surrounding ``PointTransformerEncoder`` stays eager
-        because pack/unpack use data-dependent shapes (``nonzero``), and the FPS
-        tokenizer uses a custom op plus data-dependent control flow — both would
-        force graph breaks. ``dynamic=True`` lets one graph serve the varying
-        packed length ``[1, N, D]`` and the varying padded batch ``[B, 128, D]``
-        without recompiling per shape. Compilation uses ``nn.Module.compile`` (in
-        place), so ``state_dict`` keys are unchanged and existing checkpoints stay
-        loadable. Benchmarks show ~1.5x train/inference on GPU and ~1.2x on CPU;
-        see the perf report.
+        Only ``self.encoder.layers`` is compiled: pack/unpack use data-dependent
+        shapes (``nonzero``) and the FPS tokenizer uses a custom op plus
+        data-dependent control flow, both of which would force graph breaks.
+        ``dynamic=True`` lets one graph serve the varying packed length
+        ``[1, N, D]`` and the varying padded batch ``[B, 128, D]``. Compilation
+        uses ``nn.Module.compile`` (in place), so ``state_dict`` keys are
+        unchanged and existing checkpoints stay loadable.
 
-        Compilation is *lazy*: ``torch.compile`` traces on the first forward, so
-        it targets the model's final device (e.g. after ``.to('cuda')``) rather
-        than the construction-time device. If any compiled forward fails at
-        runtime (missing backend, lowering error, ...), the model transparently
-        reverts to the uncompiled encoder (see :meth:`_run_encoder`).
-
-        Called automatically from ``__init__`` (``compile_encoder=True``); may
-        also be invoked manually.
+        Compilation is lazy: ``torch.compile`` traces on the first forward, so
+        it targets the model's final device. If a compiled forward fails at
+        runtime, the model reverts to the uncompiled encoder (see
+        :meth:`_run_encoder`).
 
         Returns:
-            True if compilation was set up, False if torch.compile is unavailable
-            in this build (the model then runs uncompiled, exactly as before).
+            True if compilation was set up, False if torch.compile is
+            unavailable (the model then runs uncompiled).
         """
         if not hasattr(torch, "compile") or not hasattr(self.encoder.layers, "compile"):
             warnings.warn(
