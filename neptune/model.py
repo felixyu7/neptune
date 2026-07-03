@@ -39,10 +39,16 @@ class AttentionPool(nn.Module):
 
         attn = torch.bmm(q, k.transpose(1, 2)) * (D ** -0.5) # [B, 1, S]
         if mask is not None:
-            attn = attn.masked_fill(~mask.unsqueeze(1), float('-inf'))
+            # Finite fill instead of -inf: an all-masked row (zero-hit event)
+            # must softmax to finite garbage, which is then zeroed below —
+            # -inf would yield NaN and poison the whole batch.
+            attn = attn.masked_fill(~mask.unsqueeze(1), torch.finfo(attn.dtype).min)
         attn = F.softmax(attn, dim=-1)
         out = torch.bmm(attn, v).squeeze(1)                   # [B, D]
-        return self.proj(out)
+        out = self.proj(out)
+        if mask is not None:
+            out = out * mask.any(dim=1, keepdim=True).to(out.dtype)
+        return out
 
 
 class PointTransformerEncoder(nn.Module):
@@ -143,8 +149,11 @@ class PointTransformerEncoder(nn.Module):
         return self.layers(src, centroids, src_key_padding_mask=attn_pad)
 
     def forward(self, tokens: Tensor, centroids: Tensor, masks: Optional[Tensor] = None) -> Tensor:
-        # Run encoder with centroid-aware inputs (absolute position embedding)
-        centroid_emb = self.abs_pos_encoder(centroids.to(tokens.dtype))
+        # Run encoder with centroid-aware inputs (absolute position embedding).
+        # No cast to tokens.dtype: the encoder computes in fp32 anyway, and a
+        # bf16 round-trip of km-scale coords costs up to ~0.7 rad of phase at
+        # freq_max=180 rad/km.
+        centroid_emb = self.abs_pos_encoder(centroids)
         if masks is not None:
             centroid_emb = centroid_emb * masks.to(dtype=centroid_emb.dtype).unsqueeze(-1)
         x = self._encode(tokens + centroid_emb, centroids, masks)
@@ -248,11 +257,13 @@ class NeptuneModel(nn.Module):
         coords: Tensor,       # [N,4] -> [x, y, z, t]
         features: Tensor,     # [N,F]
         batch_ids: Tensor,    # [N]
+        batch_size: Optional[int] = None,
     ) -> Tensor:
         spatial = coords[:, :3]
         times = coords[:, 3].unsqueeze(-1)
 
-        tokens, centroids, masks = self.tokenizer(spatial, features, batch_ids, times)
+        tokens, centroids, masks = self.tokenizer(
+            spatial, features, batch_ids, times, batch_size=batch_size)
         global_feat = self._run_encoder(tokens, centroids, masks)
 
         # Event-level scalars the pooling normalizes away: valid-token

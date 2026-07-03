@@ -141,6 +141,7 @@ class FPSTokenizer(nn.Module):
         features: Tensor,      # [N, F]
         batch_ids: Tensor,     # [N]
         times: Tensor,         # [N, 1]
+        batch_size: Optional[int] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
         """
         Args:
@@ -148,6 +149,9 @@ class FPSTokenizer(nn.Module):
           features:  [N, F]
           batch_ids: [N] batch indices
           times:     [N, 1] time coordinates
+          batch_size: optional true batch size B. Without it, B is inferred as
+            max(batch_ids)+1, which silently drops trailing zero-hit events
+            (their ids never appear) and misaligns the output with the labels.
         Returns:
           tokens:    [B, max_tokens, token_dim]
           centroids: [B, max_tokens, 4]   (x,y,z,t)
@@ -160,9 +164,10 @@ class FPSTokenizer(nn.Module):
         T = self.token_dim
 
         if coords.numel() == 0:
-            empty_tokens    = torch.zeros((0, K, T), device=device, dtype=dtype_f)
-            empty_centroids = torch.zeros((0, K, 4), device=device, dtype=dtype_p)
-            empty_masks     = torch.zeros((0, K),    device=device, dtype=torch.bool)
+            B0 = batch_size or 0
+            empty_tokens    = torch.zeros((B0, K, T), device=device, dtype=dtype_f)
+            empty_centroids = torch.zeros((B0, K, 4), device=device, dtype=dtype_p)
+            empty_masks     = torch.zeros((B0, K),    device=device, dtype=torch.bool)
             return empty_tokens, empty_centroids, empty_masks
 
         batch_idx = batch_ids.long()
@@ -173,7 +178,7 @@ class FPSTokenizer(nn.Module):
         # The single host sync: one D2H copy of the ids. (bincount on a CUDA
         # tensor would itself sync — it reads max(batch_idx) on the host to
         # size its output — so counting happens on the CPU copy instead.)
-        counts_list = torch.bincount(batch_idx.cpu()).tolist()
+        counts_list = torch.bincount(batch_idx.cpu(), minlength=(batch_size or 0)).tolist()
         B = len(counts_list)
 
         # Sort hits by batch so each event is a contiguous run.
@@ -278,10 +283,19 @@ class FPSTokenizer(nn.Module):
                 cents_raw = p_l.index_select(0, cent_flat)               # [B_l*K, 4]
                 cents_m = p_l_m.index_select(0, cent_flat).view(B_l, K, 4)
 
+                def _cell_dists(C_m: Tensor) -> Tensor:
+                    # Squared metric distances via ||c||^2 - 2 p.c (the ||p||^2
+                    # term is constant per hit, hence argmin-invariant, and
+                    # dropped): one baddbmm materializing [B_l*Nmax_l, K]
+                    # instead of the [N_l, K, 4] broadcast difference.
+                    c_sq = C_m.pow(2).sum(-1)                             # [B_l, K]
+                    d_pad = torch.baddbmm(c_sq.unsqueeze(1), P_pad_m,
+                                          C_m.transpose(1, 2), alpha=-2.0)
+                    return d_pad.reshape(-1, K).index_select(0, dest_pad)  # [N_l, K]
+
                 # Nearest-centroid assignment in the scaled metric: every hit
                 # joins exactly one token (coverage = 1 by construction).
-                d = (p_l_m.unsqueeze(1) - cents_m[seg_l]).pow(2).sum(-1)  # [N_l, K]
-                assign = d.argmin(dim=1)                                  # [N_l]
+                assign = _cell_dists(cents_m).argmin(dim=1)               # [N_l]
                 cell = seg_l * K + assign                                 # [N_l]
 
                 q_phys = torch.expm1(q_l.float().clamp(min=0))            # [N_l]
@@ -300,8 +314,7 @@ class FPSTokenizer(nn.Module):
                         cm_flat = torch.where(
                             (wsum > 0)[:, None],
                             csum / wsum.clamp(min=1e-9)[:, None], cm_flat)
-                        d = (p_l_m.unsqueeze(1) - cm_flat.view(B_l, K, 4)[seg_l]).pow(2).sum(-1)
-                        assign = d.argmin(dim=1)
+                        assign = _cell_dists(cm_flat.view(B_l, K, 4)).argmin(dim=1)
                         cell = seg_l * K + assign
                         cell4 = cell.unsqueeze(-1).expand(-1, 4)
                     # Raw-unit centroids: charge-weighted cell means over the

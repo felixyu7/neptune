@@ -368,6 +368,10 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         
         # Convert MHA semantics (True = padding) to SDPA semantics (True = allowed)
         allow = ~key_padding_mask.to(torch.bool).to(device)  # (B, S_k)
+        # A fully-padded row (zero-hit event) would softmax over all -inf and
+        # NaN-poison the batch; let it attend everywhere instead — pooling
+        # zeroes those rows, matching the packed path's zeros.
+        allow = allow | ~allow.any(dim=-1, keepdim=True)
         return allow.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, S_k) for broadcasting
 
 

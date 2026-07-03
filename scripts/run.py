@@ -61,7 +61,7 @@ def load_config(cfg_path: str) -> Dict[str, Any]:
 
 def normalize_config(cfg: Dict[str, Any]) -> None:
     dataloader = cfg.get("dataloader")
-    allowed_dataloaders = {"mmap", "kaggle", "i3"}
+    allowed_dataloaders = {"mmap", "kaggle", "i3", "parquet"}
     if dataloader not in allowed_dataloaders:
         raise ValueError(f"dataloader must be one of {sorted(allowed_dataloaders)}, got {dataloader}")
 
@@ -240,10 +240,12 @@ def build_loss_function(model_opts: Dict[str, Any]):
 
         def loss_fn(preds, labels):
             target = labels[:, 6:9]  # detector-centered km (set in the dataloader)
-            mask = torch.isfinite(target).all(dim=1)
-            if mask.sum() == 0:
-                return preds.sum() * 0.0
-            return F.mse_loss(preds[mask], target[mask])
+            # Branchless masked MSE: `if mask.sum() == 0` / boolean indexing
+            # would sync the host every step. Zero-valid batches give loss 0
+            # with intact grad flow.
+            valid = torch.isfinite(target).all(dim=1, keepdim=True).float()
+            se = (preds - torch.nan_to_num(target)).pow(2) * valid
+            return se.sum() / (valid.sum() * target.shape[1]).clamp(min=1.0)
 
         return loss_fn
 
@@ -253,7 +255,9 @@ def build_loss_function(model_opts: Dict[str, Any]):
 
         def loss_fn(preds, labels):
             logits = preds.view(-1)
-            targets = labels[..., -1].reshape(-1).float()
+            # starting_flag lives at column 5 (mmap label layout); the last
+            # column is vertex_z.
+            targets = labels[:, 5].reshape(-1).float()
             return F.binary_cross_entropy_with_logits(logits, targets)
 
         return loss_fn
@@ -269,9 +273,13 @@ def build_loss_function(model_opts: Dict[str, Any]):
             class_weights = torch.tensor(class_weights, dtype=torch.float32)
 
         def loss_fn(preds, labels):
+            # Move the weights once (lazy: device is only known here), not
+            # every step — the repeated H2D copy syncs the stream.
+            nonlocal class_weights
+            if class_weights is not None and class_weights.device != preds.device:
+                class_weights = class_weights.to(preds.device)
             targets = labels[:, 4].long()
-            weight = class_weights.to(preds.device) if class_weights is not None else None
-            return F.cross_entropy(preds, targets, weight=weight)
+            return F.cross_entropy(preds, targets, weight=class_weights)
 
         return loss_fn
 
@@ -279,10 +287,15 @@ def build_loss_function(model_opts: Dict[str, Any]):
         if loss_name != "bce":
             raise ValueError("track_cascade_classification currently supports only the 'bce' loss")
 
+        pos_weight = torch.tensor(10.0)
+
         def loss_fn(preds, labels):
+            nonlocal pos_weight
+            if pos_weight.device != preds.device:
+                pos_weight = pos_weight.to(preds.device)
             logits = preds.view(-1)
             targets = (labels[:, 4] == 0).float()
-            return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=torch.tensor(10.0))
+            return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
 
         return loss_fn
 
@@ -404,7 +417,9 @@ def build_metric_function(model_opts: Dict[str, Any]):
     if task == "starting_classification":
         def metric_fn(preds, labels):
             logits = preds.view(-1)
-            targets = labels[..., -1].reshape(-1)
+            # starting_flag column, matching the loss (NOT the last column,
+            # which is vertex_z).
+            targets = labels[:, 5].reshape(-1)
             probs = torch.sigmoid(logits)
             preds_binary = (probs >= 0.5).float()
             accuracy = (preds_binary == targets).float().mean().item()
