@@ -131,8 +131,6 @@ class RoPE4D(nn.Module):
         for i in range(remaining):
             base_allocation[i % 4] += 1
 
-        self.num_planes_per_axis = base_allocation
-
         # Build concatenated frequency vector for vectorized computation
         all_freqs = []
         for n_planes, scale in zip(base_allocation, scales):
@@ -147,8 +145,6 @@ class RoPE4D(nn.Module):
 
     def _build_freqs(self, num_bands, scale):
         """Build log-spaced frequency bands: omega_min * rho^(l/(L-1))."""
-        if num_bands == 0:
-            return torch.zeros(0)
         if num_bands == 1:
             return torch.tensor([1.0 / self.base]) * scale
 
@@ -285,7 +281,6 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         self.dropout = nn.Dropout(dropout)
         self.drop_path1 = DropPath(drop_path_rate)
         self.drop_path2 = DropPath(drop_path_rate)
-        self.drop_path_rate = drop_path_rate
 
     def _initialize_weights(self):
         """Xavier init for attention projections, zero biases."""

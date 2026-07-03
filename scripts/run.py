@@ -101,7 +101,7 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     if task == "angular_reco":
         # IAG/vMF/SIPC: 3 (μ only), ESAG/SESPC: 5 (μ + shape), GAG/GSPC/GPT: 8
         output_dim = {
-            "iag": 3, "vmf": 3, "sipc": 3, "ps": 3, "angular_distance": 4,
+            "iag": 3, "vmf": 3, "sipc": 3, "ps": 3, "angular_distance": 3,
             "esag": 5, "sespc": 5, "gag": 8, "gspc": 8,
             "ipt": 3, "ept": 5, "gpt": 8,
         }.get(loss_name, 4)
@@ -349,7 +349,7 @@ def build_loss_function(model_opts: Dict[str, Any]):
     raise ValueError(f"Unsupported task/loss combination: {task}/{loss_name}")
 
 
-def _mean_direction(preds, loss_name, loss_kwargs):
+def _mean_direction(preds, loss_name):
     """Extract the mean direction from raw predictions via the distribution classes."""
     if loss_name == "vmf":
         return VMF(preds).mean_direction
@@ -380,12 +380,11 @@ def _mean_direction(preds, loss_name, loss_kwargs):
 def build_metric_function(model_opts: Dict[str, Any]):
     task = model_opts["downstream_task"]
     loss_name = model_opts["loss_fn"]
-    loss_kwargs = model_opts.get("loss_kwargs", {})
 
     if task == "angular_reco":
         def metric_fn(preds, labels):
             target_dirs = F.normalize(labels[:, 1:4], p=2, dim=1)
-            pred_dirs = _mean_direction(preds, loss_name, loss_kwargs)
+            pred_dirs = _mean_direction(preds, loss_name)
             errors = angular_distance_loss(pred_dirs, target_dirs, reduction="none")
             errors_rad = errors * torch.pi
             return {
