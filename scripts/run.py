@@ -173,6 +173,36 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     return model.to(device)
 
 
+# Physically-confusable morphology pairs (undirected; weight = relative confusability).
+# Classes: 0 cascade, 1 starting, 2 throughgoing, 3 stopping, 4 uncontained, 5 bundle.
+# Used for physics-informed (structured) label smoothing: the smoothing mass is spread
+# over these neighbors instead of uniformly over all classes.
+MORPH_CONFUSION_EDGES = [
+    (0, 1, 1.0),  # cascade <-> starting: a short low-energy muon looks cascade-like
+    (1, 2, 1.0),  # starting <-> throughgoing: entry-containment threshold is continuous
+    (2, 3, 1.0),  # throughgoing <-> stopping: exit-containment threshold is continuous
+    (2, 4, 1.0),  # throughgoing <-> uncontained
+    (2, 5, 1.0),  # throughgoing <-> bundle: a collimated CORSIKA bundle mimics one muon
+    (1, 3, 0.5),  # starting <-> stopping: both single-ended contained tracks
+    (1, 4, 0.5),  # starting <-> uncontained
+    (3, 4, 0.5),  # stopping <-> uncontained
+]
+
+
+def build_confusion_soft_targets(num_classes: int, eps: float, device) -> torch.Tensor:
+    """Row i is the soft label for true class i: ``1 - eps`` on the diagonal, ``eps``
+    spread over confusable neighbors (``MORPH_CONFUSION_EDGES``) in proportion to their
+    weight. A class with no listed neighbors keeps a hard label. Rows sum to 1."""
+    adj = torch.zeros(num_classes, num_classes, dtype=torch.float32)
+    for i, j, w in MORPH_CONFUSION_EDGES:
+        if i < num_classes and j < num_classes:
+            adj[i, j] = adj[j, i] = w
+    row = adj.sum(dim=1, keepdim=True)
+    off = torch.where(row > 0, eps * adj / row.clamp(min=1.0), torch.zeros_like(adj))
+    diag = torch.where(row.squeeze(1) > 0, 1.0 - eps, 1.0).diag()
+    return (off + diag).to(device)
+
+
 def build_loss_function(model_opts: Dict[str, Any]):
     task = model_opts["downstream_task"]
     loss_name = model_opts["loss_fn"]
@@ -272,14 +302,31 @@ def build_loss_function(model_opts: Dict[str, Any]):
         if class_weights is not None:
             class_weights = torch.tensor(class_weights, dtype=torch.float32)
 
+        # Physics-informed structured label smoothing: eps=0 (default) recovers plain
+        # hard-label cross-entropy; eps>0 spreads mass over confusable morphologies only
+        # (MORPH_CONFUSION_EDGES), not uniformly. Both the [K,K] targets and the class
+        # weights are moved to device once (lazily) — a per-step H2D copy would sync.
+        eps = float(loss_kwargs.get("label_smoothing", 0.0))
+        soft_targets = None  # [K, K], built on first call once device/K are known
+
         def loss_fn(preds, labels):
-            # Move the weights once (lazy: device is only known here), not
-            # every step — the repeated H2D copy syncs the stream.
-            nonlocal class_weights
+            nonlocal class_weights, soft_targets
             if class_weights is not None and class_weights.device != preds.device:
                 class_weights = class_weights.to(preds.device)
             targets = labels[:, 4].long()
-            return F.cross_entropy(preds, targets, weight=class_weights)
+
+            if eps <= 0.0:
+                return F.cross_entropy(preds, targets, weight=class_weights)
+
+            if soft_targets is None or soft_targets.device != preds.device:
+                soft_targets = build_confusion_soft_targets(preds.shape[1], eps, preds.device)
+            # Soft cross-entropy; class-weighted mean matches F.cross_entropy's
+            # sum(w*l)/sum(w) reduction so eps toggles cleanly against the baseline.
+            per_sample = -(soft_targets[targets] * F.log_softmax(preds, dim=1)).sum(dim=1)
+            if class_weights is not None:
+                w = class_weights[targets]
+                return (per_sample * w).sum() / w.sum().clamp(min=1.0)
+            return per_sample.mean()
 
         return loss_fn
 
