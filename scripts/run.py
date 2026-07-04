@@ -173,34 +173,44 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     return model.to(device)
 
 
-# Physically-confusable morphology pairs (undirected; weight = relative confusability).
+# Per-class targets for physics-informed per-event label smoothing (morphology).
 # Classes: 0 cascade, 1 starting, 2 throughgoing, 3 stopping, 4 uncontained, 5 bundle.
-# Used for physics-informed (structured) label smoothing: the smoothing mass is spread
-# over these neighbors instead of uniformly over all classes.
-MORPH_CONFUSION_EDGES = [
-    (0, 1, 1.0),  # cascade <-> starting: a short low-energy muon looks cascade-like
-    (1, 2, 1.0),  # starting <-> throughgoing: entry-containment threshold is continuous
-    (2, 3, 1.0),  # throughgoing <-> stopping: exit-containment threshold is continuous
-    (2, 4, 1.0),  # throughgoing <-> uncontained
-    (2, 5, 1.0),  # throughgoing <-> bundle: a collimated CORSIKA bundle mimics one muon
-    (1, 3, 0.5),  # starting <-> stopping: both single-ended contained tracks
-    (1, 4, 0.5),  # starting <-> uncontained
-    (3, 4, 0.5),  # stopping <-> uncontained
-]
+# Axis 1 (cascade<->track) smooths track classes toward cascade by muon-track shortness.
+# Axis 2 (edge/containment) smooths toward the less-contained neighbor when the relevant
+# vertex margin is near the detector boundary. uncontained/bundle are left hard (self).
+_MORPH_NEIGHBOR2 = [4, 4, 3, 2, 4, 5]  # index = true class -> containment-neighbor class
 
 
-def build_confusion_soft_targets(num_classes: int, eps: float, device) -> torch.Tensor:
-    """Row i is the soft label for true class i: ``1 - eps`` on the diagonal, ``eps``
-    spread over confusable neighbors (``MORPH_CONFUSION_EDGES``) in proportion to their
-    weight. A class with no listed neighbors keeps a hard label. Rows sum to 1."""
-    adj = torch.zeros(num_classes, num_classes, dtype=torch.float32)
-    for i, j, w in MORPH_CONFUSION_EDGES:
-        if i < num_classes and j < num_classes:
-            adj[i, j] = adj[j, i] = w
-    row = adj.sum(dim=1, keepdim=True)
-    off = torch.where(row > 0, eps * adj / row.clamp(min=1.0), torch.zeros_like(adj))
-    diag = torch.where(row.squeeze(1) > 0, 1.0 - eps, 1.0).diag()
-    return (off + diag).to(device)
+def build_per_event_soft_targets(targets, L_mu, margin_in, margin_out, num_classes,
+                                 eps_max, L_ref, d_ref):
+    """Per-event soft labels (rows sum to 1) from two linear ramps on physical quantities.
+
+    - Axis 1: ``c1 = clip(1 - L_mu/L_ref)`` for track classes (1,2,3) -> mass to cascade (0).
+    - Axis 2: ``c2 = clip(1 - |margin|/d_ref)`` -> mass to the containment neighbor, using
+      ``margin_in`` for cascade/starting and ``margin_out`` for through-going/stopping.
+    Total off-diagonal mass is capped at ``eps_max`` (standard-LS budget). Clear events
+    (``c1=c2=0``) keep a hard label. All ops are sync-free (no host readbacks)."""
+    dev = targets.device
+    is_track = (targets >= 1) & (targets <= 3)
+    use_out = (targets == 2) | (targets == 3)
+    has_c2 = (targets >= 0) & (targets <= 3)
+    nb2 = torch.tensor(_MORPH_NEIGHBOR2, device=dev)[targets]
+
+    c1 = torch.clamp(1.0 - L_mu / L_ref, 0.0, 1.0) * is_track.to(L_mu.dtype)
+    margin_sel = torch.where(use_out, margin_out, margin_in)
+    c2 = torch.clamp(1.0 - margin_sel.abs() / d_ref, 0.0, 1.0) * has_c2.to(L_mu.dtype)
+
+    s1 = eps_max * c1
+    s2 = eps_max * c2
+    tot = s1 + s2
+    scale = torch.where(tot > eps_max, eps_max / tot.clamp(min=1e-12), torch.ones_like(tot))
+    s1, s2 = s1 * scale, s2 * scale
+
+    p = torch.zeros(targets.shape[0], num_classes, device=dev, dtype=L_mu.dtype)
+    p.scatter_(1, targets.unsqueeze(1), (1.0 - s1 - s2).unsqueeze(1))
+    p.scatter_add_(1, torch.zeros_like(targets).unsqueeze(1), s1.unsqueeze(1))  # -> cascade (0)
+    p.scatter_add_(1, nb2.unsqueeze(1), s2.unsqueeze(1))
+    return p
 
 
 def build_loss_function(model_opts: Dict[str, Any]):
@@ -302,27 +312,40 @@ def build_loss_function(model_opts: Dict[str, Any]):
         if class_weights is not None:
             class_weights = torch.tensor(class_weights, dtype=torch.float32)
 
-        # Physics-informed structured label smoothing: eps=0 (default) recovers plain
-        # hard-label cross-entropy; eps>0 spreads mass over confusable morphologies only
-        # (MORPH_CONFUSION_EDGES), not uniformly. Both the [K,K] targets and the class
-        # weights are moved to device once (lazily) — a per-step H2D copy would sync.
-        eps = float(loss_kwargs.get("label_smoothing", 0.0))
-        soft_targets = None  # [K, K], built on first call once device/K are known
+        # Physics-informed per-event label smoothing. `label_smoothing` is a dict
+        # {eps_max, L_ref_m, d_ref_m}; eps_max<=0 (or absent) recovers plain hard-label
+        # cross-entropy. eps_max>0 needs physics_labels enabled in data_options so the
+        # dataloader appends [L_mu, margin_in, margin_out] to the label vector.
+        ls = loss_kwargs.get("label_smoothing", 0.0)
+        if isinstance(ls, dict):
+            eps_max = float(ls.get("eps_max", 0.0))
+            L_ref = float(ls.get("L_ref_m", 100.0))
+            d_ref = float(ls.get("d_ref_m", 50.0))
+        else:
+            eps_max, L_ref, d_ref = float(ls), 100.0, 50.0
 
         def loss_fn(preds, labels):
-            nonlocal class_weights, soft_targets
+            nonlocal class_weights
             if class_weights is not None and class_weights.device != preds.device:
                 class_weights = class_weights.to(preds.device)
             targets = labels[:, 4].long()
 
-            if eps <= 0.0:
+            if eps_max <= 0.0:
                 return F.cross_entropy(preds, targets, weight=class_weights)
 
-            if soft_targets is None or soft_targets.device != preds.device:
-                soft_targets = build_confusion_soft_targets(preds.shape[1], eps, preds.device)
+            if labels.shape[1] < 12:
+                raise ValueError(
+                    "per-event label smoothing (eps_max>0) requires physics_labels enabled "
+                    "in data_options: expected 3 appended label columns [L_mu, margin_in, "
+                    f"margin_out], got label width {labels.shape[1]}."
+                )
+            L_mu, margin_in, margin_out = labels[:, -3], labels[:, -2], labels[:, -1]
+            soft = build_per_event_soft_targets(
+                targets, L_mu, margin_in, margin_out, preds.shape[1], eps_max, L_ref, d_ref
+            )
             # Soft cross-entropy; class-weighted mean matches F.cross_entropy's
-            # sum(w*l)/sum(w) reduction so eps toggles cleanly against the baseline.
-            per_sample = -(soft_targets[targets] * F.log_softmax(preds, dim=1)).sum(dim=1)
+            # sum(w*l)/sum(w) reduction so eps_max=0 toggles cleanly against the baseline.
+            per_sample = -(soft * F.log_softmax(preds, dim=1)).sum(dim=1)
             if class_weights is not None:
                 w = class_weights[targets]
                 return (per_sample * w).sum() / w.sum().clamp(min=1.0)
