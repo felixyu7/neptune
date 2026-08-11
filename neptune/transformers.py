@@ -69,7 +69,6 @@ class FourierPositionEncoder(nn.Module):
             f"axis_scales must have length in_dim={in_dim} (got {len(axis_scales)})"
         )
         self.in_dim = in_dim
-        self.num_bands = num_bands
 
         # Log-spaced angular frequencies in [freq_min, freq_max] (rad per coord unit).
         if num_bands == 1:
@@ -264,16 +263,8 @@ class NeptuneTransformerEncoderLayer(nn.Module):
         self.rope = RoPE4D(dim=self.head_dim, scales=rope_scales, base=rope_base)
 
         # LayerScale: learnable per-channel scaling for residual branches
-        self.layerscale_init = layerscale_init
         self.gamma_1 = nn.Parameter(layerscale_init * torch.ones(d_model))
         self.gamma_2 = nn.Parameter(layerscale_init * torch.ones(d_model))
-
-        # Store hyperparameters for cloning
-        self.layer_norm_eps = layer_norm_eps
-        self.bias = bias
-        self.ff_bias = ff_bias
-        self.rope_scales = rope_scales
-        self.rope_base = rope_base
 
         # Dropout (residual-branch only; attention-matrix dropout is intentionally
         # unused — flex_attention can't express it, so dropping it keeps the
@@ -371,7 +362,9 @@ class NeptuneTransformerEncoderLayer(nn.Module):
 
 
 class NeptuneTransformerEncoder(nn.Module):
-    def __init__(self, encoder_layer, num_layers, norm=None, drop_path_rate=0.0):
+    def __init__(self, layer_factory, num_layers, norm=None, drop_path_rate=0.0):
+        """``layer_factory(drop_path_rate)`` returns a fresh encoder layer;
+        one is built per depth with linearly-scaled stochastic depth."""
         super().__init__()
         if num_layers <= 0:
             raise ValueError("num_layers must be positive")
@@ -379,33 +372,9 @@ class NeptuneTransformerEncoder(nn.Module):
             drop_rates = [drop_path_rate]
         else:
             drop_rates = [drop_path_rate * float(i) / (num_layers - 1) for i in range(num_layers)]
-        # Create separate instances for each layer to avoid weight sharing
-        self.layers = nn.ModuleList([
-            self._get_cloned_layer(encoder_layer, drop_path_rate=drop_rates[i]) for i in range(num_layers)
-        ])
+        self.layers = nn.ModuleList([layer_factory(dr) for dr in drop_rates])
         self.num_layers = num_layers
         self.norm = norm
-
-    def _get_cloned_layer(self, module, drop_path_rate=0.0):
-        """Create a new layer with the same parameters"""
-        if isinstance(module, NeptuneTransformerEncoderLayer):
-            return NeptuneTransformerEncoderLayer(
-                d_model=module.d_model,
-                nhead=module.nhead,
-                dim_feedforward=module.ffn.w13.out_features // 2,
-                dropout=module.dropout.p,
-                layer_norm_eps=module.layer_norm_eps,
-                bias=module.bias,
-                ff_bias=module.ff_bias,
-                qk_norm=module.qk_norm,
-                rope_scales=module.rope_scales,
-                rope_base=module.rope_base,
-                drop_path_rate=drop_path_rate,
-                layerscale_init=module.layerscale_init,
-            )
-        else:
-            import copy
-            return copy.deepcopy(module)
 
     def forward(self, src, centroids, src_key_padding_mask=None, block_mask=None,
                 doc_id=None, num_docs=None):
@@ -413,16 +382,13 @@ class NeptuneTransformerEncoder(nn.Module):
         # receive the same centroids, so the cos/sin tables are identical.
         # Pre-cast tables to src.dtype so per-layer rotation skips the fp32
         # round-trip on bf16/fp16 paths.
-        first = self.layers[0] if self.layers else None
-        rope_tables = (
-            first.rope.compute_tables(centroids, dtype=src.dtype)
-            if first is not None else None
-        )
+        first = self.layers[0]
+        rope_tables = first.rope.compute_tables(centroids, dtype=src.dtype)
         # Build the SDPA mask once instead of rebuilding it per layer. On the
         # packed path attention is masked by block_mask, so no SDPA mask is built.
         attn_mask = (
             first._prepare_attention_mask(src_key_padding_mask, src.device)
-            if first is not None and block_mask is None else None
+            if block_mask is None else None
         )
 
         output = src

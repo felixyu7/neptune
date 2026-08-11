@@ -166,6 +166,15 @@ def _prepare_and_resolve(points, valid_mask, K, start_idx, random_start,
     points_c, mask_c = _prepare(points, valid_mask, precision)
     B, N, _ = points_c.shape
 
+    # Empty-input edge cases: with K == 0 skip start resolution entirely (the
+    # callers early-return an empty result and never use start_idx; argmax over
+    # N == 0 would raise). N == 0 with K > 0 can never satisfy K <= valid
+    # points, so reject it deterministically even with validate=False.
+    if K == 0:
+        return points_c, mask_c, torch.zeros(B, dtype=torch.long, device=device)
+    if N == 0:
+        raise ValueError("FPS with K > 0 requires at least one point (got N=0)")
+
     # Selectable = mask-true AND all-finite; validation and start repair both
     # count from this same predicate, so validate=True enforces exactly the
     # documented "K <= valid points" precondition. assume_finite skips the

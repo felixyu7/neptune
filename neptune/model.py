@@ -83,16 +83,19 @@ class PointTransformerEncoder(nn.Module):
         # True by compile_encoder() on success, cleared on failure/fallback.
         self.packed_flex_ready = False
 
-        enc_layer = NeptuneTransformerEncoderLayer(
-            d_model=token_dim,
-            nhead=num_heads,
-            dim_feedforward=hidden_dim,
-            dropout=dropout,
-            drop_path_rate=0.0,
-            layerscale_init=layerscale_init,
-            rope_scales=rope_scales,
-            rope_base=rope_base,
-        )
+        # Layer factory: the encoder stack builds one fresh layer per depth
+        # (with its own drop-path rate), so no throwaway prototype is initialized.
+        def enc_layer(drop_path_rate):
+            return NeptuneTransformerEncoderLayer(
+                d_model=token_dim,
+                nhead=num_heads,
+                dim_feedforward=hidden_dim,
+                dropout=dropout,
+                drop_path_rate=drop_path_rate,
+                layerscale_init=layerscale_init,
+                rope_scales=rope_scales,
+                rope_base=rope_base,
+            )
         # Absolute position encoding: log-spaced Fourier features on (x,y,z).
         # Time is dropped — events are time-centered, so absolute t is
         # ~meaningless and RoPE handles relative time. The encoder slices time
@@ -202,7 +205,6 @@ class NeptuneModel(nn.Module):
     ):
         super().__init__()
         self.compile_strict = compile_strict
-        self.compile_fallback = False
         tokenizer_cfg: Dict[str, Any] = dict(tokenizer_kwargs or {})
         mlp_layers_cfg = tokenizer_cfg.pop("mlp_layers", [256, 512, 768])
 
@@ -297,13 +299,12 @@ class NeptuneModel(nn.Module):
                 # Production runs should die loudly rather than silently lose
                 # the compiled + packed paths (a 2-4x throughput regression).
                 raise
-            self.compile_fallback = True
             msg = (
                 f"Neptune encoder torch.compile failed at runtime "
                 f"({type(exc).__name__}: {exc}); falling back to the "
                 "uncompiled encoder + padded attention FOR THE REST OF THE "
                 "PROCESS (~2-4x slower). Set compile_strict=True to make this "
-                "fatal; model.compile_fallback / the 'encoder_compiled' metric "
+                "fatal; model.encoder_compiled / the 'encoder_compiled' metric "
                 "record the downgrade."
             )
             warnings.warn(msg)

@@ -27,15 +27,11 @@ if ML_COMMON_PACKAGE.exists():
     sys.path.insert(0, submodule_path)
 
 from ml_common.dataloaders import create_dataloaders
-from directional_distributions import VMF, IAG, ESAG, GAG
-from ml_common.losses import (
-    angular_distance_loss,
-    gaussian_nll_loss,
-    von_mises_fisher_loss,
-    iag_nll_loss,
-    esag_nll_loss,
-    gag_nll_loss,
+from directional_distributions import (
+    VMF, IAG, ESAG, GAG,
+    von_mises_fisher_loss, iag_nll_loss, esag_nll_loss, gag_nll_loss,
 )
+from ml_common.losses import angular_distance_loss, gaussian_nll_loss
 from ml_common.training import Trainer
 from neptune import NeptuneModel
 
