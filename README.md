@@ -4,17 +4,11 @@ Neptune (a**N** **E**fficient **P**oint **T**ransformer for **U**ltrarelativisti
 
 ## Installation
 
-This repository requires [torch-fps](https://github.com/felixyu7/torch-fps) for optimized FPS+kNN implementations. **Ensure gcc > 9 and < 14**. Then you can install this with
-
-```bash
-pip install torch-fps
-```
-
-Then do
-
 ```bash
 pip install -e .
 ```
+
+Neptune is pure Python at install time. The FPS/kNN kernels are vendored in `neptune/fps/`: on CUDA they are Triton kernels JIT-compiled for whatever GPU you run on (no compute-capability coupling at install — safe across heterogeneous clusters), and on CPU a small C++ extension compiles automatically on first use (cached; requires a C++ compiler, otherwise a slower pure-PyTorch fallback is used with a warning).
 
 ## Usage
 
@@ -92,4 +86,3 @@ pytest tests/
 ## Requirements
 
 - torch >= 2.0
-- torch-fps

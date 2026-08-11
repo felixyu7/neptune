@@ -27,7 +27,7 @@ if ML_COMMON_PACKAGE.exists():
     sys.path.insert(0, submodule_path)
 
 from ml_common.dataloaders import create_dataloaders
-from directional_distributions import VMF, IAG, ESAG, GAG, SIPC, SESPC, GSPC, PowerSpherical, IPT, EPT, GPT
+from directional_distributions import VMF, IAG, ESAG, GAG
 from ml_common.losses import (
     angular_distance_loss,
     gaussian_nll_loss,
@@ -35,13 +35,6 @@ from ml_common.losses import (
     iag_nll_loss,
     esag_nll_loss,
     gag_nll_loss,
-    sipc_nll_loss,
-    sespc_nll_loss,
-    gspc_nll_loss,
-    ps_nll_loss,
-    ipt_nll_loss,
-    ept_nll_loss,
-    gpt_nll_loss,
 )
 from ml_common.training import Trainer
 from neptune import NeptuneModel
@@ -99,11 +92,10 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
     loss_name = model_opts["loss_fn"]
 
     if task == "angular_reco":
-        # IAG/vMF/SIPC: 3 (μ only), ESAG/SESPC: 5 (μ + shape), GAG/GSPC/GPT: 8
+        # IAG/vMF: 3 (μ only), ESAG: 5 (μ + shape), GAG: 8
         output_dim = {
-            "iag": 3, "vmf": 3, "sipc": 3, "ps": 3, "angular_distance": 3,
-            "esag": 5, "sespc": 5, "gag": 8, "gspc": 8,
-            "ipt": 3, "ept": 5, "gpt": 8,
+            "iag": 3, "vmf": 3, "angular_distance": 3,
+            "esag": 5, "gag": 8,
         }.get(loss_name, 4)
     elif task == "energy_reco":
         output_dim = 2 if loss_name == "gaussian_nll" else 1
@@ -237,34 +229,6 @@ def build_loss_function(model_opts: Dict[str, Any]):
             )
         if loss_name == "gag":
             return lambda preds, labels: gag_nll_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
-            )
-        if loss_name == "sipc":
-            return lambda preds, labels: sipc_nll_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
-            )
-        if loss_name == "sespc":
-            return lambda preds, labels: sespc_nll_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
-            )
-        if loss_name == "gspc":
-            return lambda preds, labels: gspc_nll_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
-            )
-        if loss_name == "ps":
-            return lambda preds, labels: ps_nll_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
-            )
-        if loss_name == "ipt":
-            return lambda preds, labels: ipt_nll_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
-            )
-        if loss_name == "ept":
-            return lambda preds, labels: ept_nll_loss(
-                preds, F.normalize(labels[:, 1:4], p=2, dim=1)
-            )
-        if loss_name == "gpt":
-            return lambda preds, labels: gpt_nll_loss(
                 preds, F.normalize(labels[:, 1:4], p=2, dim=1)
             )
 
@@ -429,20 +393,6 @@ def _mean_direction(preds, loss_name):
         return ESAG(preds).mean_direction
     if loss_name == "gag":
         return GAG(preds).mean_direction
-    if loss_name == "sipc":
-        return SIPC(preds).mean_direction
-    if loss_name == "sespc":
-        return SESPC(preds).mean_direction
-    if loss_name == "gspc":
-        return GSPC(preds).mean_direction
-    if loss_name == "ps":
-        return PowerSpherical(preds).mean_direction
-    if loss_name == "ipt":
-        return IPT(preds).mean_direction
-    if loss_name == "ept":
-        return EPT(preds).mean_direction
-    if loss_name == "gpt":
-        return GPT(preds).mean_direction
     # angular_distance or unknown: fall back to normalizing first 3 dims
     return F.normalize(preds[:, :3], p=2, dim=1)
 

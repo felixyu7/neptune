@@ -149,7 +149,7 @@ def _construct_orthonormal_basis(mu: Tensor) -> Tuple[Tensor, Tensor]:
 
 
 # ---------------------------------------------------------------------------
-# Cholesky parameterization utilities (used by GAG / GSPC)
+# Cholesky parameterization utilities (used by GAG)
 # ---------------------------------------------------------------------------
 
 # Bound on the free log-diagonals so exp() can never overflow to Inf (under low

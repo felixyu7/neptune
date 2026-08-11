@@ -3,7 +3,7 @@ import torch.nn as nn
 from torch import Tensor
 from typing import List, Tuple, Optional
 
-from torch_fps import farthest_point_sampling, farthest_point_sampling_with_knn
+from .fps import farthest_point_sampling, farthest_point_sampling_with_knn
 
 
 class FPSTokenizer(nn.Module):
