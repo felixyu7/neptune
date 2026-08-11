@@ -60,6 +60,26 @@ def fps_reference(points: Tensor, mask: Tensor, start_idx: Tensor, K: int) -> Te
     return idx
 
 
+def assign_reference(points: Tensor, idx: Tensor) -> Tensor:
+    """Nearest-centroid assignment to the FPS-selected centroids ``idx``.
+
+    Returns [B, N] int64 in [0, K); values at invalid lanes are unspecified.
+    Per-dim accumulation in fp32 matches the Triton kernels' order bitwise
+    (no [B,N,K,D] broadcast — the [B,N,K] accumulator keeps memory at the
+    same scale as the old baddbmm intermediate). NaN centroid distances
+    promote to +inf so a degenerate centroid is never chosen.
+    """
+    B, N, D = points.shape
+    pts = _acc(points)
+    cents = torch.gather(pts, 1, idx.unsqueeze(-1).expand(-1, -1, D))  # [B,K,D]
+    d = pts.new_zeros(B, N, idx.size(1))
+    for dim in range(D):
+        diff = pts[:, :, dim].unsqueeze(-1) - cents[:, :, dim].unsqueeze(1)
+        d = d + diff * diff
+    d = torch.where(d == d, d, float("inf"))
+    return d.argmin(dim=-1)
+
+
 def fps_knn_reference(points: Tensor, mask: Tensor, start_idx: Tensor,
                       K: int, k_neighbors: int) -> tuple[Tensor, Tensor]:
     B, N, D = points.shape

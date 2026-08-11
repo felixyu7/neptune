@@ -147,6 +147,41 @@ def _prepare(points: Tensor, valid_mask: Tensor,
     return points.contiguous(), valid_mask.contiguous()
 
 
+def _prepare_and_resolve(points, valid_mask, K, start_idx, random_start,
+                         generator, precision, validate, assume_finite):
+    """Shared front-end: shape checks, dtype prep, validity, start resolution.
+
+    Returns (points_c, mask_c, resolved_start_idx).
+    """
+    if points.dim() != 3:
+        raise ValueError("points tensor must have shape [B, N, D]")
+    if valid_mask.dim() != 2:
+        raise ValueError("valid_mask tensor must have shape [B, N]")
+    if points.shape[:2] != valid_mask.shape:
+        raise ValueError("points and valid_mask must agree on batch & point dims")
+    if K < 0:
+        raise ValueError("K must be non-negative")
+
+    device = points.device
+    points_c, mask_c = _prepare(points, valid_mask, precision)
+    B, N, _ = points_c.shape
+
+    # Selectable = mask-true AND all-finite; validation and start repair both
+    # count from this same predicate, so validate=True enforces exactly the
+    # documented "K <= valid points" precondition. assume_finite skips the
+    # [B,N,D] finiteness pass on the caller's guarantee.
+    valid = mask_c if assume_finite else (mask_c & points_c.isfinite().all(dim=-1))
+    counts = (
+        valid.sum(dim=1, dtype=torch.long)
+        if (validate or start_idx is not None) else None
+    )
+    start_idx = _resolve_start_idx(
+        valid, counts, B, N, K, device,
+        start_idx, random_start, generator, validate,
+    )
+    return points_c, mask_c, start_idx
+
+
 def farthest_point_sampling(
     points: Tensor,
     valid_mask: Tensor,
@@ -157,6 +192,7 @@ def farthest_point_sampling(
     generator: Optional[torch.Generator] = None,
     precision: Optional[torch.dtype] = None,
     validate: bool = True,
+    assume_finite: bool = False,
 ) -> Tensor:
     """
     Farthest point sampling with Triton (CUDA) / C++ (CPU) acceleration.
@@ -192,40 +228,22 @@ def farthest_point_sampling(
             precondition can pass `False` to keep the call fully asynchronous.
             With `validate=False` a violated precondition is NOT diagnosed:
             the kernel pads the output with repeated indices instead of raising.
+        assume_finite:
+            If `True`, the caller guarantees every mask-true point has finite
+            coordinates, and the `[B,N,D]` finiteness pass is skipped (validity
+            = mask alone). With non-finite inputs under this flag, a non-finite
+            point may be selected as the start (producing NaN downstream)
+            instead of being excluded. In-kernel guards are unaffected.
 
     Returns:
         idx:
             Long tensor `[B, K]` with the selected point indices.
     """
-    if points.dim() != 3:
-        raise ValueError("points tensor must have shape [B, N, D]")
-    if valid_mask.dim() != 2:
-        raise ValueError("valid_mask tensor must have shape [B, N]")
-    if points.shape[:2] != valid_mask.shape:
-        raise ValueError("points and valid_mask must agree on batch & point dims")
-    if K < 0:
-        raise ValueError("K must be non-negative")
-
+    points_c, mask_c, start_idx = _prepare_and_resolve(
+        points, valid_mask, K, start_idx, random_start,
+        generator, precision, validate, assume_finite)
     if K == 0:
-        return torch.zeros((points.shape[0], 0), device=points.device, dtype=torch.long)
-
-    device = points.device
-    points_c, mask_c = _prepare(points, valid_mask, precision)
-    B, N, _ = points_c.shape
-
-    # Selectable = mask-true AND all-finite; validation and start repair both
-    # count from this same predicate, so validate=True enforces exactly the
-    # documented "K <= valid points" precondition.
-    valid = mask_c & points_c.isfinite().all(dim=-1)
-    counts = (
-        valid.sum(dim=1, dtype=torch.long)
-        if (validate or start_idx is not None) else None
-    )
-
-    start_idx = _resolve_start_idx(
-        valid, counts, B, N, K, device,
-        start_idx, random_start, generator, validate,
-    )
+        return torch.zeros((points_c.shape[0], 0), device=points_c.device, dtype=torch.long)
 
     return _dispatch(points_c, mask_c, start_idx, K, None)
 
@@ -241,6 +259,7 @@ def farthest_point_sampling_with_knn(
     generator: Optional[torch.Generator] = None,
     precision: Optional[torch.dtype] = None,
     validate: bool = True,
+    assume_finite: bool = False,
 ) -> tuple[Tensor, Tensor]:
     """
     Fused farthest point sampling + k-nearest neighbors.
@@ -260,39 +279,70 @@ def farthest_point_sampling_with_knn(
             Long tensor `[B, K, k_neighbors]` with the k nearest neighbor
             indices for each centroid, sorted by distance (closest first).
     """
-    if points.dim() != 3:
-        raise ValueError("points tensor must have shape [B, N, D]")
-    if valid_mask.dim() != 2:
-        raise ValueError("valid_mask tensor must have shape [B, N]")
-    if points.shape[:2] != valid_mask.shape:
-        raise ValueError("points and valid_mask must agree on batch & point dims")
-    if K < 0:
-        raise ValueError("K must be non-negative")
     if k_neighbors <= 0:
         raise ValueError("k_neighbors must be positive")
 
-    B, N, _ = points.shape
-    device = points.device
+    points_c, mask_c, start_idx = _prepare_and_resolve(
+        points, valid_mask, K, start_idx, random_start,
+        generator, precision, validate, assume_finite)
+    B, N, _ = points_c.shape
 
     if K == 0:
-        centroid_idx = torch.zeros((B, 0), device=device, dtype=torch.long)
-        neighbor_idx = torch.zeros((B, 0, k_neighbors), device=device, dtype=torch.long)
+        centroid_idx = torch.zeros((B, 0), device=points_c.device, dtype=torch.long)
+        neighbor_idx = torch.zeros((B, 0, k_neighbors), device=points_c.device, dtype=torch.long)
         return centroid_idx, neighbor_idx
 
     if k_neighbors > N:
         raise ValueError(f"k_neighbors ({k_neighbors}) must be <= N ({N})")
 
-    points_c, mask_c = _prepare(points, valid_mask, precision)
-
-    valid = mask_c & points_c.isfinite().all(dim=-1)
-    counts = (
-        valid.sum(dim=1, dtype=torch.long)
-        if (validate or start_idx is not None) else None
-    )
-
-    start_idx = _resolve_start_idx(
-        valid, counts, B, N, K, device,
-        start_idx, random_start, generator, validate,
-    )
-
     return _dispatch(points_c, mask_c, start_idx, K, k_neighbors)
+
+
+def farthest_point_sampling_with_assign(
+    points: Tensor,
+    valid_mask: Tensor,
+    K: int,
+    *,
+    start_idx: Optional[Tensor] = None,
+    random_start: bool = True,
+    generator: Optional[torch.Generator] = None,
+    precision: Optional[torch.dtype] = None,
+    validate: bool = True,
+    assume_finite: bool = False,
+) -> tuple[Tensor, Tensor]:
+    """
+    Fused farthest point sampling + nearest-centroid (Voronoi) assignment.
+
+    The FPS loop already computes every point's distance to each selected
+    centroid, so the assignment comes at negligible extra cost on the fused
+    CUDA path. Ties assign to the lowest centroid index. All arguments and
+    semantics match :func:`farthest_point_sampling`.
+
+    Returns:
+        idx:
+            Long tensor `[B, K]` with the selected centroid indices.
+        assign:
+            Long tensor `[B, N]` with each point's nearest centroid as a
+            position in `[0, K)` (i.e. an index into `idx`, not into `points`).
+            Values at invalid lanes (masked out or non-finite) are unspecified.
+    """
+    points_c, mask_c, start_idx = _prepare_and_resolve(
+        points, valid_mask, K, start_idx, random_start,
+        generator, precision, validate, assume_finite)
+    B, N, D = points_c.shape
+
+    if K == 0:
+        return (torch.zeros((B, 0), device=points_c.device, dtype=torch.long),
+                torch.zeros((B, N), device=points_c.device, dtype=torch.long))
+
+    if points_c.is_cuda and points_c.dtype != torch.float64:
+        try:
+            from . import _triton
+        except ImportError:
+            pass
+        else:
+            if N <= _triton._single_tile_cap(_triton.SINGLE_TILE_MAX_N, D):
+                return _triton.fps_assign(points_c, mask_c, start_idx, K)
+    # composed route: tiled-N CUDA, CPU, and other devices
+    idx = _dispatch(points_c, mask_c, start_idx, K, None)
+    return idx, _reference.assign_reference(points_c, idx)

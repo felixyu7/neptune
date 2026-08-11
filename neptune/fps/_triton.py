@@ -76,10 +76,11 @@ def _resolve_start(start_ptr, b, N):
 
 
 @triton.jit
-def _fps_single_kernel(points_ptr, mask_ptr, start_ptr, idx_ptr,
+def _fps_single_kernel(points_ptr, mask_ptr, start_ptr, idx_ptr, assign_ptr,
                        N, K,
                        stride_pb, stride_pn, stride_mb, stride_ib,
-                       D: tl.constexpr, BLOCK_N: tl.constexpr):
+                       D: tl.constexpr, BLOCK_N: tl.constexpr,
+                       WITH_ASSIGN: tl.constexpr):
     b = tl.program_id(0).to(tl.int64)
     offs = tl.arange(0, BLOCK_N)
     inb = offs < N
@@ -89,10 +90,22 @@ def _fps_single_kernel(points_ptr, mask_ptr, start_ptr, idx_ptr,
 
     min_d = tl.where(valid, _INF, -_INF)
     last = _resolve_start(start_ptr, b, N)
+    if WITH_ASSIGN:
+        # running nearest-centroid: the K-loop computes every hit's distance
+        # to each selected centroid anyway, so the Voronoi assignment is free
+        best_d = tl.full((BLOCK_N,), _INF, dtype=tl.float32)
+        best_i = tl.zeros((BLOCK_N,), dtype=tl.int32)
 
     for i in range(K):
         sel = offs == last
         dist = _dist_to(coords, sel, D)
+        if WITH_ASSIGN:
+            # raw dist, before selection-marking; strict < keeps the earliest
+            # centroid on exact ties (= argmin first-occurrence), and NaN
+            # dist never updates
+            upd = valid & (dist < best_d)
+            best_d = tl.where(upd, dist, best_d)
+            best_i = tl.where(upd, i, best_i)
         # exact CUDA update: NaN dist and -inf (invalid/selected) lanes keep old
         min_d = tl.where(valid & (dist < min_d), dist, min_d)
         min_d = tl.where(sel, -_INF, min_d)
@@ -101,6 +114,9 @@ def _fps_single_kernel(points_ptr, mask_ptr, start_ptr, idx_ptr,
                         return_indices_tie_break_left=True)
         # exhausted rows (all -inf) repeat the previous selection
         last = tl.where(bv == -_INF, last, bi)
+
+    if WITH_ASSIGN:
+        tl.store(assign_ptr + b * N + offs, best_i.to(tl.int64), mask=inb)
 
 
 @triton.jit
@@ -286,22 +302,106 @@ def _fps_knn_tiled_kernel(points_ptr, mask_ptr, start_ptr, idx_ptr, nbr_ptr,
         last = tl.where(run_bv == -_INF, last, run_bi)
 
 
+@triton.jit
+def _nearest_assign_kernel(p_ptr, c_ptr, starts_ptr, counts_ptr, out_ptr,
+                           K,
+                           stride_p, stride_c,
+                           D: tl.constexpr, BLOCK_N: tl.constexpr,
+                           BLOCK_K: tl.constexpr):
+    b = tl.program_id(0).to(tl.int64)
+    tile = tl.program_id(1)
+    start = tl.load(starts_ptr + b)
+    count = tl.load(counts_ptr + b)
+
+    offs_n = tile * BLOCK_N + tl.arange(0, BLOCK_N)
+    ok_n = offs_n < count
+    rows = start + offs_n.to(tl.int64)
+    offs_k = tl.arange(0, BLOCK_K)
+    ok_k = offs_k < K
+    c_rows = (b * K + offs_k.to(tl.int64)) * stride_c
+
+    d = tl.zeros((BLOCK_N, BLOCK_K), dtype=tl.float32)
+    for dim in tl.static_range(D):
+        p = tl.load(p_ptr + rows * stride_p + dim, mask=ok_n, other=0.0).to(tl.float32)
+        c = tl.load(c_ptr + c_rows + dim, mask=ok_k, other=0.0).to(tl.float32)
+        diff = p[:, None] - c[None, :]
+        d += diff * diff
+    # NaN centroids (reachable via degenerate Lloyd charge weights) and the
+    # k >= K padding lanes must never win the argmin
+    d = tl.where(d == d, d, _INF)
+    d = tl.where(ok_k[None, :], d, _INF)
+    a = tl.argmin(d, axis=1, tie_break_left=True)
+    tl.store(out_ptr + rows, a.to(tl.int64), mask=ok_n)
+
+
+def nearest_assign(p_flat: Tensor, cents: Tensor, starts: Tensor,
+                   counts: Tensor, n_max: int, K: int) -> Tensor:
+    """Nearest-centroid assignment over batch-segmented flat points.
+
+    p_flat [N, D] fp32 flat hits (rows grouped per event), cents [B*K, D]
+    fp32 centroids, starts/counts [B] int64 segment bounds, n_max = max
+    count (host int). Returns [N] int64 cell indices in [0, K). Deterministic
+    (lowest centroid index on exact ties), sync-free, gradient-free: inputs
+    are detached — assignment is integer routing and stays out of the graph.
+    """
+    N, D = p_flat.shape
+    B = starts.numel()
+    out = torch.empty(N, device=p_flat.device, dtype=torch.long)
+    if N == 0 or B == 0:
+        return out
+    if K > 512:
+        raise ValueError(f"nearest_assign supports K <= 512, got {K}")
+    p = p_flat.detach().contiguous()
+    c = cents.detach().contiguous()
+    BLOCK_K = max(triton.next_power_of_2(K), 16)
+    # small tiles: the [BLOCK_N, BLOCK_K] fp32 distance tile must stay
+    # register-resident (larger budgets spill and run 2-8x slower)
+    BLOCK_N = max(16, 2048 // BLOCK_K)
+    grid = (B, triton.cdiv(max(n_max, 1), BLOCK_N))
+    _nearest_assign_kernel[grid](p, c, starts, counts, out, K,
+                                 p.stride(0), c.stride(0),
+                                 D=D, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K,
+                                 num_warps=2)
+    return out
+
+
 def fps(points: Tensor, mask: Tensor, start_idx: Tensor, K: int) -> Tensor:
     B, N, D = points.shape
     idx = torch.empty(B, K, device=points.device, dtype=torch.long)
     if B == 0 or K == 0:
         return idx
-    common = (points, mask, start_idx, idx, N, K,
-              points.stride(0), points.stride(1), mask.stride(0), idx.stride(0))
     if N <= _single_tile_cap(SINGLE_TILE_MAX_N, D):
         BLOCK_N = max(triton.next_power_of_2(N), 16)
-        _fps_single_kernel[(B,)](*common, D=D, BLOCK_N=BLOCK_N,
+        _fps_single_kernel[(B,)](points, mask, start_idx, idx, idx, N, K,
+                                 points.stride(0), points.stride(1),
+                                 mask.stride(0), idx.stride(0),
+                                 D=D, BLOCK_N=BLOCK_N, WITH_ASSIGN=False,
                                  num_warps=_num_warps(BLOCK_N))
     else:
         min_d = torch.empty(B, N, device=points.device, dtype=torch.float32)
-        _fps_tiled_kernel[(B,)](*common[:4], min_d, *common[4:],
+        _fps_tiled_kernel[(B,)](points, mask, start_idx, idx, min_d, N, K,
+                                points.stride(0), points.stride(1),
+                                mask.stride(0), idx.stride(0),
                                 D=D, BLOCK_N=TILE_N, num_warps=8)
     return idx
+
+
+def fps_assign(points: Tensor, mask: Tensor, start_idx: Tensor,
+               K: int) -> tuple[Tensor, Tensor]:
+    """Fused FPS + nearest-centroid assignment (single-tile sizes only;
+    the API layer composes fps + reference assign beyond the cap)."""
+    B, N, D = points.shape
+    idx = torch.empty(B, K, device=points.device, dtype=torch.long)
+    assign = torch.zeros(B, N, device=points.device, dtype=torch.long)
+    if B == 0 or K == 0:
+        return idx, assign
+    BLOCK_N = max(triton.next_power_of_2(N), 16)
+    _fps_single_kernel[(B,)](points, mask, start_idx, idx, assign, N, K,
+                             points.stride(0), points.stride(1),
+                             mask.stride(0), idx.stride(0),
+                             D=D, BLOCK_N=BLOCK_N, WITH_ASSIGN=True,
+                             num_warps=_num_warps(BLOCK_N))
+    return idx, assign
 
 
 def fps_knn(points: Tensor, mask: Tensor, start_idx: Tensor,

@@ -3,7 +3,10 @@ import torch.nn as nn
 from torch import Tensor
 from typing import List, Tuple, Optional
 
-from .fps import farthest_point_sampling, farthest_point_sampling_with_knn
+from .fps import (
+    farthest_point_sampling_with_assign,
+    farthest_point_sampling_with_knn,
+)
 
 
 class FPSTokenizer(nn.Module):
@@ -276,26 +279,42 @@ class FPSTokenizer(nn.Module):
             starts_l = torch.cumsum(csub_l, 0) - csub_l       # [B_l] into flat subset
 
             if self.assign_mode == "voronoi":
-                fps_idx = farthest_point_sampling(
+                # Fused FPS + nearest-centroid assignment: the FPS loop already
+                # computes every hit-to-centroid distance, so the initial
+                # Voronoi assignment is free. Runs fp32 regardless of autocast
+                # (the previous baddbmm path was bf16-quantized under autocast).
+                fps_idx, assign_pad = farthest_point_sampling_with_assign(
                     P_pad_m, valid_l, K,
-                    random_start=self.training, validate=False)          # [B_l, K]
+                    random_start=self.training, validate=False,
+                    assume_finite=True)               # [B_l, K], [B_l, Nmax_l]
                 cent_flat = (starts_l[:, None] + fps_idx).reshape(-1)    # [B_l*K]
                 cents_raw = p_l.index_select(0, cent_flat)               # [B_l*K, 4]
                 cents_m = p_l_m.index_select(0, cent_flat).view(B_l, K, 4)
 
                 def _cell_dists(C_m: Tensor) -> Tensor:
-                    # Squared metric distances via ||c||^2 - 2 p.c (the ||p||^2
-                    # term is constant per hit, hence argmin-invariant, and
-                    # dropped): one baddbmm materializing [B_l*Nmax_l, K]
-                    # instead of the [N_l, K, 4] broadcast difference.
+                    # Non-CUDA fallback: squared metric distances via
+                    # ||c||^2 - 2 p.c (the ||p||^2 term is constant per hit,
+                    # hence argmin-invariant, and dropped): one baddbmm
+                    # materializing [B_l*Nmax_l, K].
                     c_sq = C_m.pow(2).sum(-1)                             # [B_l, K]
                     d_pad = torch.baddbmm(c_sq.unsqueeze(1), P_pad_m,
                                           C_m.transpose(1, 2), alpha=-2.0)
                     return d_pad.reshape(-1, K).index_select(0, dest_pad)  # [N_l, K]
 
-                # Nearest-centroid assignment in the scaled metric: every hit
-                # joins exactly one token (coverage = 1 by construction).
-                assign = _cell_dists(cents_m).argmin(dim=1)               # [N_l]
+                def _lloyd_assign(cm_flat: Tensor) -> Tensor:
+                    # Streaming Triton argmin on CUDA: no [N_l, K] intermediate.
+                    # Elsewhere the baddbmm fallback, NaN-guarded to match the
+                    # kernel (a degenerate Lloyd centroid must never win).
+                    if device.type == "cuda":
+                        from .fps._triton import nearest_assign
+                        return nearest_assign(p_l_m, cm_flat, starts_l,
+                                              csub_l, Nmax_l, K)
+                    d = _cell_dists(cm_flat.view(B_l, K, 4))
+                    return torch.where(d == d, d, float("inf")).argmin(dim=1)
+
+                # Every hit joins exactly one token (coverage = 1 by
+                # construction); assignment in the scaled metric.
+                assign = assign_pad.reshape(-1).index_select(0, dest_pad)  # [N_l]
                 cell = seg_l * K + assign                                 # [N_l]
 
                 q_phys = torch.expm1(q_l.float().clamp(min=0))            # [N_l]
@@ -314,7 +333,7 @@ class FPSTokenizer(nn.Module):
                         cm_flat = torch.where(
                             (wsum > 0)[:, None],
                             csum / wsum.clamp(min=1e-9)[:, None], cm_flat)
-                        assign = _cell_dists(cm_flat.view(B_l, K, 4)).argmin(dim=1)
+                        assign = _lloyd_assign(cm_flat)
                         cell = seg_l * K + assign
                         cell4 = cell.unsqueeze(-1).expand(-1, 4)
                     # Raw-unit centroids: charge-weighted cell means over the
