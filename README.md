@@ -55,7 +55,7 @@ For full training runs, the CLI entry point `scripts/run.py` uses shared tooling
 python scripts/run.py -c scripts/configs/what-1_angular_reco.cfg
 ```
 
-Configs for the WhaT-1 and Prometheus tasks live under `scripts/configs/`.
+Configs for the WhaT-1 and Prometheus tasks live under `scripts/configs/`. The four `what-1_*.cfg` files are the v1.2 release configs (direction, energy, morphology, neutrino-vs-background) and reproduce the released v1.2 checkpoints.
 
 Run the test suite with
 

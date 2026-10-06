@@ -352,6 +352,18 @@ def farthest_point_sampling_with_assign(
         else:
             if N <= _triton._single_tile_cap(_triton.SINGLE_TILE_MAX_N, D):
                 return _triton.fps_assign(points_c, mask_c, start_idx, K)
-    # composed route: tiled-N CUDA, CPU, and other devices
+            # tiled-N CUDA: tiled FPS + tiled nearest-centroid kernel. The
+            # dense reference would materialize [B, N, K] fp32 distances
+            # (GBs for pulse-level events with N ~ 1e5).
+            if K <= 512:
+                idx = _dispatch(points_c, mask_c, start_idx, K, None)
+                cents = torch.gather(points_c, 1, idx.unsqueeze(-1).expand(-1, -1, D))
+                starts = torch.arange(B, device=points_c.device, dtype=torch.long) * N
+                counts = torch.full((B,), N, device=points_c.device, dtype=torch.long)
+                assign = _triton.nearest_assign(
+                    points_c.reshape(B * N, D), cents.reshape(B * K, D),
+                    starts, counts, N, K)
+                return idx, assign.view(B, N)
+    # composed route: CPU and other devices
     idx = _dispatch(points_c, mask_c, start_idx, K, None)
     return idx, _reference.assign_reference(points_c, idx)

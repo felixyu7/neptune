@@ -9,6 +9,30 @@ from .fps import (
 )
 
 
+class PulseSlotEncoder(nn.Module):
+    """Per-DOM encoder over its first S pulses (time-ordered slots).
+
+    Input  [N, 3 + 2S]: [log1p Q_dom, slog t_first, log1p n_pulses,
+                         (log1p q_s, log1p dt_s since first pulse) x S], zero-padded.
+    Output [N, 3 + D]:  DOM scalars + attention-pooled slot embedding.
+    """
+
+    def __init__(self, n_slots: int, dim: int):
+        super().__init__()
+        self.n_slots = n_slots
+        self.phi = nn.Sequential(nn.Linear(2, dim), nn.GELU(), nn.Linear(dim, dim))
+        self.slot_emb = nn.Parameter(torch.zeros(n_slots, dim))
+        self.score = nn.Linear(dim, 1)
+
+    def forward(self, x: Tensor) -> Tensor:
+        slots = x[:, 3:].unflatten(-1, (self.n_slots, 2))         # [N, S, 2]
+        h = self.phi(slots) + self.slot_emb                       # [N, S, D]
+        s = self.score(h).squeeze(-1)
+        s = s.masked_fill(slots[..., 0] <= 0, float("-inf"))      # empty slots (q = 0)
+        a = torch.softmax(s.float(), dim=-1).nan_to_num(0.0).to(h.dtype)
+        return torch.cat([x[:, :3], (a.unsqueeze(-1) * h).sum(1)], dim=-1)
+
+
 class FPSTokenizer(nn.Module):
     """
     GPU-native, vectorized FPS-based tokenizer for point clouds:
@@ -64,7 +88,11 @@ class FPSTokenizer(nn.Module):
                  charge_col: int = 0,
                  assign_mode: str = "voronoi",
                  metric_time_scale: float = 0.3,
-                 lloyd_iters: int = 0):
+                 lloyd_iters: int = 0,
+                 anchor_dt_col: Optional[int] = None,
+                 cell_pool: str = "mean",
+                 pulse_slots: int = 0,
+                 slot_dim: int = 64):
         super().__init__()
         if mlp_layers is None:
             mlp_layers = [256, 512, 768]
@@ -72,6 +100,10 @@ class FPSTokenizer(nn.Module):
             raise ValueError(f"assign_mode must be 'voronoi' or 'knn', got '{assign_mode}'")
         if lloyd_iters < 0:
             raise ValueError(f"lloyd_iters must be >= 0, got {lloyd_iters}")
+        if cell_pool not in ("mean", "attn"):
+            raise ValueError(f"cell_pool must be 'mean' or 'attn', got '{cell_pool}'")
+        if assign_mode == "knn" and (anchor_dt_col is not None or cell_pool != "mean"):
+            raise ValueError("anchor_dt_col / cell_pool='attn' require assign_mode='voronoi'")
         self.max_tokens = max_tokens
         self.token_dim = token_dim
         self.k_neighbors = k_neighbors
@@ -81,6 +113,23 @@ class FPSTokenizer(nn.Module):
         self.assign_mode = assign_mode
         self.metric_time_scale = metric_time_scale
         self.lloyd_iters = lloyd_iters
+        # Pulse mode: feature col holding log1p(ns since the DOM's first pulse).
+        # When set, FPS/assignment/centroids use each pulse's DOM first-hit time
+        # (all pulses of a DOM share one anchor point -> same cell, and token
+        # times track the direct-light front); rel offsets keep the pulse time.
+        self.anchor_dt_col = anchor_dt_col
+        self.cell_pool = cell_pool
+
+        # Optional per-DOM pulse-slot encoder (pulse_slots > 0): features are
+        # [3 DOM scalars, (log1p q, log1p dt) x pulse_slots] and are replaced by
+        # [3 DOM scalars, attention-pooled slot embedding] before MLP 1.
+        self.slot_encoder = None
+        if pulse_slots > 0:
+            if feature_dim != 3 + 2 * pulse_slots:
+                raise ValueError(f"pulse_slots={pulse_slots} needs feature_dim "
+                                 f"{3 + 2 * pulse_slots}, got {feature_dim}")
+            self.slot_encoder = PulseSlotEncoder(pulse_slots, slot_dim)
+            feature_dim = 3 + slot_dim
 
         # MLP 1: Per-point feature extraction
         mlp1 = []
@@ -111,6 +160,13 @@ class FPSTokenizer(nn.Module):
             nn.GELU(),
             nn.Linear(rel_pos_hidden, token_dim),
         )
+
+        # Attention cell pooling: score = log(w) + MLP(h). The head is zero-init,
+        # so training starts exactly at the charge-weighted mean.
+        if cell_pool == "attn":
+            self.pool_score = nn.Sequential(nn.Linear(token_dim, 64), nn.GELU(), nn.Linear(64, 1))
+            nn.init.zeros_(self.pool_score[-1].weight)
+            nn.init.zeros_(self.pool_score[-1].bias)
 
         # Buffer (not a per-forward host tensor: that would cost a pageable
         # H2D copy + stream sync every call).
@@ -175,7 +231,13 @@ class FPSTokenizer(nn.Module):
 
         batch_idx = batch_ids.long()
         points4 = torch.cat([coords[:, :3], times], dim=-1)   # [N,4] raw units
-        point_feats = self.mlp1(features)                     # [N, T]
+        if self.anchor_dt_col is not None:
+            dt_dom = torch.expm1(features[:, self.anchor_dt_col].float()) * 1e-3  # ns -> us
+            anchor4 = torch.cat([coords[:, :3], times - dt_dom.unsqueeze(-1).to(times.dtype)], dim=-1)
+        else:
+            anchor4 = points4
+        feats_in = self.slot_encoder(features) if self.slot_encoder is not None else features
+        point_feats = self.mlp1(feats_in)                     # [N, T]
         q = features[:, self.charge_col]                      # [N] log1p charge
 
         # The single host sync: one D2H copy of the ids. (bincount on a CUDA
@@ -187,6 +249,7 @@ class FPSTokenizer(nn.Module):
         # Sort hits by batch so each event is a contiguous run.
         sort_idx = torch.argsort(batch_idx, stable=True)
         p_sorted = points4.index_select(0, sort_idx)
+        a_sorted = p_sorted if anchor4 is points4 else anchor4.index_select(0, sort_idx)
         f_sorted = point_feats.index_select(0, sort_idx)
         q_sorted = q.index_select(0, sort_idx)
 
@@ -261,11 +324,12 @@ class FPSTokenizer(nn.Module):
             f_l = f_sorted.index_select(0, src_l)             # [N_l, T]
             p_l = p_sorted.index_select(0, src_l)             # [N_l, 4] raw
             q_l = q_sorted.index_select(0, src_l)             # [N_l]
+            a_l = p_l if a_sorted is p_sorted else a_sorted.index_select(0, src_l)
             n_l = f_l.size(0)
 
             # Metric copy for FPS/assignment: fp32, time axis scaled. Padding
             # stays zero (finite) — the kernel masks it but must not see NaNs.
-            p_l_m = p_l.float() * self.metric_scale           # [N_l, 4]
+            p_l_m = a_l.float() * self.metric_scale           # [N_l, 4]
             P_pad_m = torch.zeros(B_l * Nmax_l, 4, device=device)
             dest_pad = seg_l * Nmax_l + local_l
             P_pad_m.index_copy_(0, dest_pad, p_l_m)
@@ -288,7 +352,7 @@ class FPSTokenizer(nn.Module):
                     random_start=self.training, validate=False,
                     assume_finite=True)               # [B_l, K], [B_l, Nmax_l]
                 cent_flat = (starts_l[:, None] + fps_idx).reshape(-1)    # [B_l*K]
-                cents_raw = p_l.index_select(0, cent_flat)               # [B_l*K, 4]
+                cents_raw = a_l.index_select(0, cent_flat)               # [B_l*K, 4]
                 cents_m = p_l_m.index_select(0, cent_flat).view(B_l, K, 4)
 
                 def _cell_dists(C_m: Tensor) -> Tensor:
@@ -341,7 +405,7 @@ class FPSTokenizer(nn.Module):
                     # cells fall back to their FPS hit position.
                     wsum = torch.zeros(BK, device=device).scatter_add_(0, cell, q_phys)
                     craw = torch.zeros(BK, 4, device=device).scatter_add_(
-                        0, cell4, p_l * q_phys[:, None])
+                        0, cell4, a_l * q_phys[:, None])
                     cents_raw = torch.where(
                         (wsum > 0)[:, None],
                         (craw / wsum.clamp(min=1e-9)[:, None]).to(cents_raw.dtype),
@@ -362,9 +426,20 @@ class FPSTokenizer(nn.Module):
                 wsafe = wsum.clamp(min=1e-6)
 
                 if self.knn_pool == "max_mean":
-                    hw = h.float() * w[:, None]
-                    hsum = torch.zeros(B_l * K, T, device=device).scatter_add_(0, cell_T, hw)
-                    mean = (hsum / wsafe[:, None]).to(h.dtype)
+                    if self.cell_pool == "attn":
+                        # Segment softmax over each cell (sync-free scatter ops).
+                        score = torch.log(w.clamp(min=1e-6)) + self.pool_score(h).squeeze(-1).float()
+                        smax = torch.full((B_l * K,), float("-inf"), device=device).scatter_reduce(
+                            0, cell, score, reduce="amax", include_self=True)
+                        aw = torch.exp(score - smax.index_select(0, cell))
+                        asum = torch.zeros(B_l * K, device=device).scatter_add_(0, cell, aw)
+                        hsum = torch.zeros(B_l * K, T, device=device).scatter_add_(
+                            0, cell_T, h.float() * aw[:, None])
+                        mean = (hsum / asum.clamp(min=1e-12)[:, None]).to(h.dtype)
+                    else:
+                        hw = h.float() * w[:, None]
+                        hsum = torch.zeros(B_l * K, T, device=device).scatter_add_(0, cell_T, hw)
+                        mean = (hsum / wsafe[:, None]).to(h.dtype)
                     pooled_l = torch.cat([mx, mean], dim=-1)
                 else:
                     pooled_l = mx
