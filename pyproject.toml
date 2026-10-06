@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neptune-reco"
-version = "0.1.0"
+version = "1.2.0"
 description = "A transformer-based point cloud processing model for neutrino event reconstruction"
 readme = "README.md"
 license = {text = "MIT"}
