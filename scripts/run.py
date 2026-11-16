@@ -35,6 +35,8 @@ from ml_common.losses import angular_distance_loss, gaussian_nll_loss
 from ml_common.training import Trainer
 from neptune import NeptuneModel
 
+_trapezoid = getattr(np, 'trapezoid', None) or np.trapz  # numpy < 2 has only trapz
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Neptune training entrypoint")
@@ -97,12 +99,8 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         output_dim = 2 if loss_name == "gaussian_nll" else 1
     elif task == "vertex_reco":
         output_dim = 3
-    elif task == "starting_classification":
-        output_dim = 1
     elif task == "morphology_classification":
         output_dim = 6
-    elif task == "track_cascade_classification":
-        output_dim = 1
     elif task == "neutrino_classification":
         output_dim = 1
     else:
@@ -119,17 +117,11 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         )
 
     tokenizer_kwargs = model_opts.get("tokenizer_kwargs")
-    pool_type = model_opts.get("pool_type", "mean")
+    # Backwards compat for WhaT-1 v1.2 checkpoints only: their configs set pool_type.
+    if model_opts.get("pool_type", "attention") != "attention":
+        raise ValueError("pool_type other than 'attention' was removed in 1.3")
     layerscale_init = model_opts.get("layerscale_init", 1e-5)
     attn_impl = model_opts.get("attn_impl", "auto")
-
-    # Positional-encoding knobs (geometry-derived defaults live in the model).
-    fourier_num_bands = model_opts.get("fourier_num_bands", 20)
-    fourier_freq_min = model_opts.get("fourier_freq_min", 3.0)
-    fourier_freq_max = model_opts.get("fourier_freq_max", 180.0)
-    fourier_axis_scales = tuple(model_opts.get("fourier_axis_scales", (1.0, 1.0, 1.0)))
-    rope_base = model_opts.get("rope_base", 60)
-    rope_scales = tuple(model_opts.get("rope_scales", (180.0, 180.0, 180.0, 40.0)))
 
     # Encoder is lazily auto-compiled inside NeptuneModel (falls back to
     # uncompiled on failure); disable via `compile_encoder: false`.
@@ -144,15 +136,8 @@ def build_model(model_opts: Dict[str, Any], device: torch.device) -> torch.nn.Mo
         drop_path_rate=drop_path_rate,
         output_dim=output_dim,
         tokenizer_kwargs=tokenizer_kwargs,
-        pool_type=pool_type,
         layerscale_init=layerscale_init,
         attn_impl=attn_impl,
-        fourier_num_bands=fourier_num_bands,
-        fourier_freq_min=fourier_freq_min,
-        fourier_freq_max=fourier_freq_max,
-        fourier_axis_scales=fourier_axis_scales,
-        rope_scales=rope_scales,
-        rope_base=rope_base,
         compile_encoder=model_opts.get("compile_encoder", True),
         compile_options=model_opts.get("compile_options"),
         compile_strict=model_opts.get("compile_strict", False),
@@ -249,19 +234,6 @@ def build_loss_function(model_opts: Dict[str, Any]):
 
         return loss_fn
 
-    if task == "starting_classification":
-        if loss_name != "bce":
-            raise ValueError("starting_classification currently supports only the 'bce' loss")
-
-        def loss_fn(preds, labels):
-            logits = preds.view(-1)
-            # starting_flag lives at column 5 (mmap label layout); the last
-            # column is vertex_z.
-            targets = labels[:, 5].reshape(-1).float()
-            return F.binary_cross_entropy_with_logits(logits, targets)
-
-        return loss_fn
-
     if task == "morphology_classification":
         if loss_name != "cross_entropy":
             raise ValueError("morphology_classification currently supports only the 'cross_entropy' loss")
@@ -310,22 +282,6 @@ def build_loss_function(model_opts: Dict[str, Any]):
                 w = class_weights[targets]
                 return (per_sample * w).sum() / w.sum().clamp(min=1.0)
             return per_sample.mean()
-
-        return loss_fn
-
-    if task == "track_cascade_classification":
-        if loss_name != "bce":
-            raise ValueError("track_cascade_classification currently supports only the 'bce' loss")
-
-        pos_weight = torch.tensor(10.0)
-
-        def loss_fn(preds, labels):
-            nonlocal pos_weight
-            if pos_weight.device != preds.device:
-                pos_weight = pos_weight.to(preds.device)
-            logits = preds.view(-1)
-            targets = (labels[:, 4] == 0).float()
-            return F.binary_cross_entropy_with_logits(logits, targets, pos_weight=pos_weight)
 
         return loss_fn
 
@@ -429,18 +385,6 @@ def build_metric_function(model_opts: Dict[str, Any]):
             }
         return metric_fn
 
-    if task == "starting_classification":
-        def metric_fn(preds, labels):
-            logits = preds.view(-1)
-            # starting_flag column, matching the loss (NOT the last column,
-            # which is vertex_z).
-            targets = labels[:, 5].reshape(-1)
-            probs = torch.sigmoid(logits)
-            preds_binary = (probs >= 0.5).float()
-            accuracy = (preds_binary == targets).float().mean().item()
-            return {"accuracy": accuracy}
-        return metric_fn
-
     if task == "morphology_classification":
         # Class indices: 0=cascade, 1=starting, 2=throughgoing, 3=stopping, 4=uncontained, 5=bundle
         starting_like = {0, 1}
@@ -463,16 +407,6 @@ def build_metric_function(model_opts: Dict[str, Any]):
             }
         return metric_fn
 
-    if task == "track_cascade_classification":
-        def metric_fn(preds, labels):
-            logits = preds.view(-1)
-            targets = (labels[:, 4] == 0).float()
-            probs = torch.sigmoid(logits)
-            preds_binary = (probs >= 0.5).float()
-            accuracy = (preds_binary == targets).float().mean().item()
-            return {"accuracy": accuracy}
-        return metric_fn
-
     if task == "neutrino_classification":
         # Trainer aggregates preds/labels across all val batches and calls this
         # once at epoch end, so metrics are computed on the full val set.
@@ -486,7 +420,7 @@ def build_metric_function(model_opts: Dict[str, Any]):
                 return metrics
 
             fpr, tpr, thr = roc_curve(targets, probs)
-            metrics["auc_roc"] = float(np.trapezoid(tpr, fpr))
+            metrics["auc_roc"] = float(_trapezoid(tpr, fpr))
 
             # TPR at target FPRs via ROC interpolation (avoids tie-inflation
             # from threshold-based quantile computations).
@@ -501,7 +435,7 @@ def build_metric_function(model_opts: Dict[str, Any]):
             mask = fpr <= alpha_fpr
             fpr_tail = np.concatenate([fpr[mask], [alpha_fpr]])
             tpr_tail = np.concatenate([tpr[mask], [np.interp(alpha_fpr, fpr, tpr)]])
-            metrics["pauc_fpr_le_1e-4"] = float(np.trapezoid(tpr_tail, fpr_tail) / alpha_fpr)
+            metrics["pauc_fpr_le_1e-4"] = float(_trapezoid(tpr_tail, fpr_tail) / alpha_fpr)
 
             # Threshold at FPR=1e-4 (well-resolved diagnostic operating point).
             idx_4 = int(np.searchsorted(fpr, 1e-4))
@@ -559,11 +493,6 @@ def main() -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
-    if model_opts.get("downstream_task") == "starting_classification":
-        cfg["task"] = "starting_classification"
-        cfg.setdefault("data_options", {})
-        cfg["data_options"]["task"] = "starting_classification"
 
     best_key, best_mode = build_best_metric_spec(model_opts["downstream_task"])
     cfg["training_options"]["best_metric_key"] = best_key

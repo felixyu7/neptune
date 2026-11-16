@@ -28,8 +28,7 @@ from . import _cpu, _reference
 _warned_cuda_fallback = False
 
 
-def _dispatch(points_c: Tensor, mask_c: Tensor, start_idx: Tensor,
-              K: int, k_neighbors: Optional[int]):
+def _dispatch(points_c: Tensor, mask_c: Tensor, start_idx: Tensor, K: int):
     """Route a resolved call to the best backend for its device/dtype."""
     global _warned_cuda_fallback
     if points_c.is_cuda and points_c.dtype != torch.float64:
@@ -42,18 +41,12 @@ def _dispatch(points_c: Tensor, mask_c: Tensor, start_idx: Tensor,
                     f"neptune.fps: Triton unavailable on CUDA ({exc}); using "
                     "the slower pure-PyTorch implementation.", RuntimeWarning)
         else:
-            if k_neighbors is None:
-                return _triton.fps(points_c, mask_c, start_idx, K)
-            return _triton.fps_knn(points_c, mask_c, start_idx, K, k_neighbors)
+            return _triton.fps(points_c, mask_c, start_idx, K)
     elif points_c.device.type == "cpu":
         mod = _cpu.get_module()
         if mod is not None:
-            if k_neighbors is None:
-                return mod.fps_forward(points_c, mask_c, start_idx, K)
-            return mod.fps_with_knn_forward(points_c, mask_c, start_idx, K, k_neighbors)
-    if k_neighbors is None:
-        return _reference.fps_reference(points_c, mask_c, start_idx, K)
-    return _reference.fps_knn_reference(points_c, mask_c, start_idx, K, k_neighbors)
+            return mod.fps_forward(points_c, mask_c, start_idx, K)
+    return _reference.fps_reference(points_c, mask_c, start_idx, K)
 
 
 def _resolve_start_idx(
@@ -254,57 +247,7 @@ def farthest_point_sampling(
     if K == 0:
         return torch.zeros((points_c.shape[0], 0), device=points_c.device, dtype=torch.long)
 
-    return _dispatch(points_c, mask_c, start_idx, K, None)
-
-
-def farthest_point_sampling_with_knn(
-    points: Tensor,
-    valid_mask: Tensor,
-    K: int,
-    k_neighbors: int,
-    *,
-    start_idx: Optional[Tensor] = None,
-    random_start: bool = True,
-    generator: Optional[torch.Generator] = None,
-    precision: Optional[torch.dtype] = None,
-    validate: bool = True,
-    assume_finite: bool = False,
-) -> tuple[Tensor, Tensor]:
-    """
-    Fused farthest point sampling + k-nearest neighbors.
-
-    Performs FPS and kNN in a single fused kernel: the distances computed
-    during FPS are reused to find the k nearest neighbors of each selected
-    centroid. Neighbors are sorted closest-first; the centroid itself and
-    already-selected points are eligible neighbors, and rows with fewer than
-    `k_neighbors` valid points pad with the centroid index. All other
-    arguments and semantics match :func:`farthest_point_sampling`
-    (`k_neighbors` must satisfy `0 < k_neighbors <= N`).
-
-    Returns:
-        centroid_idx:
-            Long tensor `[B, K]` with the selected FPS centroid indices.
-        neighbor_idx:
-            Long tensor `[B, K, k_neighbors]` with the k nearest neighbor
-            indices for each centroid, sorted by distance (closest first).
-    """
-    if k_neighbors <= 0:
-        raise ValueError("k_neighbors must be positive")
-
-    points_c, mask_c, start_idx = _prepare_and_resolve(
-        points, valid_mask, K, start_idx, random_start,
-        generator, precision, validate, assume_finite)
-    B, N, _ = points_c.shape
-
-    if K == 0:
-        centroid_idx = torch.zeros((B, 0), device=points_c.device, dtype=torch.long)
-        neighbor_idx = torch.zeros((B, 0, k_neighbors), device=points_c.device, dtype=torch.long)
-        return centroid_idx, neighbor_idx
-
-    if k_neighbors > N:
-        raise ValueError(f"k_neighbors ({k_neighbors}) must be <= N ({N})")
-
-    return _dispatch(points_c, mask_c, start_idx, K, k_neighbors)
+    return _dispatch(points_c, mask_c, start_idx, K)
 
 
 def farthest_point_sampling_with_assign(
@@ -356,7 +299,7 @@ def farthest_point_sampling_with_assign(
             # dense reference would materialize [B, N, K] fp32 distances
             # (GBs for pulse-level events with N ~ 1e5).
             if K <= 512:
-                idx = _dispatch(points_c, mask_c, start_idx, K, None)
+                idx = _dispatch(points_c, mask_c, start_idx, K)
                 cents = torch.gather(points_c, 1, idx.unsqueeze(-1).expand(-1, -1, D))
                 starts = torch.arange(B, device=points_c.device, dtype=torch.long) * N
                 counts = torch.full((B,), N, device=points_c.device, dtype=torch.long)
@@ -365,5 +308,5 @@ def farthest_point_sampling_with_assign(
                     starts, counts, N, K)
                 return idx, assign.view(B, N)
     # composed route: CPU and other devices
-    idx = _dispatch(points_c, mask_c, start_idx, K, None)
+    idx = _dispatch(points_c, mask_c, start_idx, K)
     return idx, _reference.assign_reference(points_c, idx)

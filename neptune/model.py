@@ -61,19 +61,11 @@ class PointTransformerEncoder(nn.Module):
         hidden_dim=2048,
         dropout=0.1,
         drop_path_rate=0.0,
-        pool_type="mean",
         layerscale_init=1e-5,
         attn_impl="auto",
-        fourier_num_bands=20,
-        fourier_freq_min=3.0,
-        fourier_freq_max=180.0,
-        fourier_axis_scales=(1.0, 1.0, 1.0),
-        rope_scales=(180.0, 180.0, 180.0, 40.0),
-        rope_base=60,
     ):
         super().__init__()
         self.token_dim = token_dim
-        self.pool_type = pool_type
         # "auto": packed flex on CUDA, padded SDPA on CPU (B=1 there, nothing to
         # pack). "padded": always padded. "packed": force packed where supported.
         # Dense batches and overflow fall back to padded inside pack().
@@ -93,31 +85,19 @@ class PointTransformerEncoder(nn.Module):
                 dropout=dropout,
                 drop_path_rate=drop_path_rate,
                 layerscale_init=layerscale_init,
-                rope_scales=rope_scales,
-                rope_base=rope_base,
             )
         # Absolute position encoding: log-spaced Fourier features on (x,y,z).
         # Time is dropped — events are time-centered, so absolute t is
         # ~meaningless and RoPE handles relative time. The encoder slices time
         # off the 4D centroids internally.
-        self.abs_pos_encoder = FourierPositionEncoder(
-            token_dim,
-            in_dim=3,
-            num_bands=fourier_num_bands,
-            freq_min=fourier_freq_min,
-            freq_max=fourier_freq_max,
-            axis_scales=fourier_axis_scales,
-            dropout=dropout,
-        )
+        self.abs_pos_encoder = FourierPositionEncoder(token_dim, in_dim=3, dropout=dropout)
         self.layers = NeptuneTransformerEncoder(
             enc_layer,
             num_layers=num_layers,
             drop_path_rate=drop_path_rate,
         )
         self.norm = RMSNorm(token_dim)
-
-        if pool_type == "attention":
-            self.pool = AttentionPool(token_dim)
+        self.pool = AttentionPool(token_dim)
 
     def _use_packed(self, src: Tensor, masks: Optional[Tensor]) -> bool:
         """Packed flex path is used only when it pays off and is supported."""
@@ -160,17 +140,7 @@ class PointTransformerEncoder(nn.Module):
         if masks is not None:
             centroid_emb = centroid_emb * masks.to(dtype=centroid_emb.dtype).unsqueeze(-1)
         x = self._encode(tokens + centroid_emb, centroids, masks)
-        x = self.norm(x)
-
-        if self.pool_type == "attention":
-            return self.pool(x, masks)
-
-        # Mean pooling (default)
-        if masks is None:
-            return x.mean(dim=1)
-        weights = masks.to(dtype=x.dtype).unsqueeze(-1)
-        denom = weights.sum(dim=1, keepdim=True).clamp_min(1.0)
-        return (x * weights).sum(dim=1) / denom.squeeze(1)
+        return self.pool(self.norm(x), masks)
 
 
 class NeptuneModel(nn.Module):
@@ -190,15 +160,8 @@ class NeptuneModel(nn.Module):
         drop_path_rate: float = 0.0,
         output_dim: int = 3,
         tokenizer_kwargs: Optional[Dict[str, Any]] = None,
-        pool_type: str = "mean",
         layerscale_init: float = 1e-5,
         attn_impl: str = "auto",
-        fourier_num_bands: int = 20,
-        fourier_freq_min: float = 3.0,
-        fourier_freq_max: float = 180.0,
-        fourier_axis_scales: tuple = (1.0, 1.0, 1.0),
-        rope_scales: tuple = (180.0, 180.0, 180.0, 40.0),
-        rope_base: int = 60,
         compile_encoder: bool = True,
         compile_options: Optional[Dict[str, Any]] = None,
         compile_strict: bool = False,
@@ -206,6 +169,13 @@ class NeptuneModel(nn.Module):
         super().__init__()
         self.compile_strict = compile_strict
         tokenizer_cfg: Dict[str, Any] = dict(tokenizer_kwargs or {})
+        # Backwards compat for WhaT-1 v1.2 checkpoints only: their configs carry
+        # the removed knn_pool/assign_mode keys and predate seed_mode (FPS seeds).
+        legacy = {k: tokenizer_cfg.pop(k) for k in ("knn_pool", "assign_mode") if k in tokenizer_cfg}
+        if legacy:
+            if legacy.get("knn_pool", "max_mean") != "max_mean" or legacy.get("assign_mode", "voronoi") != "voronoi":
+                raise ValueError(f"tokenizer options {legacy} were removed in 1.3; use neptune 1.2.0 for this model")
+            tokenizer_cfg.setdefault("seed_mode", "fps")
         mlp_layers_cfg = tokenizer_cfg.pop("mlp_layers", [256, 512, 768])
 
         tokenizer_dropout = tokenizer_cfg.pop("dropout", dropout)
@@ -226,15 +196,8 @@ class NeptuneModel(nn.Module):
             hidden_dim=hidden_dim,
             dropout=dropout,
             drop_path_rate=drop_path_rate,
-            pool_type=pool_type,
             layerscale_init=layerscale_init,
             attn_impl=attn_impl,
-            fourier_num_bands=fourier_num_bands,
-            fourier_freq_min=fourier_freq_min,
-            fourier_freq_max=fourier_freq_max,
-            fourier_axis_scales=fourier_axis_scales,
-            rope_scales=rope_scales,
-            rope_base=rope_base,
         )
         # +2: event-level scalars (log token multiplicity, log total charge)
         # concatenated onto the pooled feature — pooling normalizes event size

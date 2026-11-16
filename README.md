@@ -55,7 +55,7 @@ For full training runs, the CLI entry point `scripts/run.py` uses shared tooling
 python scripts/run.py -c scripts/configs/what-1_angular_reco.cfg
 ```
 
-Configs for the WhaT-1 and Prometheus tasks live under `scripts/configs/`. The four `what-1_*.cfg` files are the v1.2 release configs (direction, energy, morphology, neutrino-vs-background) and reproduce the released v1.2 checkpoints.
+Configs for the WhaT-1 and Prometheus tasks live under `scripts/configs/`. The four `what-1_*.cfg` files are the WhaT-1 recipes (direction, energy, morphology, neutrino-vs-background). They match the v1.2 release except for the tokenizer, which now seeds its cells at the highest-charge hits; add `tokenizer_kwargs: {seed_mode: "fps", lloyd_iters: 2}` to reproduce v1.2 training. The released v1.2 checkpoints load unchanged (their embedded configs select the v1.2 tokenization).
 
 Run the test suite with
 
@@ -65,9 +65,9 @@ pytest tests/
 
 ## How it works
 
-1. **Tokenization** – farthest-point sampling down to `num_patches` centroids, then per-token pooling by nearest-centroid (Voronoi) assignment (or k-NN gather with `assign_mode="knn"`), with optional charge-weighted Lloyd refinement of the centroids.
+1. **Tokenization** – events with more than `num_patches` hits are reduced to `num_patches` cells seeded at the highest-charge hits (or by farthest-point sampling with `seed_mode="fps"`); every hit joins its nearest seed (Voronoi assignment) and each cell is max+mean pooled, with optional charge-weighted Lloyd refinement of the centroids.
 2. **Transformer encoder** – 4D RoPE-enabled (based on this [paper](https://arxiv.org/abs/2504.06308)) self-attention over tokens, plus a Fourier absolute position encoding. Compiled with `torch.compile` by default; sparse batches use a packed block-diagonal `flex_attention` path on GPU.
-3. **Pooling** – masked mean (or attention) pool to obtain a global representation.
+3. **Pooling** – attention pool to obtain a global representation.
 4. **Prediction head** – MLP for the downstream task.
 
 ## Parameters
@@ -78,10 +78,9 @@ pytest tests/
 - `num_layers`: transformer depth (default: 12)
 - `num_heads`: attention heads (default: 12)
 - `output_dim`: task output dim (default: 3)
-- `pool_type`: `"mean"` or `"attention"` (default: `"mean"`)
 - `attn_impl`: `"auto"`, `"padded"`, or `"packed"` attention path (default: `"auto"`)
 - `compile_encoder`: compile the encoder with `torch.compile` (default: `True`)
-- `tokenizer_kwargs`: optional dict forwarded to the tokenizer (e.g. `assign_mode`, `lloyd_iters`, `knn_pool`, `k_neighbors`)
+- `tokenizer_kwargs`: optional dict forwarded to the tokenizer (`seed_mode`, `lloyd_iters`, `anchor_dt_col`, `metric_time_scale`)
 
 ## Requirements
 

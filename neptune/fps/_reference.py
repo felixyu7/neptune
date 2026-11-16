@@ -10,10 +10,7 @@ mirror the native kernels exactly:
 - ties select the lowest index (torch.argmax/max return the first
   occurrence of the maximum),
 - an out-of-range start falls back to index 0; once valid candidates are
-  exhausted (K > valid count) the last selection is repeated,
-- kNN neighbors are closest-first over all valid points (the centroid and
-  already-selected points included); rows with fewer than k valid points
-  pad with the centroid index.
+  exhausted (K > valid count) the last selection is repeated.
 
 Vectorized over the batch; the only Python loop is the inherently
 sequential K iterations. No host syncs.
@@ -79,18 +76,3 @@ def assign_reference(points: Tensor, idx: Tensor) -> Tensor:
     d = torch.where(d == d, d, float("inf"))
     return d.argmin(dim=-1)
 
-
-def fps_knn_reference(points: Tensor, mask: Tensor, start_idx: Tensor,
-                      K: int, k_neighbors: int) -> tuple[Tensor, Tensor]:
-    B, N, D = points.shape
-    centroid_idx = fps_reference(points, mask, start_idx, K)
-    pts = _acc(points)
-    valid = mask & points.isfinite().all(dim=-1)
-    cents = torch.gather(pts, 1, centroid_idx.unsqueeze(-1).expand(-1, -1, D))
-    d = (cents.unsqueeze(2) - pts.unsqueeze(1)).square().sum(dim=-1)   # [B, K, N]
-    d = torch.where(valid.unsqueeze(1), d, float("inf"))
-    # stable sort ⇒ lowest index first among exact ties, like the kernels
-    svals, sidx = d.sort(dim=-1, stable=True)
-    svals, sidx = svals[..., :k_neighbors], sidx[..., :k_neighbors]
-    # slots past the row's valid count carry +inf → pad with the centroid
-    return centroid_idx, torch.where(svals.isinf(), centroid_idx.unsqueeze(-1), sidx)
